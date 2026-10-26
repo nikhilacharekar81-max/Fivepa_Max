@@ -16,7 +16,7 @@ import {
   type PaymentMethodRecord
 } from '../../store.js';
 import { postgresStore, isPostgresEnabled } from '../../db/postgresStore.js';
-import { financialTransactionService, financialRepository } from './financial.service.js';
+import { financialTransactionService, financialRepository, checkOrRecordIdempotency, recordIdempotencyResult } from './financial.service.js';
 import { diagnosticService } from '../../services/diagnosticService.js';
 import { financeLedger, FinanceLedgerEngine } from './financeLedger.js';
 import { paymentGatewayManager } from './paymentGateways.js';
@@ -400,6 +400,29 @@ const handlePaymentWebhook = async (req: Request, res: Response) => {
 
     try {
       const result = await postgresStore.executeInTransaction(async (client) => {
+        // 1. Durably check if provider transaction ID was already processed in completed checkout sessions
+        const existingTx = await client.query(
+          "SELECT * FROM payment_checkout_sessions WHERE provider_tx_id = $1 AND status = 'completed'",
+          [txId]
+        );
+        if (existingTx.rows.length > 0) {
+          return { received: true, replayed: true };
+        }
+
+        // 2. PostgreSQL-level durable idempotency lock via financial_idempotency table (protects against concurrent deliveries)
+        const providerTxKey = `WH-PROVIDER-TX-${gateway}-${txId}`;
+        const payloadFingerprint = { gateway, txId, userId, amount: Number(amount), checkoutId: chkId };
+        const idempCheck = await checkOrRecordIdempotency(
+          client,
+          providerTxKey,
+          'paymentWebhook',
+          payloadFingerprint
+        );
+        if (idempCheck.replayed) {
+          return { received: true, replayed: true };
+        }
+
+        // 3. Lock checkout session row
         const sessRes = await client.query(
           'SELECT * FROM payment_checkout_sessions WHERE id = $1 FOR UPDATE',
           [chkId]
@@ -421,6 +444,7 @@ const handlePaymentWebhook = async (req: Request, res: Response) => {
         }
         if (sess.status === 'completed') {
           // Idempotent duplicate event handling
+          await recordIdempotencyResult(client, providerTxKey, 'paymentWebhook', { received: true, replayed: true }, payloadFingerprint);
           return { received: true, replayed: true };
         }
         if (sess.status !== 'pending') {
@@ -446,7 +470,7 @@ const handlePaymentWebhook = async (req: Request, res: Response) => {
           userId,
           amount: Number(amount),
           reference: reference || txId || 'WH-DEPOSIT',
-          idempotencyKey: `WH-${userId}-${sess.id}-${txId}`,
+          idempotencyKey: providerTxKey,
           actor: 'Gateway Webhook',
           source: 'webhook'
         }, client);
@@ -456,7 +480,10 @@ const handlePaymentWebhook = async (req: Request, res: Response) => {
           ['completed', txId, sess.id]
         );
 
-        return { received: true };
+        const resObj = { received: true };
+        await recordIdempotencyResult(client, providerTxKey, 'paymentWebhook', resObj, payloadFingerprint);
+
+        return resObj;
       });
 
       await syncUserBalances();
@@ -607,7 +634,7 @@ router.post('/payments/escrow/refund', requireAuth, async (req: Request, res: Re
 
     const isGigOrder = order.orderType === 'gig' || Boolean(order.gigOrderId);
     if (isGigOrder && isSeller && !isAdmin) return res.status(403).json({ error: 'Sellers must use the cancellation request.' });
-    const overdueThresholdHours = isGigOrder ? 24 : 76;
+    const overdueThresholdHours = 48;
     const isOverdueByThreshold = order.dueDate ? (Date.now() > new Date(order.dueDate).getTime() + overdueThresholdHours * 60 * 60 * 1000) : false;
 
     if (!isAdmin && !isSeller) {

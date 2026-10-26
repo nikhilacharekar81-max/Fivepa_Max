@@ -115,35 +115,43 @@ export function verifyToken(token: string): { id: string; role: string; email: s
 
 // Global Authentication Middleware: verifies cryptographic signed JWT/session and populates req.user
 export async function verifyAuthTokenMiddleware(req: Request, res: Response, next: NextFunction) {
+  (req as any).authDbError = false;
+  (req as any).authDbErrorObject = null;
+
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.slice(7).trim();
     const payload = verifyToken(token);
     if (payload) {
-      const dbUser = await store.getUser(payload.id);
-      if (dbUser) {
-        if (payload.sessionVersion !== undefined) {
-          const activeSessions = getUserActiveSessions(dbUser);
-          if (!activeSessions.includes(payload.sessionVersion)) {
-            if (payload.sessionVersion === dbUser.sessionVersion) {
-              activeSessions.push(payload.sessionVersion);
-            } else {
-              (req as any).user = null;
-              (req as any).authenticatedUserId = null;
-              (req as any).authenticatedUser = null;
-              return next();
+      try {
+        const dbUser = await store.getUser(payload.id);
+        if (dbUser) {
+          if (payload.sessionVersion !== undefined) {
+            const activeSessions = getUserActiveSessions(dbUser);
+            if (!activeSessions.includes(payload.sessionVersion)) {
+              if (payload.sessionVersion === dbUser.sessionVersion) {
+                activeSessions.push(payload.sessionVersion);
+              } else {
+                (req as any).user = null;
+                (req as any).authenticatedUserId = null;
+                (req as any).authenticatedUser = null;
+                return next();
+              }
             }
           }
+          (req as any).user = {
+            id: dbUser.id,
+            role: dbUser.role,
+            status: dbUser.status,
+            email: dbUser.email
+          };
+          (req as any).authenticatedUserId = dbUser.id;
+          (req as any).authenticatedUser = dbUser;
+          return next();
         }
-        (req as any).user = {
-          id: dbUser.id,
-          role: dbUser.role,
-          status: dbUser.status,
-          email: dbUser.email
-        };
-        (req as any).authenticatedUserId = dbUser.id;
-        (req as any).authenticatedUser = dbUser;
-        return next();
+      } catch (err) {
+        (req as any).authDbError = true;
+        (req as any).authDbErrorObject = err;
       }
     }
   }
@@ -210,13 +218,21 @@ export function orderParticipantSafeUser(user: any) {
 }
 
 export async function requireAuth(req: Request, res: Response, next: NextFunction) {
+  if ((req as any).authDbError) {
+    return res.status(503).json(formatApiError((req as any).authDbErrorObject, 'Authentication service temporarily unavailable. Please try again.'));
+  }
+
   const authUserId = resolveAuthenticatedUserId(req);
   if (!authUserId) {
     return res.status(401).json({ error: 'Authentication required. Please provide a valid session token.' });
   }
   let u = (req as any).authenticatedUser;
   if (!u || u.id !== authUserId) {
-    u = await store.getUser(authUserId);
+    try {
+      u = await store.getUser(authUserId);
+    } catch (err) {
+      return res.status(503).json(formatApiError(err, 'Authentication service temporarily unavailable. Please try again.'));
+    }
   }
   if (!u) {
     return res.status(401).json({ error: 'User account not found.' });
@@ -260,13 +276,21 @@ export function adminActor(req: Request): string {
 
 export function requireRole(allowedRoles: string[]) {
   return async (req: Request, res: Response, next: NextFunction) => {
+    if ((req as any).authDbError) {
+      return res.status(503).json(formatApiError((req as any).authDbErrorObject, 'Authentication service temporarily unavailable. Please try again.'));
+    }
+
     const authUserId = resolveAuthenticatedUserId(req);
     if (!authUserId) {
       return res.status(401).json({ error: 'Authentication required.' });
     }
     let u = (req as any).authenticatedUser;
     if (!u || u.id !== authUserId) {
-      u = await store.getUser(authUserId);
+      try {
+        u = await store.getUser(authUserId);
+      } catch (err) {
+        return res.status(503).json(formatApiError(err, 'Authentication service temporarily unavailable. Please try again.'));
+      }
     }
     if (!u) {
       return res.status(401).json({ error: 'User not found.' });
@@ -284,13 +308,21 @@ export function requireRole(allowedRoles: string[]) {
 }
 
 export async function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  if ((req as any).authDbError) {
+    return res.status(503).json(formatApiError((req as any).authDbErrorObject, 'Authentication service temporarily unavailable. Please try again.'));
+  }
+
   const authUserId = resolveAuthenticatedUserId(req);
   if (!authUserId) {
     return res.status(401).json({ error: 'Authentication required. Valid admin session missing.' });
   }
   let u = (req as any).authenticatedUser;
   if (!u || u.id !== authUserId) {
-    u = await store.getUser(authUserId);
+    try {
+      u = await store.getUser(authUserId);
+    } catch (err) {
+      return res.status(503).json(formatApiError(err, 'Authentication service temporarily unavailable. Please try again.'));
+    }
   }
   if (!u || (u.role !== 'super_admin' && u.role !== 'admin')) {
     return res.status(403).json({ error: 'Forbidden: Administrator privileges required.' });

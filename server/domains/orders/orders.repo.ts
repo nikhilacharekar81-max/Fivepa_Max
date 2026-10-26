@@ -50,7 +50,10 @@ export class OrdersRepo {
               buyer_id = EXCLUDED.buyer_id,
               seller_id = EXCLUDED.seller_id,
               amount = EXCLUDED.amount,
-              status = EXCLUDED.status,
+              status = CASE
+                WHEN orders.status IN ('completed', 'cancelled') AND EXCLUDED.status NOT IN ('completed', 'cancelled') THEN orders.status
+                ELSE EXCLUDED.status
+              END,
               created_at = EXCLUDED.created_at,
               due_date = EXCLUDED.due_date,
               completed_at = EXCLUDED.completed_at,

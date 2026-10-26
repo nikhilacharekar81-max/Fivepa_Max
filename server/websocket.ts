@@ -77,15 +77,29 @@ export function initWebSocketServer(server: Server): WebSocketServer {
             try { ws.close(1008, 'Invalid token in query'); } catch {}
             return;
           }
-          const dbUser = await store.getUser(payload.id);
-          if (!dbUser || dbUser.status === 'deactivated') {
+          try {
+            const dbUser = await store.getUser(payload.id);
+            if (!dbUser || dbUser.status === 'deactivated') {
+              clients.delete(ws);
+              try { ws.close(1008, 'Account deactivated'); } catch {}
+              return;
+            }
+            if (payload.sessionVersion !== undefined) {
+              const activeSessions = getUserActiveSessions(dbUser);
+              if (!activeSessions.includes(payload.sessionVersion) && payload.sessionVersion !== dbUser.sessionVersion) {
+                clients.delete(ws);
+                try { ws.close(1008, 'Session revoked'); } catch {}
+                return;
+              }
+            }
+            (ws as any).authenticatedUserId = dbUser.id;
+            (ws as any).sessionVersion = payload.sessionVersion !== undefined ? payload.sessionVersion : Number(dbUser.sessionVersion || 1);
+            (ws as any).isAuthenticated = true;
+          } catch (err) {
             clients.delete(ws);
-            try { ws.close(1008, 'Account deactivated'); } catch {}
+            try { ws.close(1008, 'Authentication service unavailable'); } catch {}
             return;
           }
-          (ws as any).authenticatedUserId = dbUser.id;
-          (ws as any).sessionVersion = payload.sessionVersion !== undefined ? payload.sessionVersion : Number(dbUser.sessionVersion || 1);
-          (ws as any).isAuthenticated = true;
         }
       }
 
@@ -227,21 +241,37 @@ function setupWebSocketHandlers(ws: WebSocket, authTimeout?: NodeJS.Timeout) {
 
         const payload = verifyToken(token);
         if (payload && payload.id) {
-          const dbUser = await store.getUser(payload.id);
-          if (dbUser && dbUser.status !== 'deactivated') {
-            (ws as any).authenticatedUserId = dbUser.id;
-            (ws as any).sessionVersion = payload.sessionVersion !== undefined ? payload.sessionVersion : Number(dbUser.sessionVersion || 1);
-            (ws as any).isAuthenticated = true;
-            if (authTimeout) clearTimeout(authTimeout);
+          try {
+            const dbUser = await store.getUser(payload.id);
+            if (dbUser && dbUser.status !== 'deactivated') {
+              if (payload.sessionVersion !== undefined) {
+                const activeSessions = getUserActiveSessions(dbUser);
+                if (!activeSessions.includes(payload.sessionVersion) && payload.sessionVersion !== dbUser.sessionVersion) {
+                  ws.send(JSON.stringify({ error: 'Session revoked' }));
+                  clients.delete(ws);
+                  try { ws.close(1008, 'Session revoked'); } catch {}
+                  return;
+                }
+              }
+              (ws as any).authenticatedUserId = dbUser.id;
+              (ws as any).sessionVersion = payload.sessionVersion !== undefined ? payload.sessionVersion : Number(dbUser.sessionVersion || 1);
+              (ws as any).isAuthenticated = true;
+              if (authTimeout) clearTimeout(authTimeout);
 
-            if (!(ws as any).hasSentConnected) {
-              (ws as any).hasSentConnected = true;
-              ws.send(JSON.stringify({
-                type: 'CONNECTED',
-                userId: dbUser.id,
-                serverTime: new Date().toISOString()
-              }));
+              if (!(ws as any).hasSentConnected) {
+                (ws as any).hasSentConnected = true;
+                ws.send(JSON.stringify({
+                  type: 'CONNECTED',
+                  userId: dbUser.id,
+                  serverTime: new Date().toISOString()
+                }));
+              }
+              return;
             }
+          } catch (err) {
+            ws.send(JSON.stringify({ error: 'Authentication service unavailable' }));
+            clients.delete(ws);
+            try { ws.close(1008, 'Authentication service unavailable'); } catch {}
             return;
           }
         }
