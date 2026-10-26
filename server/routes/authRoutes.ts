@@ -223,6 +223,9 @@ authRouter.post('/verify-email', rateLimit(30, 3_600_000), async (req: Request, 
       return res.status(500).json({ error: 'Failed to verify code.' });
     }
   } else {
+    if (IS_PRODUCTION) {
+      return res.status(500).json({ error: 'Security verification requires database connection in production.' });
+    }
     const record = emailVerificationCodes.get(normalizedEmail);
     if (record) {
       if (Date.now() > record.expiresAt) {
@@ -288,6 +291,9 @@ authRouter.post('/resend-email-code', rateLimit(10, 3_600_000), async (req: Requ
       return res.status(500).json({ error: 'Failed to generate verification code.' });
     }
   } else {
+    if (IS_PRODUCTION) {
+      return res.status(500).json({ error: 'Security verification requires database connection in production.' });
+    }
     const existing = emailVerificationCodes.get(normalizedEmail);
     if (existing && now - existing.lastResendAt < 30_000) {
       return res.status(429).json({ error: 'Please wait 30 seconds before requesting a new resend.' });
@@ -447,6 +453,9 @@ authRouter.post('/forgot-password/request', rateLimit(10, 3_600_000), async (req
       return res.status(500).json({ error: 'Failed to generate recovery code.' });
     }
   } else {
+    if (IS_PRODUCTION) {
+      return res.status(500).json({ error: 'Security verification requires database connection in production.' });
+    }
     const existing = forgotPasswordCodes.get(query);
     if (existing && now - existing.lastResendAt < 30_000) {
       return res.json(genericResponse);
@@ -591,6 +600,9 @@ authRouter.post('/forgot-password/reset', async (req: Request, res: Response) =>
       return res.status(500).json({ error: 'Failed to reset password.' });
     }
   } else {
+    if (IS_PRODUCTION) {
+      return res.status(500).json({ error: 'Security verification requires database connection in production.' });
+    }
     const record = forgotPasswordCodes.get(query);
     if (!record || record.code !== trimmedCode || Date.now() > record.expiresAt) {
       return res.status(400).json({ error: 'Invalid or expired recovery code. Please request a new one.' });
@@ -633,6 +645,9 @@ authRouter.post('/withdrawal/request-code', requireAuth, async (req: Request, re
       return res.status(500).json({ error: 'Failed to generate withdrawal verification code.' });
     }
   } else {
+    if (IS_PRODUCTION) {
+      return res.status(500).json({ error: 'Security verification requires database connection in production.' });
+    }
     withdrawalVerificationCodes.set(caller.id, {
       code,
       expiresAt: expiresAtMs,

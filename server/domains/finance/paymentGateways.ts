@@ -251,6 +251,124 @@ export class PaymentGatewayManager {
     }
   }
 
+  public async verifyPaymentEvent(params: {
+    gateway: 'stripe' | 'paypal' | 'razorpay' | string;
+    sessionId?: string;
+    transactionId?: string;
+    expectedAmount: number;
+    expectedCurrency: string;
+  }): Promise<{ verified: boolean; error?: string }> {
+    const isProd = process.env.NODE_ENV === 'production';
+    const env = isProd ? 'production' : 'sandbox';
+    const gwName = (params.gateway || 'stripe').toLowerCase() as 'stripe' | 'paypal' | 'razorpay';
+    const gw = this.getGateway(gwName, env);
+    const hasCredentials = gw && gw.enabled && gw.clientSecret;
+
+    if (!hasCredentials) {
+      if (isProd) {
+        return { verified: false, error: `Payment gateway "${gwName}" credentials missing in production.` };
+      }
+      const simAllowed = process.env.PAYMENT_SIMULATION_ENABLED === 'true';
+      if (simAllowed) {
+        return { verified: true };
+      }
+      return { verified: false, error: `Gateway credentials missing and simulation disabled.` };
+    }
+
+    try {
+      if (gwName === 'stripe') {
+        const idToLookup = params.sessionId || params.transactionId;
+        if (!idToLookup) return { verified: false, error: 'Missing session or transaction ID for Stripe verification.' };
+
+        const url = idToLookup.startsWith('cs_')
+          ? `https://api.stripe.com/v1/checkout/sessions/${idToLookup}`
+          : `https://api.stripe.com/v1/payment_intents/${idToLookup}`;
+
+        const res = await fetch(url, {
+          headers: { 'Authorization': `Bearer ${gw.clientSecret}` }
+        });
+        if (!res.ok) {
+          return { verified: false, error: `Stripe API verification returned status ${res.status}` };
+        }
+        const data: any = await res.json();
+        const paid = data.payment_status === 'paid' || data.status === 'succeeded';
+        if (!paid) return { verified: false, error: `Stripe payment not completed (status: ${data.payment_status || data.status})` };
+
+        const liveAmount = (data.amount_total ?? data.amount) / 100;
+        const liveCurrency = (data.currency || '').toUpperCase();
+
+        if (liveCurrency !== params.expectedCurrency.toUpperCase()) {
+          return { verified: false, error: `Currency mismatch: expected ${params.expectedCurrency}, got ${liveCurrency}` };
+        }
+        if (Math.abs(liveAmount - params.expectedAmount) > 0.01) {
+          return { verified: false, error: `Amount mismatch: expected ${params.expectedAmount}, got ${liveAmount}` };
+        }
+        return { verified: true };
+      } else if (gwName === 'paypal') {
+        const idToLookup = params.sessionId || params.transactionId;
+        if (!idToLookup) return { verified: false, error: 'Missing order or transaction ID for PayPal verification.' };
+
+        const tokenRes = await fetch('https://api-m.paypal.com/v1/oauth2/token', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Basic ${Buffer.from(`${gw.clientId}:${gw.clientSecret}`).toString('base64')}`,
+            'Content-Type': 'application/x-www-form-urlencoded'
+          },
+          body: 'grant_type=client_credentials'
+        });
+        if (!tokenRes.ok) return { verified: false, error: 'PayPal OAuth handshake failed.' };
+        const tokenData: any = await tokenRes.json();
+
+        const orderRes = await fetch(`https://api-m.paypal.com/v2/checkout/orders/${idToLookup}`, {
+          headers: { 'Authorization': `Bearer ${tokenData.access_token}` }
+        });
+        if (!orderRes.ok) return { verified: false, error: `PayPal order lookup failed (${orderRes.status})` };
+        const orderData: any = await orderRes.json();
+
+        if (orderData.status !== 'COMPLETED' && orderData.status !== 'APPROVED') {
+          return { verified: false, error: `PayPal order status is ${orderData.status}` };
+        }
+        const unit = orderData.purchase_units?.[0]?.amount;
+        if (!unit) return { verified: false, error: 'PayPal purchase unit amount missing.' };
+
+        if ((unit.currency_code || '').toUpperCase() !== params.expectedCurrency.toUpperCase()) {
+          return { verified: false, error: `PayPal currency mismatch: ${unit.currency_code}` };
+        }
+        if (Math.abs(Number(unit.value) - params.expectedAmount) > 0.01) {
+          return { verified: false, error: `PayPal amount mismatch: ${unit.value}` };
+        }
+        return { verified: true };
+      } else if (gwName === 'razorpay') {
+        const idToLookup = params.transactionId || params.sessionId;
+        if (!idToLookup) return { verified: false, error: 'Missing transaction ID for Razorpay verification.' };
+
+        const authHeader = `Basic ${Buffer.from(`${gw.clientId}:${gw.clientSecret}`).toString('base64')}`;
+        const res = await fetch(`https://api.razorpay.com/v1/payments/${idToLookup}`, {
+          headers: { 'Authorization': authHeader }
+        });
+        if (!res.ok) return { verified: false, error: `Razorpay payment lookup failed (${res.status})` };
+        const data: any = await res.json();
+
+        if (data.status !== 'captured' && data.status !== 'authorized') {
+          return { verified: false, error: `Razorpay payment status is ${data.status}` };
+        }
+        const liveAmount = Number(data.amount) / 100;
+        const liveCurrency = (data.currency || '').toUpperCase();
+
+        if (liveCurrency !== params.expectedCurrency.toUpperCase()) {
+          return { verified: false, error: `Razorpay currency mismatch: ${liveCurrency}` };
+        }
+        if (Math.abs(liveAmount - params.expectedAmount) > 0.01) {
+          return { verified: false, error: `Razorpay amount mismatch: ${liveAmount}` };
+        }
+        return { verified: true };
+      }
+      return { verified: false, error: `Unsupported gateway: ${gwName}` };
+    } catch (err: any) {
+      return { verified: false, error: `Provider payment verification exception: ${err.message}` };
+    }
+  }
+
   public async verifyPayoutSettlement(params: { method: string; providerReference: string; amount: number; payoutId: string }): Promise<{ verified: boolean; providerTxId: string; status: string }> {
     const isProd = process.env.NODE_ENV === 'production';
     const env = isProd ? 'production' : 'sandbox';

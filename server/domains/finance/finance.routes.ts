@@ -363,28 +363,15 @@ router.post('/payments/gateway/checkout', requireAuth, rateLimit(10, 60_000), as
 
 const handlePaymentWebhook = async (req: Request, res: Response) => {
   const rawBody = req.body;
+  const gateway = (req.headers['x-gateway-provider'] || req.query.gateway || 'stripe') as string;
   const isVerified = paymentGatewayManager.verifyWebhookSignature({
-    gateway: (req.headers['x-gateway-provider'] || req.query.gateway || 'stripe') as string,
+    gateway,
     headers: req.headers,
     rawBody
   });
 
   if (!isVerified) {
-    const signature = req.headers['x-webhook-signature'] as string;
-    const secret = process.env.WEBHOOK_SECRET;
-    if (!secret || !signature) {
-      return res.status(403).json({ error: 'Unauthorized: Invalid or missing webhook signature' });
-    }
-
-    const hmac = createHmac('sha256', secret);
-    hmac.update(rawBody);
-    const calculatedSignature = hmac.digest('hex');
-
-    const sigBuf = Buffer.from(signature);
-    const expBuf = Buffer.from(calculatedSignature);
-    if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) {
-      return res.status(403).json({ error: 'Unauthorized: Invalid webhook signature' });
-    }
+    return res.status(403).json({ error: 'Unauthorized: Invalid or missing provider webhook signature' });
   }
 
   let payload: any;
@@ -403,7 +390,8 @@ const handlePaymentWebhook = async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Invalid or missing currency: provider webhook currency must be explicitly USD.' });
   }
 
-  if ((event === 'payment.succeeded' || event === 'checkout.session.completed' || event === 'payment_intent.succeeded') && userId && amount) {
+  const validEvents = ['payment.succeeded', 'checkout.session.completed', 'payment_intent.succeeded', 'payment.captured', 'order.approved'];
+  if (validEvents.includes(event) && userId && amount) {
     const pool = postgresStore.getPool();
     const chkId = checkoutId || sessionId;
     if (!chkId) {
@@ -435,6 +423,19 @@ const handlePaymentWebhook = async (req: Request, res: Response) => {
     }
     if (sess.status !== 'pending') {
       return res.status(400).json({ error: `Checkout session already in status ${sess.status}` });
+    }
+
+    // Direct Provider API Object Authenticity Verification
+    const liveVerification = await paymentGatewayManager.verifyPaymentEvent({
+      gateway: sess.gateway || gateway,
+      sessionId: sess.provider_tx_id || chkId,
+      transactionId: txId,
+      expectedAmount: Number(sess.expected_amount),
+      expectedCurrency: 'USD'
+    });
+
+    if (!liveVerification.verified) {
+      return res.status(400).json({ error: `Provider payment verification failed: ${liveVerification.error}` });
     }
 
     await pool.query(
