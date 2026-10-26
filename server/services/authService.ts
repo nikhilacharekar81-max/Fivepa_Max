@@ -178,6 +178,7 @@ export async function checkRecoveryCodeAsync(query: string, code: unknown, markV
 }
 
 export function checkRecoveryCode(query: string, code: unknown, markVerified = false): 'ok' | 'invalid' | 'locked' {
+  if (IS_PRODUCTION) return 'invalid';
   const record = forgotPasswordCodes.get(query);
   if (!record || Date.now() > record.expiresAt) return 'invalid';
   if (record.attempts >= 5) {
@@ -204,6 +205,22 @@ export async function handleLogin(req: Request, res: Response) {
   const now = Date.now();
   const cooldownMs = process.env.NODE_ENV === 'test' ? 2000 : 60000;
   const attemptKeys = [clientIp, ...(lookupEmail || lookupId ? ['acct:' + (lookupEmail || lookupId)] : [])];
+
+  if (isPostgresEnabled()) {
+    try {
+      const pool = postgresStore.getPool();
+      for (const key of attemptKeys) {
+        const attemptsRes = await pool.query(
+          `SELECT attempts FROM auth_verification_codes WHERE email = $1 AND type = 'login_attempts' AND expires_at > NOW()`,
+          [`login:${key}`]
+        );
+        if (attemptsRes.rows.length > 0 && Number(attemptsRes.rows[0].attempts || 0) >= 5) {
+          return res.status(429).json({ error: 'Too many failed login attempts. Please try again later.' });
+        }
+      }
+    } catch {}
+  }
+
   for (const key of attemptKeys) {
     const attemptRecord = loginAttempts.get(key);
     if (!attemptRecord) continue;
@@ -215,11 +232,24 @@ export async function handleLogin(req: Request, res: Response) {
     }
   }
 
-  function recordFailedLogin() {
+  async function recordFailedLogin() {
     for (const key of attemptKeys) {
       const record = loginAttempts.get(key) || { count: 0, resetAt: Date.now() + cooldownMs };
       record.count++;
       loginAttempts.set(key, record);
+
+      if (isPostgresEnabled()) {
+        try {
+          const pool = postgresStore.getPool();
+          const expiresAt = new Date(Date.now() + cooldownMs);
+          await pool.query(
+            `INSERT INTO auth_verification_codes (email, code, type, attempts, last_resend_at, expires_at, created_at)
+             VALUES ($1, '0', 'login_attempts', 1, $2, $3, NOW())
+             ON CONFLICT (email, type) DO UPDATE SET attempts = auth_verification_codes.attempts + 1, expires_at = $3`,
+            [`login:${key}`, Date.now(), expiresAt]
+          );
+        } catch {}
+      }
     }
   }
 
@@ -239,13 +269,13 @@ export async function handleLogin(req: Request, res: Response) {
   }
 
   if (!user) {
-    recordFailedLogin();
+    await recordFailedLogin();
     return res.status(401).json({ error: 'Invalid email or password.' });
   }
 
   const passwordMatch = typeof user.password === 'string' && user.password.length > 0 && (await bcrypt.compare(password, user.password));
   if (!passwordMatch) {
-    recordFailedLogin();
+    await recordFailedLogin();
     return res.status(401).json({ error: 'Invalid email or password.' });
   }
 
@@ -357,7 +387,7 @@ export async function handleLogin(req: Request, res: Response) {
       });
 
       if (codeCheckErr) {
-        recordFailedLogin();
+        await recordFailedLogin();
         return res.status(codeCheckErr.status).json({ error: codeCheckErr.error });
       }
     } else {
@@ -366,7 +396,7 @@ export async function handleLogin(req: Request, res: Response) {
       }
       const record = emailVerificationCodes.get(userEmailKey);
       if (!record || Date.now() > record.expiresAt) {
-        recordFailedLogin();
+        await recordFailedLogin();
         return res.status(400).json({ error: 'Invalid or expired email verification code.' });
       }
       if (record.attempts >= 5) {
@@ -375,7 +405,7 @@ export async function handleLogin(req: Request, res: Response) {
       }
       if (record.code !== providedCode) {
         record.attempts++;
-        recordFailedLogin();
+        await recordFailedLogin();
         return res.status(400).json({ error: 'Invalid or expired email verification code.' });
       }
       emailVerificationCodes.delete(userEmailKey);

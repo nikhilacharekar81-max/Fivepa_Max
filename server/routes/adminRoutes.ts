@@ -1138,6 +1138,9 @@ router.get('/admin/reconciliation', requireAdmin, async (_req: Request, res: Res
 router.post('/admin/refunds/:id/approve', requireAdmin, async (req: Request, res: Response) => {
   try {
     if (!isPostgresEnabled()) {
+      if (process.env.NODE_ENV === 'production') {
+        return res.status(500).json({ error: 'Refund processing requires database connection in production.' });
+      }
       const pool = postgresStore.getPool();
       const refRes = await pool.query('SELECT * FROM refunds WHERE id = $1', [req.params.id]);
       if (refRes.rows.length === 0) return res.status(404).json({ error: 'Refund not found' });
@@ -1204,6 +1207,9 @@ router.post('/admin/refunds/:id/approve', requireAdmin, async (req: Request, res
 router.post('/admin/refunds/:id/reject', requireAdmin, async (req: Request, res: Response) => {
   try {
     if (!isPostgresEnabled()) {
+      if (process.env.NODE_ENV === 'production') {
+        return res.status(500).json({ error: 'Refund processing requires database connection in production.' });
+      }
       const pool = postgresStore.getPool();
       const refRes = await pool.query('SELECT * FROM refunds WHERE id = $1', [req.params.id]);
       if (refRes.rows.length === 0) return res.status(404).json({ error: 'Refund not found' });

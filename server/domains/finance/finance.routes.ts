@@ -364,7 +364,7 @@ router.post('/payments/gateway/checkout', requireAuth, rateLimit(10, 60_000), as
 const handlePaymentWebhook = async (req: Request, res: Response) => {
   const rawBody = req.body;
   const gateway = (req.headers['x-gateway-provider'] || req.query.gateway || 'stripe') as string;
-  const isVerified = paymentGatewayManager.verifyWebhookSignature({
+  const isVerified = await paymentGatewayManager.verifyWebhookSignature({
     gateway,
     headers: req.headers,
     rawBody

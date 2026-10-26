@@ -213,42 +213,116 @@ export class PaymentGatewayManager {
     return this.state[env];
   }
 
-  public verifyWebhookSignature(params: { gateway?: string; headers: Record<string, any>; rawBody: Buffer | string }): boolean {
+  public async verifyWebhookSignature(params: { gateway?: string; headers: Record<string, any>; rawBody: Buffer | string }): Promise<boolean> {
     const gateway = (params.gateway || 'stripe').toLowerCase();
     const env = process.env.NODE_ENV === 'production' ? 'production' : 'sandbox';
     const gw = this.getGateway(gateway as any, env);
-    const webhookSecret = gw?.webhookId || process.env.WEBHOOK_SECRET;
-
-    if (!webhookSecret) return false;
+    const webhookSecret = gw?.webhookId;
 
     const bodyStr = typeof params.rawBody === 'string' ? params.rawBody : params.rawBody.toString('utf8');
 
     if (gateway === 'stripe') {
-      const sigHeader = params.headers['stripe-signature'] || params.headers['x-webhook-signature'];
+      if (!webhookSecret) return false;
+      const sigHeader = params.headers['stripe-signature'];
       if (!sigHeader) return false;
+
       const parts = String(sigHeader).split(',').reduce((acc: any, item) => {
         const [k, v] = item.split('=');
         if (k && v) acc[k.trim()] = v.trim();
         return acc;
       }, {});
-      if (!parts.t || !parts.v1) {
-        const h = crypto.createHmac('sha256', webhookSecret).update(bodyStr).digest('hex');
-        return crypto.timingSafeEqual(Buffer.from(String(sigHeader)), Buffer.from(h));
-      }
+
+      if (!parts.t || !parts.v1) return false;
+
       const signedPayload = `${parts.t}.${bodyStr}`;
       const expectedSig = crypto.createHmac('sha256', webhookSecret).update(signedPayload).digest('hex');
-      return crypto.timingSafeEqual(Buffer.from(parts.v1), Buffer.from(expectedSig));
+
+      const sigBuf = Buffer.from(parts.v1);
+      const expBuf = Buffer.from(expectedSig);
+      if (sigBuf.length !== expBuf.length) return false;
+      return crypto.timingSafeEqual(sigBuf, expBuf);
     } else if (gateway === 'razorpay') {
-      const sig = params.headers['x-razorpay-signature'] || params.headers['x-webhook-signature'];
+      if (!webhookSecret) return false;
+      const sig = params.headers['x-razorpay-signature'];
       if (!sig) return false;
+
       const expectedSig = crypto.createHmac('sha256', webhookSecret).update(bodyStr).digest('hex');
-      return crypto.timingSafeEqual(Buffer.from(String(sig)), Buffer.from(expectedSig));
-    } else {
+      const sigBuf = Buffer.from(String(sig));
+      const expBuf = Buffer.from(expectedSig);
+      if (sigBuf.length !== expBuf.length) return false;
+      return crypto.timingSafeEqual(sigBuf, expBuf);
+    } else if (gateway === 'paypal') {
+      // Genuine PayPal REST API Webhook Signature Verification
+      if (gw && gw.enabled && gw.clientId && gw.clientSecret && gw.webhookId) {
+        try {
+          const authAlgo = params.headers['paypal-auth-algo'];
+          const certUrl = params.headers['paypal-cert-url'];
+          const transmissionId = params.headers['paypal-transmission-id'];
+          const transmissionSig = params.headers['paypal-transmission-sig'];
+          const transmissionTime = params.headers['paypal-transmission-time'];
+
+          if (!transmissionId || !transmissionSig || !certUrl || !authAlgo || !transmissionTime) {
+            return false;
+          }
+
+          let webhookEventObj: any;
+          try {
+            webhookEventObj = JSON.parse(bodyStr);
+          } catch {
+            return false;
+          }
+
+          const tokenRes = await fetch('https://api-m.paypal.com/v1/oauth2/token', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Basic ${Buffer.from(`${gw.clientId}:${gw.clientSecret}`).toString('base64')}`,
+              'Content-Type': 'application/x-www-form-urlencoded'
+            },
+            body: 'grant_type=client_credentials'
+          });
+
+          if (!tokenRes.ok) return false;
+          const tokenData: any = await tokenRes.json();
+
+          const verifyRes = await fetch('https://api-m.paypal.com/v1/notifications/verify-webhook-signature', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${tokenData.access_token}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              auth_algo: authAlgo,
+              cert_url: certUrl,
+              transmission_id: transmissionId,
+              transmission_sig: transmissionSig,
+              transmission_time: transmissionTime,
+              webhook_id: gw.webhookId,
+              webhook_event: webhookEventObj
+            })
+          });
+
+          if (!verifyRes.ok) return false;
+          const verifyData: any = await verifyRes.json();
+          return verifyData.verification_status === 'SUCCESS';
+        } catch (err) {
+          console.error('[PaymentGateway] PayPal webhook signature verification API call failed:', err);
+          return false;
+        }
+      }
+
+      if (process.env.NODE_ENV === 'production') return false;
+      const simAllowed = process.env.PAYMENT_SIMULATION_ENABLED === 'true';
+      if (!simAllowed || !webhookSecret) return false;
+
       const sig = params.headers['x-webhook-signature'] || params.headers['paypal-transmission-sig'];
       if (!sig) return false;
       const expectedSig = crypto.createHmac('sha256', webhookSecret).update(bodyStr).digest('hex');
-      return crypto.timingSafeEqual(Buffer.from(String(sig)), Buffer.from(expectedSig));
+      const sigBuf = Buffer.from(String(sig));
+      const expBuf = Buffer.from(expectedSig);
+      if (sigBuf.length !== expBuf.length) return false;
+      return crypto.timingSafeEqual(sigBuf, expBuf);
     }
+    return false;
   }
 
   public async verifyPaymentEvent(params: {
@@ -325,8 +399,8 @@ export class PaymentGatewayManager {
         if (!orderRes.ok) return { verified: false, error: `PayPal order lookup failed (${orderRes.status})` };
         const orderData: any = await orderRes.json();
 
-        if (orderData.status !== 'COMPLETED' && orderData.status !== 'APPROVED') {
-          return { verified: false, error: `PayPal order status is ${orderData.status}` };
+        if (orderData.status !== 'COMPLETED') {
+          return { verified: false, error: `PayPal order status is ${orderData.status}. Payment must be COMPLETED.` };
         }
         const unit = orderData.purchase_units?.[0]?.amount;
         if (!unit) return { verified: false, error: 'PayPal purchase unit amount missing.' };
@@ -349,8 +423,8 @@ export class PaymentGatewayManager {
         if (!res.ok) return { verified: false, error: `Razorpay payment lookup failed (${res.status})` };
         const data: any = await res.json();
 
-        if (data.status !== 'captured' && data.status !== 'authorized') {
-          return { verified: false, error: `Razorpay payment status is ${data.status}` };
+        if (data.status !== 'captured') {
+          return { verified: false, error: `Razorpay payment status is ${data.status}. Payment must be captured.` };
         }
         const liveAmount = Number(data.amount) / 100;
         const liveCurrency = (data.currency || '').toUpperCase();
