@@ -60,40 +60,41 @@ export async function verifyAndConsumeWithdrawalCode(
   const trimmedCode = code.trim();
 
   if (isPostgresEnabled()) {
-    const pool = postgresStore.getPool();
-    const res = await pool.query(
-      `SELECT * FROM auth_verification_codes
-       WHERE (email = $1 OR email = (SELECT LOWER(email) FROM users WHERE id = $1 LIMIT 1))
-         AND type = 'withdrawal'
-       LIMIT 1`,
-      [userId]
-    );
-    if (res.rows.length === 0) {
-      return { ok: false, status: 400, error: 'No active withdrawal verification code found. Please request a new code via /api/auth/withdrawal/request-code.' };
-    }
-    const row = res.rows[0];
-    if (new Date() > new Date(row.expires_at)) {
-      await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'withdrawal'`, [row.email]);
-      return { ok: false, status: 400, error: 'Withdrawal verification code has expired. Please request a new code.' };
-    }
-    if (Number(row.attempts || 0) >= 5) {
-      await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'withdrawal'`, [row.email]);
-      return { ok: false, status: 429, error: 'Too many incorrect attempts. Verification code invalidated. Please request a new code.' };
-    }
-    if (row.code !== trimmedCode) {
-      const upd = await pool.query(
-        `UPDATE auth_verification_codes SET attempts = attempts + 1 WHERE email = $1 AND type = 'withdrawal' RETURNING attempts`,
-        [row.email]
+    return postgresStore.executeInTransaction(async (client) => {
+      const res = await client.query(
+        `SELECT * FROM auth_verification_codes
+         WHERE (email = $1 OR email = (SELECT LOWER(email) FROM users WHERE id = $1 LIMIT 1))
+           AND type = 'withdrawal'
+         FOR UPDATE`,
+        [userId]
       );
-      const newAttempts = Number(upd.rows[0]?.attempts || 0);
-      if (newAttempts >= 5) {
-        await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'withdrawal'`, [row.email]);
+      if (res.rows.length === 0) {
+        return { ok: false, status: 400, error: 'No active withdrawal verification code found. Please request a new code via /api/auth/withdrawal/request-code.' };
+      }
+      const row = res.rows[0];
+      if (new Date() > new Date(row.expires_at)) {
+        await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'withdrawal'`, [row.email]);
+        return { ok: false, status: 400, error: 'Withdrawal verification code has expired. Please request a new code.' };
+      }
+      if (Number(row.attempts || 0) >= 5) {
+        await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'withdrawal'`, [row.email]);
         return { ok: false, status: 429, error: 'Too many incorrect attempts. Verification code invalidated. Please request a new code.' };
       }
-      return { ok: false, status: 400, error: 'Invalid verification code.' };
-    }
-    await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'withdrawal'`, [row.email]);
-    return { ok: true };
+      if (row.code !== trimmedCode) {
+        const upd = await client.query(
+          `UPDATE auth_verification_codes SET attempts = attempts + 1 WHERE email = $1 AND type = 'withdrawal' RETURNING attempts`,
+          [row.email]
+        );
+        const newAttempts = Number(upd.rows[0]?.attempts || 0);
+        if (newAttempts >= 5) {
+          await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'withdrawal'`, [row.email]);
+          return { ok: false, status: 429, error: 'Too many incorrect attempts. Verification code invalidated. Please request a new code.' };
+        }
+        return { ok: false, status: 400, error: 'Invalid verification code.' };
+      }
+      await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'withdrawal'`, [row.email]);
+      return { ok: true };
+    });
   }
 
   if (IS_PRODUCTION) {
@@ -125,35 +126,36 @@ export async function checkRecoveryCodeAsync(query: string, code: unknown, markV
   const trimmedCode = typeof code === 'string' || typeof code === 'number' ? String(code).trim() : '';
 
   if (isPostgresEnabled()) {
-    const pool = postgresStore.getPool();
-    const res = await pool.query(
-      `SELECT * FROM auth_verification_codes WHERE email = $1 AND type = 'password_reset'`,
-      [queryEmail]
-    );
-    if (res.rows.length === 0) return 'invalid';
-    const row = res.rows[0];
-    if (new Date() > new Date(row.expires_at)) {
-      await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'password_reset'`, [queryEmail]);
-      return 'invalid';
-    }
-    if (Number(row.attempts || 0) >= 5) {
-      await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'password_reset'`, [queryEmail]);
-      return 'locked';
-    }
-    if (row.code !== trimmedCode) {
-      await pool.query(
-        `UPDATE auth_verification_codes SET attempts = attempts + 1 WHERE email = $1 AND type = 'password_reset'`,
+    return postgresStore.executeInTransaction(async (client) => {
+      const res = await client.query(
+        `SELECT * FROM auth_verification_codes WHERE email = $1 AND (type = 'password_reset' OR type = 'reset') FOR UPDATE`,
         [queryEmail]
       );
-      return 'invalid';
-    }
-    if (markVerified) {
-      await pool.query(
-        `UPDATE auth_verification_codes SET attempts = 0 WHERE email = $1 AND type = 'password_reset'`,
-        [queryEmail]
-      );
-    }
-    return 'ok';
+      if (res.rows.length === 0) return 'invalid';
+      const row = res.rows[0];
+      if (new Date() > new Date(row.expires_at)) {
+        await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND (type = 'password_reset' OR type = 'reset')`, [queryEmail]);
+        return 'invalid';
+      }
+      if (Number(row.attempts || 0) >= 5) {
+        await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND (type = 'password_reset' OR type = 'reset')`, [queryEmail]);
+        return 'locked';
+      }
+      if (row.code !== trimmedCode) {
+        await client.query(
+          `UPDATE auth_verification_codes SET attempts = attempts + 1 WHERE email = $1 AND (type = 'password_reset' OR type = 'reset')`,
+          [queryEmail]
+        );
+        return 'invalid';
+      }
+      if (markVerified) {
+        await client.query(
+          `UPDATE auth_verification_codes SET attempts = 0 WHERE email = $1 AND (type = 'password_reset' OR type = 'reset')`,
+          [queryEmail]
+        );
+      }
+      return 'ok';
+    });
   }
 
   if (IS_PRODUCTION) {
@@ -322,39 +324,46 @@ export async function handleLogin(req: Request, res: Response) {
     }
 
     if (isPostgresEnabled()) {
-      const pool = postgresStore.getPool();
-      const codeRes = await pool.query(
-        `SELECT * FROM auth_verification_codes WHERE email = $1 AND type = 'verify'`,
-        [userEmailKey]
-      );
-      if (codeRes.rows.length === 0) {
-        recordFailedLogin();
-        return res.status(400).json({ error: 'Invalid or expired email verification code.' });
-      }
-      const row = codeRes.rows[0];
-      if (new Date() > new Date(row.expires_at)) {
-        await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'verify'`, [userEmailKey]);
-        recordFailedLogin();
-        return res.status(400).json({ error: 'Invalid or expired email verification code.' });
-      }
-      if (Number(row.attempts || 0) >= 5) {
-        await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'verify'`, [userEmailKey]);
-        return res.status(429).json({ error: 'Too many failed attempts. Please log in again to receive a new code.' });
-      }
-      if (row.code !== providedCode) {
-        const upd = await pool.query(
-          `UPDATE auth_verification_codes SET attempts = attempts + 1 WHERE email = $1 AND type = 'verify' RETURNING attempts`,
+      const codeCheckErr = await postgresStore.executeInTransaction(async (client) => {
+        const codeRes = await client.query(
+          `SELECT * FROM auth_verification_codes WHERE email = $1 AND type = 'verify' FOR UPDATE`,
           [userEmailKey]
         );
-        if (Number(upd.rows[0]?.attempts || 0) >= 5) {
-          await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'verify'`, [userEmailKey]);
-          return res.status(429).json({ error: 'Too many failed attempts. Please log in again to receive a new code.' });
+        if (codeRes.rows.length === 0) {
+          return { status: 400, error: 'Invalid or expired email verification code.' };
         }
+        const row = codeRes.rows[0];
+        if (new Date() > new Date(row.expires_at)) {
+          await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'verify'`, [userEmailKey]);
+          return { status: 400, error: 'Invalid or expired email verification code.' };
+        }
+        if (Number(row.attempts || 0) >= 5) {
+          await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'verify'`, [userEmailKey]);
+          return { status: 429, error: 'Too many failed attempts. Please log in again to receive a new code.' };
+        }
+        if (row.code !== providedCode) {
+          const upd = await client.query(
+            `UPDATE auth_verification_codes SET attempts = attempts + 1 WHERE email = $1 AND type = 'verify' RETURNING attempts`,
+            [userEmailKey]
+          );
+          if (Number(upd.rows[0]?.attempts || 0) >= 5) {
+            await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'verify'`, [userEmailKey]);
+            return { status: 429, error: 'Too many failed attempts. Please log in again to receive a new code.' };
+          }
+          return { status: 400, error: 'Invalid or expired email verification code.' };
+        }
+        await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'verify'`, [userEmailKey]);
+        return null;
+      });
+
+      if (codeCheckErr) {
         recordFailedLogin();
-        return res.status(400).json({ error: 'Invalid or expired email verification code.' });
+        return res.status(codeCheckErr.status).json({ error: codeCheckErr.error });
       }
-      await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'verify'`, [userEmailKey]);
     } else {
+      if (IS_PRODUCTION) {
+        return res.status(500).json({ error: 'Security verification requires database connection in production.' });
+      }
       const record = emailVerificationCodes.get(userEmailKey);
       if (!record || Date.now() > record.expiresAt) {
         recordFailedLogin();

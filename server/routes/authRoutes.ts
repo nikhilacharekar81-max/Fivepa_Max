@@ -180,38 +180,44 @@ authRouter.post('/verify-email', rateLimit(30, 3_600_000), async (req: Request, 
 
   let valid = false;
   if (isPostgresEnabled()) {
-    const pool = postgresStore.getPool();
     try {
-      const codeRes = await pool.query(
-        `SELECT * FROM auth_verification_codes WHERE email = $1 AND type = 'verify'`,
-        [normalizedEmail]
-      );
-      if (codeRes.rows.length === 0) {
-        return res.status(400).json({ error: 'Invalid verification code.' });
-      }
-      const row = codeRes.rows[0];
-      if (new Date() > new Date(row.expires_at)) {
-        await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'verify'`, [normalizedEmail]);
-        return res.status(400).json({ error: 'Verification code has expired. Please request a new one.' });
-      }
-      if (Number(row.attempts || 0) >= 5) {
-        await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'verify'`, [normalizedEmail]);
-        return res.status(429).json({ error: 'Too many failed attempts. Code invalidated.' });
-      }
-      if (row.code === code) {
-        valid = true;
-        await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'verify'`, [normalizedEmail]);
-      } else {
-        const upd = await pool.query(
-          `UPDATE auth_verification_codes SET attempts = attempts + 1 WHERE email = $1 AND type = 'verify' RETURNING attempts`,
+      const result = await postgresStore.executeInTransaction(async (client) => {
+        const codeRes = await client.query(
+          `SELECT * FROM auth_verification_codes WHERE email = $1 AND type = 'verify' FOR UPDATE`,
           [normalizedEmail]
         );
-        if (Number(upd.rows[0]?.attempts || 0) >= 5) {
-          await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'verify'`, [normalizedEmail]);
-          return res.status(429).json({ error: 'Too many failed attempts. Code invalidated.' });
+        if (codeRes.rows.length === 0) {
+          return { status: 400, error: 'Invalid verification code.' };
         }
-        return res.status(400).json({ error: 'Invalid verification code.' });
+        const row = codeRes.rows[0];
+        if (new Date() > new Date(row.expires_at)) {
+          await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'verify'`, [normalizedEmail]);
+          return { status: 400, error: 'Verification code has expired. Please request a new one.' };
+        }
+        if (Number(row.attempts || 0) >= 5) {
+          await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'verify'`, [normalizedEmail]);
+          return { status: 429, error: 'Too many failed attempts. Code invalidated.' };
+        }
+        if (row.code === code) {
+          await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'verify'`, [normalizedEmail]);
+          return { ok: true };
+        } else {
+          const upd = await client.query(
+            `UPDATE auth_verification_codes SET attempts = attempts + 1 WHERE email = $1 AND type = 'verify' RETURNING attempts`,
+            [normalizedEmail]
+          );
+          if (Number(upd.rows[0]?.attempts || 0) >= 5) {
+            await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'verify'`, [normalizedEmail]);
+            return { status: 429, error: 'Too many failed attempts. Code invalidated.' };
+          }
+          return { status: 400, error: 'Invalid verification code.' };
+        }
+      });
+
+      if (result.error) {
+        return res.status(result.status).json({ error: result.error });
       }
+      valid = true;
     } catch (e) {
       console.error('[Auth] Error querying auth_verification_codes:', e);
       return res.status(500).json({ error: 'Failed to verify code.' });
@@ -472,40 +478,50 @@ authRouter.post('/forgot-password/verify', async (req: Request, res: Response) =
   const trimmedCode = String(code).trim();
 
   if (isPostgresEnabled()) {
-    const pool = postgresStore.getPool();
     try {
-      const codeRes = await pool.query(
-        `SELECT * FROM auth_verification_codes WHERE (email = $1 OR email = (SELECT LOWER(email) FROM users WHERE mobile = $1 LIMIT 1)) AND type = 'reset'`,
-        [query]
-      );
-      if (codeRes.rows.length === 0) {
-        return res.status(400).json({ error: 'Invalid or expired recovery code.' });
-      }
-      const row = codeRes.rows[0];
-      if (new Date() > new Date(row.expires_at)) {
-        await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'reset'`, [row.email]);
-        return res.status(400).json({ error: 'Invalid or expired recovery code.' });
-      }
-      if (Number(row.attempts || 0) >= 5) {
-        await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'reset'`, [row.email]);
-        return res.status(429).json({ error: 'Too many failed attempts. Please request a new recovery code.' });
-      }
-      if (row.code !== trimmedCode) {
-        const upd = await pool.query(
-          `UPDATE auth_verification_codes SET attempts = attempts + 1 WHERE email = $1 AND type = 'reset' RETURNING attempts`,
-          [row.email]
+      const errRes = await postgresStore.executeInTransaction(async (client) => {
+        const codeRes = await client.query(
+          `SELECT * FROM auth_verification_codes WHERE (email = $1 OR email = (SELECT LOWER(email) FROM users WHERE mobile = $1 LIMIT 1)) AND type = 'reset' FOR UPDATE`,
+          [query]
         );
-        if (Number(upd.rows[0]?.attempts || 0) >= 5) {
-          await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'reset'`, [row.email]);
-          return res.status(429).json({ error: 'Too many failed attempts. Please request a new recovery code.' });
+        if (codeRes.rows.length === 0) {
+          return { status: 400, error: 'Invalid or expired recovery code.' };
         }
-        return res.status(400).json({ error: 'Invalid or expired recovery code.' });
+        const row = codeRes.rows[0];
+        if (new Date() > new Date(row.expires_at)) {
+          await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'reset'`, [row.email]);
+          return { status: 400, error: 'Invalid or expired recovery code.' };
+        }
+        if (Number(row.attempts || 0) >= 5) {
+          await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'reset'`, [row.email]);
+          return { status: 429, error: 'Too many failed attempts. Please request a new recovery code.' };
+        }
+        if (row.code !== trimmedCode) {
+          const upd = await client.query(
+            `UPDATE auth_verification_codes SET attempts = attempts + 1 WHERE email = $1 AND type = 'reset' RETURNING attempts`,
+            [row.email]
+          );
+          if (Number(upd.rows[0]?.attempts || 0) >= 5) {
+            await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'reset'`, [row.email]);
+            return { status: 429, error: 'Too many failed attempts. Please request a new recovery code.' };
+          }
+          return { status: 400, error: 'Invalid or expired recovery code.' };
+        }
+        return null;
+      });
+
+      if (errRes) {
+        return res.status(errRes.status).json({ error: errRes.error });
       }
       return res.json({ success: true, message: 'Code verified successfully.' });
     } catch (e) {
       console.error('[Auth] Error verifying reset code from DB:', e);
       return res.status(500).json({ error: 'Failed to verify recovery code.' });
     }
+  }
+
+  if (IS_PRODUCTION) {
+    return res.status(500).json({ error: 'Security verification requires database connection in production.' });
   }
 
   const check = checkRecoveryCode(query, trimmedCode, true);
@@ -534,36 +550,42 @@ authRouter.post('/forgot-password/reset', async (req: Request, res: Response) =>
   const trimmedCode = String(code).trim();
 
   if (isPostgresEnabled()) {
-    const pool = postgresStore.getPool();
     try {
-      const codeRes = await pool.query(
-        `SELECT * FROM auth_verification_codes WHERE (email = $1 OR email = (SELECT LOWER(email) FROM users WHERE mobile = $1 LIMIT 1)) AND type = 'reset'`,
-        [query]
-      );
-      if (codeRes.rows.length === 0) {
-        return res.status(400).json({ error: 'Invalid or expired recovery code. Please request a new one.' });
-      }
-      const row = codeRes.rows[0];
-      if (new Date() > new Date(row.expires_at)) {
-        await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'reset'`, [row.email]);
-        return res.status(400).json({ error: 'Invalid or expired recovery code. Please request a new one.' });
-      }
-      if (Number(row.attempts || 0) >= 5) {
-        await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'reset'`, [row.email]);
-        return res.status(429).json({ error: 'Too many failed attempts. Please request a new recovery code.' });
-      }
-      if (row.code !== trimmedCode) {
-        const upd = await pool.query(
-          `UPDATE auth_verification_codes SET attempts = attempts + 1 WHERE email = $1 AND type = 'reset' RETURNING attempts`,
-          [row.email]
+      const errRes = await postgresStore.executeInTransaction(async (client) => {
+        const codeRes = await client.query(
+          `SELECT * FROM auth_verification_codes WHERE (email = $1 OR email = (SELECT LOWER(email) FROM users WHERE mobile = $1 LIMIT 1)) AND type = 'reset' FOR UPDATE`,
+          [query]
         );
-        if (Number(upd.rows[0]?.attempts || 0) >= 5) {
-          await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'reset'`, [row.email]);
-          return res.status(429).json({ error: 'Too many failed attempts. Please request a new recovery code.' });
+        if (codeRes.rows.length === 0) {
+          return { status: 400, error: 'Invalid or expired recovery code. Please request a new one.' };
         }
-        return res.status(400).json({ error: 'Invalid or expired recovery code. Please request a new one.' });
+        const row = codeRes.rows[0];
+        if (new Date() > new Date(row.expires_at)) {
+          await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'reset'`, [row.email]);
+          return { status: 400, error: 'Invalid or expired recovery code. Please request a new one.' };
+        }
+        if (Number(row.attempts || 0) >= 5) {
+          await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'reset'`, [row.email]);
+          return { status: 429, error: 'Too many failed attempts. Please request a new recovery code.' };
+        }
+        if (row.code !== trimmedCode) {
+          const upd = await client.query(
+            `UPDATE auth_verification_codes SET attempts = attempts + 1 WHERE email = $1 AND type = 'reset' RETURNING attempts`,
+            [row.email]
+          );
+          if (Number(upd.rows[0]?.attempts || 0) >= 5) {
+            await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'reset'`, [row.email]);
+            return { status: 429, error: 'Too many failed attempts. Please request a new recovery code.' };
+          }
+          return { status: 400, error: 'Invalid or expired recovery code. Please request a new one.' };
+        }
+        await client.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'reset'`, [row.email]);
+        return null;
+      });
+
+      if (errRes) {
+        return res.status(errRes.status).json({ error: errRes.error });
       }
-      await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'reset'`, [row.email]);
     } catch (e) {
       console.error('[Auth] Error querying reset code during reset:', e);
       return res.status(500).json({ error: 'Failed to reset password.' });

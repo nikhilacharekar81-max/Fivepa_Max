@@ -820,7 +820,6 @@ export class FinancialTransactionService {
     sellerId: string;
     actor: string;
     idempotencyKey?: string;
-    feeBreakdown?: any;
   }, externalClient?: any) {
     assertValidMoneyAmount(params.amount, 'amount');
 
@@ -887,7 +886,7 @@ export class FinancialTransactionService {
       const { siteSettings } = await import('../admin/siteSettings.js');
       const comm = siteSettings.getSettings().commission;
 
-      const gigPrice = Number(params.amount.toFixed(2));
+      const gigPrice = Number(orderRow ? orderRow.amount : params.amount.toFixed(2));
       if (gigPrice < 1.00) {
         throw new Error('Minimum order amount is $1.00');
       }
@@ -1523,13 +1522,28 @@ export class FinancialTransactionService {
         throw new Error(`Insufficient available balance.`);
       }
 
+      let normalizedAccount = '';
+      if (typeof params.accountDetails === 'string') {
+        normalizedAccount = params.accountDetails.trim();
+      } else if (params.accountDetails && typeof params.accountDetails === 'object') {
+        try {
+          const sortedKeys = Object.keys(params.accountDetails).sort();
+          const normObj: any = {};
+          for (const k of sortedKeys) normObj[k] = (params.accountDetails as any)[k];
+          normalizedAccount = JSON.stringify(normObj);
+        } catch {
+          normalizedAccount = String(params.accountDetails);
+        }
+      }
+
       const idempotencyKey = params.idempotencyKey || `IDEMP-PAYREQ-${params.payoutId}`;
       const payloadFingerprint = {
         payoutId: params.payoutId,
         freelancerId: params.freelancerId,
         amount: params.amount,
         method: params.method,
-        accountDetails: params.accountDetails
+        accountDetails: normalizedAccount,
+        destination: normalizedAccount
       };
 
       const check = await checkOrRecordIdempotency(client, idempotencyKey, 'requestPayout', payloadFingerprint);
@@ -1903,19 +1917,44 @@ export class FinancialTransactionService {
         throw new Error('Only failed payouts can be retried.');
       }
 
+      if (params.actor && !params.actor.startsWith('admin') && !params.actor.startsWith('system') && params.actor !== payout.freelancer_id) {
+        throw new Error('Unauthorized: You can only retry your own payouts.');
+      }
+
+      const rawAccount = payout.account_details || payout.accountDetails || '';
+      let normalizedAccount = '';
+      if (typeof rawAccount === 'string') {
+        normalizedAccount = rawAccount.trim();
+      } else if (rawAccount && typeof rawAccount === 'object') {
+        try {
+          const sortedKeys = Object.keys(rawAccount).sort();
+          const normObj: any = {};
+          for (const k of sortedKeys) normObj[k] = rawAccount[k];
+          normalizedAccount = JSON.stringify(normObj);
+        } catch {
+          normalizedAccount = String(rawAccount);
+        }
+      }
+
+      if (!normalizedAccount) {
+        throw new Error('Payout destination details missing or invalid.');
+      }
+
+      const amount = assertValidMoneyAmount(Number(payout.amount), 'payout retry amount');
+
       const idempKey = params.idempotencyKey || `IDEMP-PAY-RETRY-${params.payoutId}-${payout.updated_at || payout.created_at || Date.now()}`;
       const payloadFingerprint = {
         payoutId: params.payoutId,
         freelancerId: payout.freelancer_id,
-        amount: payout.amount,
+        amount,
         method: payout.method,
-        accountDetails: payout.account_details || payout.accountDetails
+        accountDetails: normalizedAccount,
+        destination: normalizedAccount
       };
 
       const check = await checkOrRecordIdempotency(client, idempKey, 'retryPayout', payloadFingerprint);
       if (check.replayed) return check.result;
 
-      const amount = Number(payout.amount);
       const wRes = await client.query('SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE', [payout.freelancer_id]);
       if (wRes.rows.length === 0) throw new Error('Freelancer wallet not found');
       const wallet = wRes.rows[0];
@@ -1929,6 +1968,20 @@ export class FinancialTransactionService {
 
       const { siteSettings } = await import('../admin/siteSettings.js');
       const walletConfig = siteSettings.getSettings().wallets;
+
+      if (walletConfig.allowedPayoutMethods) {
+        const methodsObj = walletConfig.allowedPayoutMethods as any;
+        if (typeof methodsObj === 'object' && !Array.isArray(methodsObj)) {
+          if (methodsObj[payout.method] === false) {
+            throw new Error(`Payout method "${payout.method}" is not currently supported or allowed.`);
+          }
+        } else if (Array.isArray(methodsObj) && methodsObj.length > 0) {
+          if (!methodsObj.includes(payout.method)) {
+            throw new Error(`Payout method "${payout.method}" is not currently supported or allowed.`);
+          }
+        }
+      }
+
       const minPayout = walletConfig.minimumWithdrawalAmount ?? 10.00;
       if (amount < minPayout) {
         throw new Error(`Minimum payout withdrawal amount is $${minPayout.toFixed(2)}.`);

@@ -391,11 +391,11 @@ const handlePaymentWebhook = async (req: Request, res: Response) => {
   if (!txId) {
     return res.status(400).json({ error: 'Missing required transactionId or eventId' });
   }
-  if (currency && currency !== 'USD') {
-    return res.status(400).json({ error: 'Invalid currency: only USD is supported' });
+  if (!currency || currency !== 'USD') {
+    return res.status(400).json({ error: 'Invalid or missing currency: provider webhook currency must be explicitly USD.' });
   }
 
-  if (event === 'payment.succeeded' && userId && amount) {
+  if ((event === 'payment.succeeded' || event === 'checkout.session.completed' || event === 'payment_intent.succeeded') && userId && amount) {
     const pool = postgresStore.getPool();
     const chkId = checkoutId || sessionId;
     if (!chkId) {
@@ -414,6 +414,9 @@ const handlePaymentWebhook = async (req: Request, res: Response) => {
     const sess = sessRes.rows[0];
     if (sess.user_id !== userId) {
       return res.status(400).json({ error: 'Checkout session user mismatch.' });
+    }
+    if (!sess.currency || sess.currency !== 'USD') {
+      return res.status(400).json({ error: 'Checkout session currency mismatch.' });
     }
     if (Math.abs(Number(sess.expected_amount) - Number(amount)) > 0.01) {
       return res.status(400).json({ error: 'Checkout session amount mismatch.' });

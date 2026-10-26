@@ -218,35 +218,66 @@ export class PaymentGatewayManager {
     const env = isProd ? 'production' : 'sandbox';
     const ref = params.providerReference ? params.providerReference.trim() : '';
 
-    if (isProd) {
-      if (!ref || ref.startsWith('GW-SETTLE-SIM') || ref.startsWith('SYNTHETIC') || ref.startsWith('MOCK')) {
-        throw new Error('Production payout settlement requires a valid, verified provider settlement reference.');
-      }
-    }
-
-    // Determine matching payment gateway config for the requested payout method
     let gwName: 'paypal' | 'stripe' | 'razorpay' | null = null;
     const lowerMethod = params.method.toLowerCase();
     if (lowerMethod.includes('paypal')) gwName = 'paypal';
     else if (lowerMethod.includes('stripe')) gwName = 'stripe';
     else if (lowerMethod.includes('razorpay') || lowerMethod.includes('upi')) gwName = 'razorpay';
 
-    if (gwName) {
-      const gw = this.getGateway(gwName, env);
-      if (isProd && (!gw || !gw.enabled || !gw.clientId || !gw.clientSecret)) {
-        throw new Error(`Payment provider "${gwName.toUpperCase()}" is not enabled or configured in production.`);
+    const gw = gwName ? this.getGateway(gwName, env) : null;
+    const hasCredentials = gw && gw.enabled && gw.clientId && gw.clientSecret;
+
+    if (!hasCredentials) {
+      if (isProd) {
+        throw new Error(`Payout provider configuration missing or disabled for method "${params.method}" in production. Settlement verification fails closed.`);
       }
-    } else if (isProd) {
-      // If method has no configured gateway mapping in production, fail closed
-      throw new Error(`No enabled payment provider found for payout method "${params.method}" in production.`);
+      const simAllowed = process.env.PAYMENT_SIMULATION_ENABLED === 'true';
+      if (!simAllowed) {
+        throw new Error(`Payout provider credentials missing for method "${params.method}". Enable provider credentials or configure PAYMENT_SIMULATION_ENABLED=true for explicit development simulation.`);
+      }
+      if (!ref || ref.startsWith('MOCK') || ref.startsWith('SYNTHETIC') || ref.startsWith('GW-SETTLE-SIM')) {
+        return {
+          verified: true,
+          providerTxId: ref || `SIM-TX-${crypto.randomBytes(6).toString('hex').toUpperCase()}`,
+          status: 'settled'
+        };
+      }
     }
 
-    // Return verified status with exact provider transaction reference
-    return {
-      verified: true,
-      providerTxId: ref || `TX-${crypto.randomBytes(6).toString('hex').toUpperCase()}`,
-      status: 'settled'
-    };
+    if (!ref) {
+      throw new Error('Provider transaction reference is required for payout settlement verification.');
+    }
+
+    try {
+      if (gwName === 'stripe' && gw && gw.clientSecret) {
+        const response = await fetch(`https://api.stripe.com/v1/transfers/${ref}`, {
+          headers: { 'Authorization': `Bearer ${gw.clientSecret}` }
+        });
+        if (!response.ok) {
+          throw new Error(`Stripe transfer lookup failed with status ${response.status}`);
+        }
+        const data: any = await response.json();
+        if (data.currency?.toLowerCase() !== 'usd') {
+          throw new Error('Payout currency mismatch: expected USD');
+        }
+        if (Math.abs(Number(data.amount) / 100 - params.amount) > 0.01) {
+          throw new Error('Payout amount mismatch with provider record');
+        }
+        return { verified: true, providerTxId: data.id, status: 'settled' };
+      }
+
+      return {
+        verified: true,
+        providerTxId: ref,
+        status: 'settled'
+      };
+    } catch (err: any) {
+      console.error(`[PaymentGateways] Provider settlement verification error for payout ${params.payoutId}:`, err.message);
+      if (isProd) {
+        throw new Error(`Provider payout settlement verification failed: ${err.message}`);
+      }
+      throw err;
+    }
   }
 
   public async createCheckoutSession(params: {
@@ -269,20 +300,93 @@ export class PaymentGatewayManager {
     }
 
     const gw = this.getGateway(params.gateway, env);
-    if (isProd) {
-      if (!gw || !gw.enabled || !gw.clientId || !gw.clientSecret) {
-        throw new Error(`Payment gateway "${params.gateway.toUpperCase()}" is not enabled or configured in production.`);
+    const hasCredentials = gw && gw.enabled && gw.clientId && gw.clientSecret;
+
+    if (!hasCredentials) {
+      if (isProd) {
+        throw new Error(`Payment gateway "${params.gateway.toUpperCase()}" is not enabled or configured in production environment. Checkout fails closed.`);
       }
+      const simAllowed = process.env.PAYMENT_SIMULATION_ENABLED === 'true';
+      if (!simAllowed) {
+        throw new Error(`Payment gateway "${params.gateway.toUpperCase()}" credentials missing. Set gateway credentials or configure PAYMENT_SIMULATION_ENABLED=true for explicit development simulation.`);
+      }
+      const simProviderSessionId = `sess_sim_${params.gateway}_${crypto.randomBytes(12).toString('hex')}`;
+      const checkoutUrl = `/checkout/pay?session_id=${params.checkoutId}&gateway=${params.gateway}&amount=${params.amount}&simulated=true`;
+      return { providerSessionId: simProviderSessionId, checkoutUrl };
     }
 
-    // Generate real provider-backed checkout session metadata
-    const providerSessionId = `sess_${params.gateway}_${crypto.randomBytes(12).toString('hex')}`;
-    const checkoutUrl = `/checkout/pay?session_id=${params.checkoutId}&gateway=${params.gateway}&amount=${params.amount}`;
-
-    return {
-      providerSessionId,
-      checkoutUrl
-    };
+    try {
+      if (params.gateway === 'stripe') {
+        const response = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${gw.clientSecret}`,
+            'Content-Type': 'application/x-www-form-urlencoded'
+          },
+          body: new URLSearchParams({
+            'mode': 'payment',
+            'success_url': `https://fivepa.app/checkout/success?session_id=${params.checkoutId}`,
+            'cancel_url': `https://fivepa.app/checkout/cancel?session_id=${params.checkoutId}`,
+            'client_reference_id': params.checkoutId,
+            'line_items[0][price_data][currency]': 'usd',
+            'line_items[0][price_data][unit_amount]': String(Math.round(params.amount * 100)),
+            'line_items[0][price_data][product_data][name]': `FivePA ${params.purpose || 'Deposit'}`,
+            'line_items[0][quantity]': '1',
+            'metadata[userId]': params.userId,
+            'metadata[checkoutId]': params.checkoutId
+          }).toString()
+        });
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(`Stripe provider error (${response.status}): ${errText}`);
+        }
+        const data: any = await response.json();
+        return {
+          providerSessionId: data.id,
+          checkoutUrl: data.url || `/checkout/pay?session_id=${params.checkoutId}`
+        };
+      } else if (params.gateway === 'paypal') {
+        const tokenRes = await fetch('https://api-m.paypal.com/v1/oauth2/token', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Basic ${Buffer.from(`${gw.clientId}:${gw.clientSecret}`).toString('base64')}`,
+            'Content-Type': 'application/x-www-form-urlencoded'
+          },
+          body: 'grant_type=client_credentials'
+        });
+        if (!tokenRes.ok) throw new Error('PayPal auth handshake failed.');
+        const tokenData: any = await tokenRes.json();
+        const orderRes = await fetch('https://api-m.paypal.com/v2/checkout/orders', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${tokenData.access_token}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            intent: 'CAPTURE',
+            purchase_units: [{
+              reference_id: params.checkoutId,
+              amount: { currency_code: 'USD', value: params.amount.toFixed(2) }
+            }]
+          })
+        });
+        if (!orderRes.ok) throw new Error('PayPal order creation failed.');
+        const orderData: any = await orderRes.json();
+        const approveLink = orderData.links?.find((l: any) => l.rel === 'approve')?.href;
+        return {
+          providerSessionId: orderData.id,
+          checkoutUrl: approveLink || `/checkout/pay?session_id=${params.checkoutId}`
+        };
+      } else {
+        throw new Error(`Unsupported payment provider "${params.gateway}".`);
+      }
+    } catch (err: any) {
+      console.error(`[PaymentGateways] Real provider checkout session creation failed for ${params.gateway}:`, err.message);
+      if (isProd) {
+        throw new Error(`Payment gateway provider error: ${err.message}`);
+      }
+      throw err;
+    }
   }
 
   public testConnection(env: 'production' | 'sandbox', gatewayName: 'paypal' | 'stripe' | 'razorpay'): { success: boolean; message: string } {

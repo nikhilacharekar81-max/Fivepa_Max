@@ -186,8 +186,60 @@ export class FinanceRepo {
     return res.rows.map(r => this.mapPaymentMethodRow(r));
   }
 
+  private validateAndNormalizePaymentMethodDetails(type: string, details: any): Record<string, any> {
+    const normType = (type || '').toLowerCase().trim();
+    if (!normType) {
+      throw new Error('Payment method type is required.');
+    }
+
+    const rawDetails = details && typeof details === 'object' ? { ...details } : {};
+
+    // Strip sensitive secrets from stored details
+    delete rawDetails.cvv;
+    delete rawDetails.cvc;
+    delete rawDetails.pin;
+    delete rawDetails.password;
+    delete rawDetails.secret;
+
+    if (normType === 'paypal') {
+      const email = String(rawDetails.email || rawDetails.paypalEmail || rawDetails.handle || '').trim().toLowerCase();
+      if (!email || !email.includes('@')) {
+        throw new Error('Invalid PayPal payment method: a valid email address is required.');
+      }
+      return { ...rawDetails, email };
+    } else if (normType === 'bank_transfer' || normType === 'bank') {
+      const acct = String(rawDetails.accountNumber || rawDetails.iban || rawDetails.account_number || '').trim();
+      if (!acct || acct.length < 4) {
+        throw new Error('Invalid bank transfer method: account number or IBAN is required.');
+      }
+      const maskedAcct = acct.length > 4 ? `••••${acct.slice(-4)}` : acct;
+      return {
+        ...rawDetails,
+        accountNumber: maskedAcct,
+        routingNumber: rawDetails.routingNumber ? String(rawDetails.routingNumber).trim() : undefined,
+        bankName: rawDetails.bankName ? String(rawDetails.bankName).trim() : undefined
+      };
+    } else if (normType === 'crypto') {
+      const address = String(rawDetails.address || rawDetails.walletAddress || '').trim();
+      if (!address || address.length < 10) {
+        throw new Error('Invalid crypto payment method: a valid wallet address is required.');
+      }
+      return { ...rawDetails, address };
+    } else if (normType === 'stripe' || normType === 'card') {
+      const last4 = String(rawDetails.last4 || rawDetails.cardLast4 || '').trim();
+      return {
+        ...rawDetails,
+        last4: last4 || '••••',
+        brand: rawDetails.brand ? String(rawDetails.brand).trim() : 'card'
+      };
+    }
+
+    return rawDetails;
+  }
+
   async savePaymentMethod(pm: PaymentMethodRecord | any): Promise<void> {
     if (!pm?.id) return;
+    const validatedDetails = this.validateAndNormalizePaymentMethodDetails(pm.type, pm.details);
     return this.ctx.withLock(`pm_${pm.userId}`, async () => {
       const client = await this.ctx.getPool().connect();
       try {
@@ -204,7 +256,7 @@ export class FinanceRepo {
              name = EXCLUDED.name,
              details = EXCLUDED.details,
              is_default = EXCLUDED.is_default`,
-          [pm.id, pm.userId, pm.type, pm.name, JSON.stringify(pm.details || {}), Boolean(pm.isDefault), pm.createdAt || new Date().toISOString().substring(0, 10)]
+          [pm.id, pm.userId, pm.type, pm.name, JSON.stringify(validatedDetails), Boolean(pm.isDefault), pm.createdAt || new Date().toISOString().substring(0, 10)]
         );
         await client.query('COMMIT');
       } catch (e) {

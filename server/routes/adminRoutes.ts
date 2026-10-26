@@ -9,8 +9,8 @@ import {
   type User,
   type Order
 } from '../store.js';
-import { postgresStore } from '../db/postgresStore.js';
-import { financialRepository } from '../services/financialService.js';
+import { postgresStore, isPostgresEnabled } from '../db/postgresStore.js';
+import { financialRepository, financialTransactionService } from '../domains/finance/financial.service.js';
 import { siteSettings } from '../../src/server/siteSettings.js';
 import { paymentGatewayManager } from '../../src/server/paymentGateways.js';
 import {
@@ -1129,60 +1129,112 @@ router.get('/admin/refunds', requireAdmin, async (_req: Request, res: Response) 
 
 router.post('/admin/refunds/:id/approve', requireAdmin, async (req: Request, res: Response) => {
   try {
-    const pool = postgresStore.getPool();
-    const refRes = await pool.query('SELECT * FROM refunds WHERE id = $1', [req.params.id]);
-    if (refRes.rows.length === 0) return res.status(404).json({ error: 'Refund not found' });
-    const r = refRes.rows[0];
+    if (!isPostgresEnabled()) {
+      const pool = postgresStore.getPool();
+      const refRes = await pool.query('SELECT * FROM refunds WHERE id = $1', [req.params.id]);
+      if (refRes.rows.length === 0) return res.status(404).json({ error: 'Refund not found' });
+      const r = refRes.rows[0];
 
-    if (r.status === 'approved' || r.status === 'executed') {
-      return res.status(400).json({ error: 'Refund has already been approved and executed.' });
-    }
-    if (r.status !== 'pending' && r.status !== 'requested') {
-      return res.status(400).json({ error: `Cannot approve refund in status "${r.status}".` });
+      if (r.status === 'approved' || r.status === 'executed') {
+        return res.status(400).json({ error: 'Refund has already been approved and executed.' });
+      }
+      if (r.status !== 'pending' && r.status !== 'requested') {
+        return res.status(400).json({ error: `Cannot approve refund in status "${r.status}".` });
+      }
+
+      const order = await store.getOrder(r.order_id);
+      if (order) {
+        await refundOrderFunds(order, Number(r.amount), adminActor(req), 'Admin approved refund');
+      }
+      await postgresStore.financeRepo.saveRefunds([{
+        id: r.id,
+        orderId: r.order_id,
+        buyerId: r.buyer_id,
+        amount: Number(r.amount),
+        reason: r.reason || 'Admin approved refund',
+        status: 'approved',
+        createdAt: r.created_at || new Date().toISOString()
+      }]);
+      return res.json({ success: true, refundId: r.id, status: 'approved' });
     }
 
-    const order = await store.getOrder(r.order_id);
-    if (order) {
-      await refundOrderFunds(order, Number(r.amount), adminActor(req), 'Admin approved refund');
-    }
-    await postgresStore.financeRepo.saveRefunds([{
-      id: r.id,
-      orderId: r.order_id,
-      buyerId: r.buyer_id,
-      amount: Number(r.amount),
-      reason: r.reason || 'Admin approved refund',
-      status: 'approved',
-      createdAt: r.created_at || new Date().toISOString()
-    }]);
-    res.json({ success: true, refundId: r.id, status: 'approved' });
+    await postgresStore.executeInTransaction(async (client) => {
+      const refRes = await client.query('SELECT * FROM refunds WHERE id = $1 FOR UPDATE', [req.params.id]);
+      if (refRes.rows.length === 0) throw new Error('Refund not found');
+      const r = refRes.rows[0];
+
+      if (r.status === 'approved' || r.status === 'executed') {
+        throw new Error('Refund has already been approved and executed.');
+      }
+      if (r.status !== 'pending' && r.status !== 'requested') {
+        throw new Error(`Cannot approve refund in status "${r.status}".`);
+      }
+
+      const orderRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [r.order_id]);
+      if (orderRes.rows.length === 0) throw new Error(`Order ${r.order_id} not found`);
+      const orderRow = orderRes.rows[0];
+
+      await financialTransactionService.refundOrderFunds({
+        orderId: r.order_id,
+        amount: Number(r.amount),
+        reason: r.reason || 'Admin approved refund',
+        actor: adminActor(req)
+      }, client);
+
+      await client.query(
+        "UPDATE refunds SET status = 'approved' WHERE id = $1",
+        [r.id]
+      );
+    });
+
+    res.json({ success: true, refundId: req.params.id, status: 'approved' });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(400).json({ error: err.message });
   }
 });
 
 router.post('/admin/refunds/:id/reject', requireAdmin, async (req: Request, res: Response) => {
   try {
-    const pool = postgresStore.getPool();
-    const refRes = await pool.query('SELECT * FROM refunds WHERE id = $1', [req.params.id]);
-    if (refRes.rows.length === 0) return res.status(404).json({ error: 'Refund not found' });
-    const r = refRes.rows[0];
+    if (!isPostgresEnabled()) {
+      const pool = postgresStore.getPool();
+      const refRes = await pool.query('SELECT * FROM refunds WHERE id = $1', [req.params.id]);
+      if (refRes.rows.length === 0) return res.status(404).json({ error: 'Refund not found' });
+      const r = refRes.rows[0];
 
-    if (r.status === 'approved' || r.status === 'executed') {
-      return res.status(400).json({ error: 'Cannot reject a refund that has already been executed.' });
+      if (r.status === 'approved' || r.status === 'executed') {
+        return res.status(400).json({ error: 'Cannot reject a refund that has already been executed.' });
+      }
+
+      await postgresStore.financeRepo.saveRefunds([{
+        id: r.id,
+        orderId: r.order_id,
+        buyerId: r.buyer_id,
+        amount: Number(r.amount),
+        reason: r.reason || 'Admin rejected refund',
+        status: 'rejected',
+        createdAt: r.created_at || new Date().toISOString()
+      }]);
+      return res.json({ success: true, refundId: req.params.id, status: 'rejected' });
     }
 
-    await postgresStore.financeRepo.saveRefunds([{
-      id: r.id,
-      orderId: r.order_id,
-      buyerId: r.buyer_id,
-      amount: Number(r.amount),
-      reason: r.reason || 'Admin rejected refund',
-      status: 'rejected',
-      createdAt: r.created_at || new Date().toISOString()
-    }]);
+    await postgresStore.executeInTransaction(async (client) => {
+      const refRes = await client.query('SELECT * FROM refunds WHERE id = $1 FOR UPDATE', [req.params.id]);
+      if (refRes.rows.length === 0) throw new Error('Refund not found');
+      const r = refRes.rows[0];
+
+      if (r.status === 'approved' || r.status === 'executed') {
+        throw new Error('Cannot reject a refund that has already been executed.');
+      }
+
+      await client.query(
+        "UPDATE refunds SET status = 'rejected' WHERE id = $1",
+        [r.id]
+      );
+    });
+
     res.json({ success: true, refundId: req.params.id, status: 'rejected' });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(400).json({ error: err.message });
   }
 });
 
