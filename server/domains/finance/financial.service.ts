@@ -955,7 +955,25 @@ export class FinancialTransactionService {
         [params.orderId, params.orderTitle, params.buyerId, params.sellerId, gigPrice, serviceFee, smallOrderFee, commissionPercent]
       );
       
-      const feeSnapshot = { gigPrice, serviceFee, smallOrderFee, clientTotal, commissionPercent };
+      const buyerFeePercent = comm.buyerProcessingFeePercent ?? DEFAULT_FEE_CONFIG.buyerFeePercent;
+      const smallOrderThreshold = comm.smallOrderFeeThreshold ?? DEFAULT_FEE_CONFIG.smallOrderThreshold;
+
+      const feeSnapshot = {
+        gigPrice,
+        serviceFee,
+        smallOrderFee,
+        clientTotal,
+        freelancerNet: calculated.freelancerNet,
+        platformCommission: calculated.platformCommission,
+        commissionPercent,
+        buyerFeePercent,
+        smallOrderThreshold,
+        minimumOrderAmount: 1.00,
+        currency: 'USD',
+        policyVersion: 'v1.0.0-authoritative',
+        capturedAt: new Date().toISOString()
+      };
+
       await client.query(
         'UPDATE orders SET status = $1, fee_breakdown = $2, service_fee = $3, small_order_fee = $4 WHERE id = $5',
         ['funded_in_escrow', JSON.stringify(feeSnapshot), serviceFee, smallOrderFee, params.orderId]
@@ -2355,6 +2373,127 @@ export class FinancialTransactionService {
         "SELECT id FROM earnings_clearing WHERE status = 'clearing' AND clearance_end <= NOW() FOR UPDATE SKIP LOCKED"
       );
       return res.rows.map(r => r.id);
+    });
+  }
+
+  async runFinancialReconciliation(): Promise<{
+    reconciled: boolean;
+    timestamp: string;
+    summary: {
+      wallets: { totalAvailable: number; totalHold: number; totalPendingWithdrawals: number };
+      escrows: { totalRemaining: number; countHeld: number };
+      payouts: { totalPending: number; countPending: number };
+      clearing: { totalClearing: number; countClearing: number };
+      ledgerAccounts: Record<string, number>;
+    };
+    discrepancies: string[];
+  }> {
+    if (!isPostgresEnabled()) {
+      return {
+        reconciled: true,
+        timestamp: new Date().toISOString(),
+        summary: {
+          wallets: { totalAvailable: 0, totalHold: 0, totalPendingWithdrawals: 0 },
+          escrows: { totalRemaining: 0, countHeld: 0 },
+          payouts: { totalPending: 0, countPending: 0 },
+          clearing: { totalClearing: 0, countClearing: 0 },
+          ledgerAccounts: {}
+        },
+        discrepancies: []
+      };
+    }
+
+    return postgresStore.executeInTransaction(async (client) => {
+      const wRes = await client.query(
+        `SELECT 
+           COALESCE(SUM(available_balance), 0) as total_avail,
+           COALESCE(SUM(funds_on_hold), 0) as total_hold,
+           COALESCE(SUM(pending_withdrawals), 0) as total_pending_withdraw
+         FROM wallets`
+      );
+      const walletTotalAvail = Number(wRes.rows[0]?.total_avail || 0);
+      const walletTotalHold = Number(wRes.rows[0]?.total_hold || 0);
+      const walletTotalPending = Number(wRes.rows[0]?.total_pending_withdraw || 0);
+
+      const escRes = await client.query(
+        `SELECT COALESCE(SUM(remaining), 0) as total_remaining, COUNT(*) as count_held
+         FROM escrows WHERE status IN ('held', 'split')`
+      );
+      const escrowTotalRemaining = Number(escRes.rows[0]?.total_remaining || 0);
+      const escrowHeldCount = Number(escRes.rows[0]?.count_held || 0);
+
+      const payRes = await client.query(
+        `SELECT COALESCE(SUM(amount), 0) as total_pending, COUNT(*) as count_pending
+         FROM payouts WHERE status IN ('pending', 'approved')`
+      );
+      const payoutTotalPending = Number(payRes.rows[0]?.total_pending || 0);
+      const payoutPendingCount = Number(payRes.rows[0]?.count_pending || 0);
+
+      const clrRes = await client.query(
+        `SELECT COALESCE(SUM(amount), 0) as total_clearing, COUNT(*) as count_clearing
+         FROM earnings_clearing WHERE status = 'clearing'`
+      );
+      const clearingTotal = Number(clrRes.rows[0]?.total_clearing || 0);
+      const clearingCount = Number(clrRes.rows[0]?.count_clearing || 0);
+
+      const ledgerRes = await client.query(
+        `SELECT account_code, COALESCE(SUM(debit), 0) as total_debit, COALESCE(SUM(credit), 0) as total_credit
+         FROM ledger_entries GROUP BY account_code`
+      );
+
+      const accts: Record<string, { debit: number; credit: number; net: number }> = {};
+      let totalDebits = 0;
+      let totalCredits = 0;
+
+      for (const row of ledgerRes.rows) {
+        const deb = Number(row.total_debit);
+        const cred = Number(row.total_credit);
+        totalDebits += deb;
+        totalCredits += cred;
+        accts[row.account_code] = { debit: deb, credit: cred, net: cred - deb };
+      }
+
+      const discrepancies: string[] = [];
+
+      if (Math.abs(walletTotalHold - escrowTotalRemaining) > 0.01) {
+        discrepancies.push(`Wallet hold balance ($${walletTotalHold.toFixed(2)}) does not match active escrow remaining ($${escrowTotalRemaining.toFixed(2)}).`);
+      }
+
+      const acct2030Net = accts['2030'] ? accts['2030'].net : 0;
+      if (Math.abs(escrowTotalRemaining - acct2030Net) > 0.01) {
+        discrepancies.push(`Escrow remaining ($${escrowTotalRemaining.toFixed(2)}) does not match Ledger Account 2030 Escrow Liability ($${acct2030Net.toFixed(2)}).`);
+      }
+
+      if (Math.abs(walletTotalPending - payoutTotalPending) > 0.01) {
+        discrepancies.push(`Wallet pending withdrawals ($${walletTotalPending.toFixed(2)}) does not match active payouts ($${payoutTotalPending.toFixed(2)}).`);
+      }
+
+      const acct2040Net = accts['2040'] ? accts['2040'].net : 0;
+      if (Math.abs(payoutTotalPending - acct2040Net) > 0.01) {
+        discrepancies.push(`Pending payouts ($${payoutTotalPending.toFixed(2)}) does not match Ledger Account 2040 Pending Payout Liability ($${acct2040Net.toFixed(2)}).`);
+      }
+
+      const acct2050Net = accts['2050'] ? accts['2050'].net : 0;
+      if (Math.abs(clearingTotal - acct2050Net) > 0.01) {
+        discrepancies.push(`Earnings in clearing ($${clearingTotal.toFixed(2)}) does not match Ledger Account 2050 Pending Clearance Liability ($${acct2050Net.toFixed(2)}).`);
+      }
+
+      if (Math.abs(totalDebits - totalCredits) > 0.01) {
+        discrepancies.push(`Ledger journal equation unbalanced: Total Debits ($${totalDebits.toFixed(2)}) != Total Credits ($${totalCredits.toFixed(2)}).`);
+      }
+
+      return {
+        reconciled: discrepancies.length === 0,
+        timestamp: new Date().toISOString(),
+        summary: {
+          wallets: { totalAvailable: walletTotalAvail, totalHold: walletTotalHold, totalPendingWithdrawals: walletTotalPending },
+          escrows: { totalRemaining: escrowTotalRemaining, countHeld: escrowHeldCount },
+          payouts: { totalPending: payoutTotalPending, countPending: payoutPendingCount },
+          clearing: { totalClearing: clearingTotal, countClearing: clearingCount },
+          ledgerAccounts: Object.fromEntries(Object.entries(accts).map(([k, v]) => [k, v.net]))
+        },
+        discrepancies
+      };
     });
   }
 }

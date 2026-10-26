@@ -474,7 +474,7 @@ router.patch('/admin/payment-gateways/:environment/:gateway', requireAdmin, asyn
   }
 });
 
-router.post('/admin/payment-gateways/:environment/:gateway/test', requireAdmin, (req: Request, res: Response) => {
+router.post('/admin/payment-gateways/:environment/:gateway/test', requireAdmin, async (req: Request, res: Response) => {
   try {
     const env = req.params.environment as 'production' | 'sandbox';
     const gw = req.params.gateway as 'paypal' | 'stripe' | 'razorpay';
@@ -484,7 +484,7 @@ router.post('/admin/payment-gateways/:environment/:gateway/test', requireAdmin, 
       return res.status(400).json({ error: 'Invalid environment or gateway.' });
     }
 
-    const result = paymentGatewayManager.testConnection(env, gw);
+    const result = await paymentGatewayManager.testConnection(env, gw);
 
     registerAuditLog({
       id: 'log_' + Date.now(),
@@ -1120,8 +1120,16 @@ router.get('/admin/refunds', requireAdmin, async (_req: Request, res: Response) 
       amount: Number(r.amount),
       reason: r.reason,
       status: r.status,
-      createdAt: r.created_at
     })));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/admin/reconciliation', requireAdmin, async (_req: Request, res: Response) => {
+  try {
+    const report = await financialTransactionService.runFinancialReconciliation();
+    res.json(report);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

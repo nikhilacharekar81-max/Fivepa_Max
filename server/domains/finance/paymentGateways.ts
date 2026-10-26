@@ -213,6 +213,44 @@ export class PaymentGatewayManager {
     return this.state[env];
   }
 
+  public verifyWebhookSignature(params: { gateway?: string; headers: Record<string, any>; rawBody: Buffer | string }): boolean {
+    const gateway = (params.gateway || 'stripe').toLowerCase();
+    const env = process.env.NODE_ENV === 'production' ? 'production' : 'sandbox';
+    const gw = this.getGateway(gateway as any, env);
+    const webhookSecret = gw?.webhookId || process.env.WEBHOOK_SECRET;
+
+    if (!webhookSecret) return false;
+
+    const bodyStr = typeof params.rawBody === 'string' ? params.rawBody : params.rawBody.toString('utf8');
+
+    if (gateway === 'stripe') {
+      const sigHeader = params.headers['stripe-signature'] || params.headers['x-webhook-signature'];
+      if (!sigHeader) return false;
+      const parts = String(sigHeader).split(',').reduce((acc: any, item) => {
+        const [k, v] = item.split('=');
+        if (k && v) acc[k.trim()] = v.trim();
+        return acc;
+      }, {});
+      if (!parts.t || !parts.v1) {
+        const h = crypto.createHmac('sha256', webhookSecret).update(bodyStr).digest('hex');
+        return crypto.timingSafeEqual(Buffer.from(String(sigHeader)), Buffer.from(h));
+      }
+      const signedPayload = `${parts.t}.${bodyStr}`;
+      const expectedSig = crypto.createHmac('sha256', webhookSecret).update(signedPayload).digest('hex');
+      return crypto.timingSafeEqual(Buffer.from(parts.v1), Buffer.from(expectedSig));
+    } else if (gateway === 'razorpay') {
+      const sig = params.headers['x-razorpay-signature'] || params.headers['x-webhook-signature'];
+      if (!sig) return false;
+      const expectedSig = crypto.createHmac('sha256', webhookSecret).update(bodyStr).digest('hex');
+      return crypto.timingSafeEqual(Buffer.from(String(sig)), Buffer.from(expectedSig));
+    } else {
+      const sig = params.headers['x-webhook-signature'] || params.headers['paypal-transmission-sig'];
+      if (!sig) return false;
+      const expectedSig = crypto.createHmac('sha256', webhookSecret).update(bodyStr).digest('hex');
+      return crypto.timingSafeEqual(Buffer.from(String(sig)), Buffer.from(expectedSig));
+    }
+  }
+
   public async verifyPayoutSettlement(params: { method: string; providerReference: string; amount: number; payoutId: string }): Promise<{ verified: boolean; providerTxId: string; status: string }> {
     const isProd = process.env.NODE_ENV === 'production';
     const env = isProd ? 'production' : 'sandbox';
@@ -225,7 +263,7 @@ export class PaymentGatewayManager {
     else if (lowerMethod.includes('razorpay') || lowerMethod.includes('upi')) gwName = 'razorpay';
 
     const gw = gwName ? this.getGateway(gwName, env) : null;
-    const hasCredentials = gw && gw.enabled && gw.clientId && gw.clientSecret;
+    const hasCredentials = gw && gw.enabled && gw.clientSecret;
 
     if (!hasCredentials) {
       if (isProd) {
@@ -264,13 +302,45 @@ export class PaymentGatewayManager {
           throw new Error('Payout amount mismatch with provider record');
         }
         return { verified: true, providerTxId: data.id, status: 'settled' };
+      } else if (gwName === 'paypal' && gw && gw.clientId && gw.clientSecret) {
+        const tokenRes = await fetch('https://api-m.paypal.com/v1/oauth2/token', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Basic ${Buffer.from(`${gw.clientId}:${gw.clientSecret}`).toString('base64')}`,
+            'Content-Type': 'application/x-www-form-urlencoded'
+          },
+          body: 'grant_type=client_credentials'
+        });
+        if (!tokenRes.ok) throw new Error('PayPal auth handshake failed during payout verification.');
+        const tokenData: any = await tokenRes.json();
+        const payoutRes = await fetch(`https://api-m.paypal.com/v1/payments/payouts-item/${ref}`, {
+          headers: { 'Authorization': `Bearer ${tokenData.access_token}` }
+        });
+        if (!payoutRes.ok) {
+          throw new Error(`PayPal payout item lookup failed with status ${payoutRes.status}`);
+        }
+        const payoutData: any = await payoutRes.json();
+        const pVal = Number(payoutData.payout_item?.amount?.value || 0);
+        const pCurr = payoutData.payout_item?.amount?.currency;
+        if (pCurr !== 'USD') throw new Error('PayPal payout currency mismatch: expected USD.');
+        if (Math.abs(pVal - params.amount) > 0.01) throw new Error('PayPal payout amount mismatch.');
+        return { verified: true, providerTxId: payoutData.payout_item_id || ref, status: 'settled' };
+      } else if (gwName === 'razorpay' && gw && gw.clientId && gw.clientSecret) {
+        const authHeader = `Basic ${Buffer.from(`${gw.clientId}:${gw.clientSecret}`).toString('base64')}`;
+        const razorRes = await fetch(`https://api.razorpay.com/v1/payouts/${ref}`, {
+          headers: { 'Authorization': authHeader }
+        });
+        if (!razorRes.ok) {
+          throw new Error(`Razorpay payout lookup failed with status ${razorRes.status}`);
+        }
+        const razorData: any = await razorRes.json();
+        const rVal = Number(razorData.amount || 0) / 100;
+        if (razorData.currency !== 'USD') throw new Error('Razorpay payout currency mismatch: expected USD.');
+        if (Math.abs(rVal - params.amount) > 0.01) throw new Error('Razorpay payout amount mismatch.');
+        return { verified: true, providerTxId: razorData.id || ref, status: 'settled' };
+      } else {
+        throw new Error(`Payout provider verification is not configured or supported for method "${params.method}".`);
       }
-
-      return {
-        verified: true,
-        providerTxId: ref,
-        status: 'settled'
-      };
     } catch (err: any) {
       console.error(`[PaymentGateways] Provider settlement verification error for payout ${params.payoutId}:`, err.message);
       if (isProd) {
@@ -377,6 +447,30 @@ export class PaymentGatewayManager {
           providerSessionId: orderData.id,
           checkoutUrl: approveLink || `/checkout/pay?session_id=${params.checkoutId}`
         };
+      } else if (params.gateway === 'razorpay') {
+        const authHeader = `Basic ${Buffer.from(`${gw.clientId}:${gw.clientSecret}`).toString('base64')}`;
+        const response = await fetch('https://api.razorpay.com/v1/orders', {
+          method: 'POST',
+          headers: {
+            'Authorization': authHeader,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            amount: Math.round(params.amount * 100),
+            currency: 'USD',
+            receipt: params.checkoutId,
+            notes: { userId: params.userId, checkoutId: params.checkoutId }
+          })
+        });
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(`Razorpay order creation error (${response.status}): ${errText}`);
+        }
+        const data: any = await response.json();
+        return {
+          providerSessionId: data.id,
+          checkoutUrl: `/checkout/pay?session_id=${params.checkoutId}&razorpay_order_id=${data.id}`
+        };
       } else {
         throw new Error(`Unsupported payment provider "${params.gateway}".`);
       }
@@ -389,21 +483,59 @@ export class PaymentGatewayManager {
     }
   }
 
-  public testConnection(env: 'production' | 'sandbox', gatewayName: 'paypal' | 'stripe' | 'razorpay'): { success: boolean; message: string } {
+  public async testConnection(env: 'production' | 'sandbox', gatewayName: 'paypal' | 'stripe' | 'razorpay'): Promise<{ success: boolean; message: string }> {
     const envState = this.state[env];
     const gw = envState[gatewayName];
 
     if (!gw.enabled) {
       return { success: false, message: `${gatewayName.toUpperCase()} (${env}) is currently disabled. Enable the gateway before testing connection.` };
     }
-    if (!gw.clientId || !gw.clientSecret) {
-      return { success: false, message: `Missing Client ID or Client Secret for ${gatewayName.toUpperCase()} (${env}).` };
+    if (!gw.clientId && gatewayName !== 'stripe') {
+      return { success: false, message: `Missing Client ID for ${gatewayName.toUpperCase()} (${env}).` };
+    }
+    if (!gw.clientSecret) {
+      return { success: false, message: `Missing Client Secret for ${gatewayName.toUpperCase()} (${env}).` };
     }
 
-    return {
-      success: false,
-      message: `${gatewayName.toUpperCase()} (${env}) configuration structure is valid and securely stored. Live API handshake endpoint is not yet activated.`
-    };
+    try {
+      if (gatewayName === 'stripe') {
+        const res = await fetch('https://api.stripe.com/v1/balance', {
+          headers: { 'Authorization': `Bearer ${gw.clientSecret}` }
+        });
+        if (!res.ok) {
+          const errText = await res.text();
+          return { success: false, message: `Stripe API handshake failed (${res.status}): ${errText}` };
+        }
+        return { success: true, message: `Stripe (${env}) connection verified successfully via live balance handshake.` };
+      } else if (gatewayName === 'paypal') {
+        const tokenRes = await fetch('https://api-m.paypal.com/v1/oauth2/token', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Basic ${Buffer.from(`${gw.clientId}:${gw.clientSecret}`).toString('base64')}`,
+            'Content-Type': 'application/x-www-form-urlencoded'
+          },
+          body: 'grant_type=client_credentials'
+        });
+        if (!tokenRes.ok) {
+          const errText = await tokenRes.text();
+          return { success: false, message: `PayPal API handshake failed (${tokenRes.status}): ${errText}` };
+        }
+        return { success: true, message: `PayPal (${env}) connection verified successfully via live OAuth handshake.` };
+      } else if (gatewayName === 'razorpay') {
+        const authHeader = `Basic ${Buffer.from(`${gw.clientId}:${gw.clientSecret}`).toString('base64')}`;
+        const res = await fetch('https://api.razorpay.com/v1/payments?count=1', {
+          headers: { 'Authorization': authHeader }
+        });
+        if (!res.ok) {
+          const errText = await res.text();
+          return { success: false, message: `Razorpay API handshake failed (${res.status}): ${errText}` };
+        }
+        return { success: true, message: `Razorpay (${env}) connection verified successfully via live API handshake.` };
+      }
+      return { success: false, message: `Unsupported gateway: ${gatewayName}` };
+    } catch (err: any) {
+      return { success: false, message: `Live API handshake error for ${gatewayName.toUpperCase()}: ${err.message}` };
+    }
   }
 }
 

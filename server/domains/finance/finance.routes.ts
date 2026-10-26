@@ -362,21 +362,29 @@ router.post('/payments/gateway/checkout', requireAuth, rateLimit(10, 60_000), as
 });
 
 const handlePaymentWebhook = async (req: Request, res: Response) => {
-  const signature = req.headers['x-webhook-signature'] as string;
-  const secret = process.env.WEBHOOK_SECRET;
-  
-  if (!secret || !signature) {
-    return res.status(403).json({ error: 'Unauthorized: Missing signature' });
-  }
+  const rawBody = req.body;
+  const isVerified = paymentGatewayManager.verifyWebhookSignature({
+    gateway: (req.headers['x-gateway-provider'] || req.query.gateway || 'stripe') as string,
+    headers: req.headers,
+    rawBody
+  });
 
-  const hmac = createHmac('sha256', secret);
-  hmac.update(req.body);
-  const calculatedSignature = hmac.digest('hex');
+  if (!isVerified) {
+    const signature = req.headers['x-webhook-signature'] as string;
+    const secret = process.env.WEBHOOK_SECRET;
+    if (!secret || !signature) {
+      return res.status(403).json({ error: 'Unauthorized: Invalid or missing webhook signature' });
+    }
 
-  const sigBuf = Buffer.from(signature);
-  const expBuf = Buffer.from(calculatedSignature);
-  if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) {
-    return res.status(403).json({ error: 'Unauthorized: Invalid signature' });
+    const hmac = createHmac('sha256', secret);
+    hmac.update(rawBody);
+    const calculatedSignature = hmac.digest('hex');
+
+    const sigBuf = Buffer.from(signature);
+    const expBuf = Buffer.from(calculatedSignature);
+    if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) {
+      return res.status(403).json({ error: 'Unauthorized: Invalid webhook signature' });
+    }
   }
 
   let payload: any;
