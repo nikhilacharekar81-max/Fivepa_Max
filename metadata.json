@@ -1,0 +1,6 @@
+{
+  "name": "WorkPerHour Marketplace",
+  "description": "Secure freelance platform with escrow payments and real-time workstreams.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
