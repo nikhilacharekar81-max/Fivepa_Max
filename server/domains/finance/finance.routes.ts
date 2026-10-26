@@ -321,26 +321,31 @@ router.post('/payments/gateway/checkout', requireAuth, rateLimit(10, 60_000), as
     const caller = callerRes.rows[0];
     if (!caller) return res.status(401).json({ error: 'Unauthorized' });
     const amt = Number(amount);
-    if (!Number.isFinite(amt) || amt <= 0) return res.status(400).json({ error: 'Valid amount required' });
-
-    if (currency !== 'USD') {
-      return res.status(400).json({ error: 'Only USD currency is supported' });
+    if (!Number.isFinite(amt) || amt < 1.00) {
+      return res.status(400).json({ error: 'Valid amount of at least $1.00 USD is required.' });
     }
 
-    if (IS_PRODUCTION) {
-      const gwConf = paymentGatewayManager.getGateway(gateway as any, 'production');
-      if (!gwConf || !gwConf.enabled || !gwConf.clientId || !gwConf.clientSecret) {
-        return res.status(400).json({ error: `Payment gateway "${gateway}" is not enabled or configured in production.` });
-      }
+    if (currency !== 'USD') {
+      return res.status(400).json({ error: 'Only USD currency is supported.' });
     }
 
     await ensureWallet(authUserId);
     const checkoutId = 'chk_' + randomUUID();
 
+    const providerSession = await paymentGatewayManager.createCheckoutSession({
+      gateway: gateway as any,
+      amount: amt,
+      currency: 'USD',
+      userId: authUserId,
+      orderId: orderId || undefined,
+      purpose: purpose || 'deposit',
+      checkoutId
+    });
+
     await pool.query(
-      `INSERT INTO payment_checkout_sessions (id, user_id, order_id, gateway, expected_amount, currency, purpose, status, created_at)
-       VALUES ($1, $2, $3, $4, $5, 'USD', $6, 'pending', NOW())`,
-      [checkoutId, authUserId, orderId || null, gateway, amt, purpose]
+      `INSERT INTO payment_checkout_sessions (id, user_id, order_id, gateway, expected_amount, currency, purpose, status, provider_tx_id, created_at)
+       VALUES ($1, $2, $3, $4, $5, 'USD', $6, 'pending', $7, NOW())`,
+      [checkoutId, authUserId, orderId || null, gateway, amt, purpose, providerSession.providerSessionId]
     );
 
     res.json({
@@ -349,7 +354,7 @@ router.post('/payments/gateway/checkout', requireAuth, rateLimit(10, 60_000), as
       gateway,
       amount: amt,
       currency: 'USD',
-      redirectUrl: `/checkout/success?session_id=${checkoutId}&amount=${amt}`
+      redirectUrl: providerSession.checkoutUrl || `/checkout/success?session_id=${checkoutId}&amount=${amt}`
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -393,25 +398,38 @@ const handlePaymentWebhook = async (req: Request, res: Response) => {
   if (event === 'payment.succeeded' && userId && amount) {
     const pool = postgresStore.getPool();
     const chkId = checkoutId || sessionId;
-    if (chkId) {
-      const sessRes = await pool.query('SELECT * FROM payment_checkout_sessions WHERE id = $1 FOR UPDATE', [chkId]);
-      if (sessRes.rows.length > 0) {
-        const sess = sessRes.rows[0];
-        if (sess.user_id !== userId) {
-          return res.status(400).json({ error: 'Checkout session user mismatch' });
-        }
-        if (Math.abs(Number(sess.expected_amount) - Number(amount)) > 0.01) {
-          return res.status(400).json({ error: 'Checkout session amount mismatch' });
-        }
-        if (sess.status !== 'pending') {
-          return res.status(400).json({ error: `Checkout session already in status ${sess.status}` });
-        }
-        await pool.query(
-          'UPDATE payment_checkout_sessions SET status = $1, provider_tx_id = $2, completed_at = NOW() WHERE id = $3',
-          ['completed', txId, chkId]
-        );
-      }
+    if (!chkId) {
+      return res.status(400).json({ error: 'Authoritative checkout session ID is required for webhook payment.' });
     }
+
+    const sessRes = await pool.query(
+      'SELECT * FROM payment_checkout_sessions WHERE id = $1 OR provider_tx_id = $1 FOR UPDATE',
+      [chkId]
+    );
+
+    if (sessRes.rows.length === 0) {
+      return res.status(400).json({ error: 'Checkout session not found.' });
+    }
+
+    const sess = sessRes.rows[0];
+    if (sess.user_id !== userId) {
+      return res.status(400).json({ error: 'Checkout session user mismatch.' });
+    }
+    if (Math.abs(Number(sess.expected_amount) - Number(amount)) > 0.01) {
+      return res.status(400).json({ error: 'Checkout session amount mismatch.' });
+    }
+    if (sess.status === 'completed') {
+      // Idempotent duplicate event handling
+      return res.json({ received: true, replayed: true });
+    }
+    if (sess.status !== 'pending') {
+      return res.status(400).json({ error: `Checkout session already in status ${sess.status}` });
+    }
+
+    await pool.query(
+      'UPDATE payment_checkout_sessions SET status = $1, provider_tx_id = $2, completed_at = NOW() WHERE id = $3',
+      ['completed', txId, sess.id]
+    );
 
     await financialTransactionService.ensureWallet(userId);
     try {
@@ -419,7 +437,7 @@ const handlePaymentWebhook = async (req: Request, res: Response) => {
         userId,
         amount: Number(amount),
         reference: reference || txId || 'WH-DEPOSIT',
-        idempotencyKey: `WH-${userId}-${txId}`,
+        idempotencyKey: `WH-${userId}-${sess.id}-${txId}`,
         actor: 'Gateway Webhook',
         source: 'webhook'
       });
@@ -851,6 +869,30 @@ router.post('/payments/methods', requireAuth, async (req: Request, res: Response
       return res.status(400).json({ error: 'Method type and name are required' });
     }
 
+    // Tight payment method details validation by method type
+    const lowerType = String(type).trim().toLowerCase();
+    if (lowerType.includes('bank')) {
+      if (!details?.accountNumber && !details?.iban && !details?.routingNumber) {
+        return res.status(400).json({ error: 'Bank account number, IBAN, or routing number is required for Bank Transfer.' });
+      }
+    } else if (lowerType.includes('paypal')) {
+      if (!details?.email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(details.email))) {
+        return res.status(400).json({ error: 'A valid email address is required for PayPal payment method.' });
+      }
+    } else if (lowerType.includes('upi')) {
+      if (!details?.vpa && !details?.upiId) {
+        return res.status(400).json({ error: 'A valid UPI VPA/ID (e.g., user@upi) is required for UPI payment method.' });
+      }
+    } else if (lowerType.includes('stripe')) {
+      if (!details?.stripeAccountId && !details?.email) {
+        return res.status(400).json({ error: 'Stripe account ID or email is required for Stripe payment method.' });
+      }
+    } else if (lowerType.includes('razorpay')) {
+      if (!details?.accountId && !details?.vpa) {
+        return res.status(400).json({ error: 'Razorpay account ID or UPI VPA is required.' });
+      }
+    }
+
     const existingMethods = await store.listPaymentMethodsForUser(userId);
     const newMethod: PaymentMethodRecord = {
       id: 'pm_' + Date.now() + '_' + randomUUID().slice(0, 8),
@@ -1178,22 +1220,59 @@ router.post('/admin/finance/escrow/:orderId/refund', requireAdmin, async (req: R
   const orderId = req.params.orderId;
   if (!tryAcquireOrderLock(orderId, res)) return;
   try {
-    const order = await store.getOrder(orderId);
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (order.status === 'completed') {
-      return res.status(400).json({ error: 'Cannot refund order: Escrow funds have already been released to seller.' });
-    }
-    if (order.status === 'cancelled') {
-      return res.status(400).json({ error: 'Order is already cancelled/refunded.' });
-    }
-    const esc = await financialRepository.getEscrow(order.id);
-    if (!esc || esc.remaining <= 0 || esc.status === 'released' || esc.status === 'refunded') {
-      return res.status(400).json({ error: 'No refundable escrow funds remaining for this order.' });
-    }
     const amount = req.body.amount === undefined || req.body.amount === '' ? undefined : Number(req.body.amount);
-    const result = await refundOrderFunds(order, amount, adminActor(req), String(req.body.reason || 'Administrative escrow refund approval'), req.body.requestKey);
-    await closeActiveDispute(order.id, 'resolved_refund', String(req.body.reason || 'Administrative escrow refund'));
-    res.json({ success: true, order, journal: result.journal });
+    const reason = String(req.body.reason || 'Administrative escrow refund approval');
+    const actor = adminActor(req);
+    const requestKey = req.body.requestKey || req.body.idempotencyKey;
+
+    const result = await postgresStore.executeInTransaction(async (client) => {
+      // 1. Lock order row
+      const orderRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+      if (orderRes.rows.length === 0) throw new Error('Order not found');
+      const orderRow = orderRes.rows[0];
+
+      if (orderRow.status === 'completed') {
+        throw new Error('Cannot refund order: Escrow funds have already been released to seller.');
+      }
+      if (orderRow.status === 'cancelled') {
+        throw new Error('Order is already cancelled/refunded.');
+      }
+
+      // 2. Lock escrow row
+      const escRes = await client.query('SELECT * FROM escrows WHERE order_id = $1 FOR UPDATE', [orderId]);
+      if (escRes.rows.length === 0) throw new Error('Escrow record not found for this order.');
+      const escrow = escRes.rows[0];
+      if (Number(escrow.remaining) <= 0 || escrow.status === 'released' || escrow.status === 'refunded') {
+        throw new Error('No refundable escrow funds remaining for this order.');
+      }
+
+      // 3. Perform atomic refund financial operation
+      const refundResult = await financialTransactionService.refundOrderFunds({
+        orderId,
+        amount,
+        reason,
+        actor,
+        idempotencyKey: requestKey
+      }, client);
+
+      // 4. Lock & resolve active dispute in the same transaction
+      const dispRes = await client.query(
+        "SELECT * FROM disputes WHERE order_id = $1 AND status IN ('open', 'under_investigation') FOR UPDATE",
+        [orderId]
+      );
+      if (dispRes.rows.length > 0) {
+        await client.query(
+          "UPDATE disputes SET status = 'resolved_refund', resolution_notes = $1, notes = $1 WHERE order_id = $2 AND status IN ('open', 'under_investigation')",
+          [reason, orderId]
+        );
+      }
+
+      return refundResult;
+    });
+
+    await syncUserBalances();
+    const updatedOrder = await store.getOrder(orderId);
+    res.json({ success: true, order: updatedOrder, result });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   } finally {

@@ -96,6 +96,10 @@ export async function verifyAndConsumeWithdrawalCode(
     return { ok: true };
   }
 
+  if (IS_PRODUCTION) {
+    return { ok: false, status: 500, error: 'Security verification requires PostgreSQL database in production.' };
+  }
+
   const record = withdrawalVerificationCodes.get(userId);
   if (!record) {
     return { ok: false, status: 400, error: 'No active withdrawal verification code found. Please request a new code via /api/auth/withdrawal/request-code.' };
@@ -114,6 +118,61 @@ export async function verifyAndConsumeWithdrawalCode(
   }
   withdrawalVerificationCodes.delete(userId);
   return { ok: true };
+}
+
+export async function checkRecoveryCodeAsync(query: string, code: unknown, markVerified = false): Promise<'ok' | 'invalid' | 'locked'> {
+  const queryEmail = query.toLowerCase().trim();
+  const trimmedCode = typeof code === 'string' || typeof code === 'number' ? String(code).trim() : '';
+
+  if (isPostgresEnabled()) {
+    const pool = postgresStore.getPool();
+    const res = await pool.query(
+      `SELECT * FROM auth_verification_codes WHERE email = $1 AND type = 'password_reset'`,
+      [queryEmail]
+    );
+    if (res.rows.length === 0) return 'invalid';
+    const row = res.rows[0];
+    if (new Date() > new Date(row.expires_at)) {
+      await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'password_reset'`, [queryEmail]);
+      return 'invalid';
+    }
+    if (Number(row.attempts || 0) >= 5) {
+      await pool.query(`DELETE FROM auth_verification_codes WHERE email = $1 AND type = 'password_reset'`, [queryEmail]);
+      return 'locked';
+    }
+    if (row.code !== trimmedCode) {
+      await pool.query(
+        `UPDATE auth_verification_codes SET attempts = attempts + 1 WHERE email = $1 AND type = 'password_reset'`,
+        [queryEmail]
+      );
+      return 'invalid';
+    }
+    if (markVerified) {
+      await pool.query(
+        `UPDATE auth_verification_codes SET attempts = 0 WHERE email = $1 AND type = 'password_reset'`,
+        [queryEmail]
+      );
+    }
+    return 'ok';
+  }
+
+  if (IS_PRODUCTION) {
+    return 'invalid';
+  }
+
+  const record = forgotPasswordCodes.get(query);
+  if (!record || Date.now() > record.expiresAt) return 'invalid';
+  if (record.attempts >= 5) {
+    forgotPasswordCodes.delete(query);
+    return 'locked';
+  }
+  if (!trimmedCode) return 'invalid';
+  if (record.code !== trimmedCode) {
+    record.attempts++;
+    return 'invalid';
+  }
+  if (markVerified) record.verified = true;
+  return 'ok';
 }
 
 export function checkRecoveryCode(query: string, code: unknown, markVerified = false): 'ok' | 'invalid' | 'locked' {

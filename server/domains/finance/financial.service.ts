@@ -1,6 +1,7 @@
 import { postgresStore, isPostgresEnabled } from '../../db/postgresStore.js';
 import { diagnosticService } from '../../services/diagnosticService.js';
 import { financeLedger, FinanceLedgerEngine } from './financeLedger.js';
+import { paymentGatewayManager } from './paymentGateways.js';
 import { randomUUID } from 'crypto';
 import type { UserWallet, EscrowRecord, LedgerJournal, FinancialTransaction } from './financeLedger.js';
 import {
@@ -123,11 +124,11 @@ export async function recordIdempotencyResult(
   );
 }
 
-// In-memory sync tracking for immediate synchronous reads in test fixtures (capped at 200 items)
+// In-memory sync tracking for immediate synchronous reads in test fixtures (capped at 50 items)
 const recentClearingItems: { sellerId: string; amount: number; clearsAt: string }[] = [];
 
 export function recordRecentClearingSync(sellerId: string, amount: number, clearsAt: string) {
-  if (recentClearingItems.length >= 200) {
+  if (recentClearingItems.length >= 50) {
     recentClearingItems.shift();
   }
   recentClearingItems.push({ sellerId, amount, clearsAt });
@@ -238,25 +239,6 @@ export class FinancialRepository {
     }
     const res = await postgresStore.getPool().query('SELECT * FROM escrows WHERE order_id = $1', [orderId]);
     if (res.rows.length === 0) {
-      const memEsc = financeLedger.getEscrow(orderId);
-      if (memEsc) {
-        await postgresStore.seedEscrow(
-          memEsc.orderId,
-          memEsc.orderTitle,
-          memEsc.buyerId,
-          memEsc.sellerId,
-          memEsc.amount,
-          memEsc.remaining,
-          memEsc.fundedAt || new Date().toISOString()
-        );
-        if (memEsc.status === 'released') {
-          await postgresStore.getPool().query("UPDATE escrows SET status = 'released', remaining = 0 WHERE order_id = $1", [orderId]);
-        } else if (memEsc.status === 'refunded') {
-          await postgresStore.getPool().query("UPDATE escrows SET status = 'refunded', remaining = 0 WHERE order_id = $1", [orderId]);
-        }
-        const seeded = await postgresStore.getPool().query('SELECT * FROM escrows WHERE order_id = $1', [orderId]);
-        if (seeded.rows.length > 0) return this.formatEscrowRow(seeded.rows[0]);
-      }
       return null;
     }
     return this.formatEscrowRow(res.rows[0]);
@@ -906,29 +888,21 @@ export class FinancialTransactionService {
       const comm = siteSettings.getSettings().commission;
 
       const gigPrice = Number(params.amount.toFixed(2));
-      let serviceFee = 0;
-      let smallOrderFee = 0;
-      let commissionPercent = 20;
-      let clientTotal = 0;
-
-      if (params.feeBreakdown) {
-        const breakdown = params.feeBreakdown;
-        commissionPercent = breakdown.freelancerPercent !== undefined ? (100 - breakdown.freelancerPercent) : (breakdown.commissionPercent ?? comm.commissionPercent ?? 20);
-        serviceFee = Number((breakdown.serviceFee ?? (breakdown.cents?.serviceFee ? breakdown.cents.serviceFee / 100 : 0)).toFixed(2));
-        smallOrderFee = Number((breakdown.smallOrderFee ?? (breakdown.cents?.smallOrderFee ? breakdown.cents.smallOrderFee / 100 : 0)).toFixed(2));
-        clientTotal = Number((breakdown.clientTotal ?? (gigPrice + serviceFee + smallOrderFee)).toFixed(2));
-      } else {
-        const calculated = calculateOrderFees(gigPrice, {
-          commissionPercent: comm.commissionPercent ?? DEFAULT_FEE_CONFIG.commissionPercent,
-          buyerFeePercent: comm.buyerProcessingFeePercent ?? DEFAULT_FEE_CONFIG.buyerFeePercent,
-          smallOrderFee: comm.smallOrderFeeAmount ?? DEFAULT_FEE_CONFIG.smallOrderFee,
-          smallOrderThreshold: comm.smallOrderFeeThreshold ?? DEFAULT_FEE_CONFIG.smallOrderThreshold
-        });
-        serviceFee = calculated.serviceFee;
-        smallOrderFee = calculated.smallOrderFee;
-        commissionPercent = comm.commissionPercent ?? DEFAULT_FEE_CONFIG.commissionPercent;
-        clientTotal = calculated.clientTotal;
+      if (gigPrice < 1.00) {
+        throw new Error('Minimum order amount is $1.00');
       }
+
+      const calculated = calculateOrderFees(gigPrice, {
+        commissionPercent: comm.commissionPercent ?? DEFAULT_FEE_CONFIG.commissionPercent,
+        buyerFeePercent: comm.buyerProcessingFeePercent ?? DEFAULT_FEE_CONFIG.buyerFeePercent,
+        smallOrderFee: comm.smallOrderFeeAmount ?? DEFAULT_FEE_CONFIG.smallOrderFee,
+        smallOrderThreshold: comm.smallOrderFeeThreshold ?? DEFAULT_FEE_CONFIG.smallOrderThreshold
+      });
+
+      const serviceFee = calculated.serviceFee;
+      const smallOrderFee = calculated.smallOrderFee;
+      const commissionPercent = comm.commissionPercent ?? DEFAULT_FEE_CONFIG.commissionPercent;
+      const clientTotal = calculated.clientTotal;
 
       const idempKey = params.idempotencyKey || `IDEMP-ORD-FUND-${params.orderId}`;
       const payloadFingerprint = {
@@ -982,7 +956,7 @@ export class FinancialTransactionService {
         [params.orderId, params.orderTitle, params.buyerId, params.sellerId, gigPrice, serviceFee, smallOrderFee, commissionPercent]
       );
       
-      const feeSnapshot = params.feeBreakdown || { gigPrice, serviceFee, smallOrderFee, clientTotal, commissionPercent };
+      const feeSnapshot = { gigPrice, serviceFee, smallOrderFee, clientTotal, commissionPercent };
       await client.query(
         'UPDATE orders SET status = $1, fee_breakdown = $2, service_fee = $3, small_order_fee = $4 WHERE id = $5',
         ['funded_in_escrow', JSON.stringify(feeSnapshot), serviceFee, smallOrderFee, params.orderId]
@@ -1035,23 +1009,10 @@ export class FinancialTransactionService {
       const check = await checkOrRecordIdempotency(client, idempKey, 'releaseOrderFunds', payloadFingerprint);
       if (check.replayed) return check.result;
 
-      let escRes = await client.query('SELECT * FROM escrows WHERE order_id = $1 FOR UPDATE', [params.orderId]);
-      if (escRes.rows.length === 0 && process.env.NODE_ENV === 'test') {
-        const memEsc = financeLedger.getEscrow(params.orderId);
-        if (memEsc) {
-          await postgresStore.seedEscrow(
-            memEsc.orderId,
-            memEsc.orderTitle,
-            memEsc.buyerId,
-            memEsc.sellerId,
-            memEsc.amount,
-            memEsc.remaining,
-            memEsc.fundedAt || new Date().toISOString()
-          );
-          escRes = await client.query('SELECT * FROM escrows WHERE order_id = $1 FOR UPDATE', [params.orderId]);
-        }
+      const escRes = await client.query('SELECT * FROM escrows WHERE order_id = $1 FOR UPDATE', [params.orderId]);
+      if (escRes.rows.length === 0) {
+        throw new Error(`Escrow record not found in PostgreSQL for order ${params.orderId}`);
       }
-      if (escRes.rows.length === 0) throw new Error('Escrow not found');
       const escrow = escRes.rows[0];
 
       await this.ensureWallet({ userId: escrow.buyer_id, role: 'buyer' }, client);
@@ -1160,23 +1121,10 @@ export class FinancialTransactionService {
       };
     }
     const run = async (client: any) => {
-      let escRes = await client.query('SELECT * FROM escrows WHERE order_id = $1 FOR UPDATE', [params.orderId]);
-      if (escRes.rows.length === 0 && process.env.NODE_ENV === 'test') {
-        const memEsc = financeLedger.getEscrow(params.orderId);
-        if (memEsc) {
-          await postgresStore.seedEscrow(
-            memEsc.orderId,
-            memEsc.orderTitle,
-            memEsc.buyerId,
-            memEsc.sellerId,
-            memEsc.amount,
-            memEsc.remaining,
-            memEsc.fundedAt || new Date().toISOString()
-          );
-          escRes = await client.query('SELECT * FROM escrows WHERE order_id = $1 FOR UPDATE', [params.orderId]);
-        }
+      const escRes = await client.query('SELECT * FROM escrows WHERE order_id = $1 FOR UPDATE', [params.orderId]);
+      if (escRes.rows.length === 0) {
+        throw new Error(`Escrow record not found in PostgreSQL for order ${params.orderId}`);
       }
-      if (escRes.rows.length === 0) throw new Error('Escrow not found');
       const escrow = escRes.rows[0];
 
       await this.ensureWallet({ userId: escrow.buyer_id, role: 'buyer' }, client);
@@ -1580,7 +1528,8 @@ export class FinancialTransactionService {
         payoutId: params.payoutId,
         freelancerId: params.freelancerId,
         amount: params.amount,
-        method: params.method
+        method: params.method,
+        accountDetails: params.accountDetails
       };
 
       const check = await checkOrRecordIdempotency(client, idempotencyKey, 'requestPayout', payloadFingerprint);
@@ -1781,9 +1730,18 @@ export class FinancialTransactionService {
     return postgresStore.executeInTransaction(run);
   }
 
-  async settlePayout(params: { payoutId: string; actor: string; providerReference?: string }, externalClient?: any) {
+  async settlePayout(params: { payoutId: string; actor: string; providerReference?: string; idempotencyKey?: string }, externalClient?: any) {
     if (!isPostgresEnabled()) return financeLedger.settlePayout(params);
     const run = async (client: any) => {
+      const idempKey = params.idempotencyKey || `IDEMP-PAY-SETTLE-${params.payoutId}`;
+      const payloadFingerprint = {
+        payoutId: params.payoutId,
+        providerReference: params.providerReference
+      };
+
+      const check = await checkOrRecordIdempotency(client, idempKey, 'settlePayout', payloadFingerprint);
+      if (check.replayed) return check.result;
+
       const pRes = await client.query('SELECT * FROM payouts WHERE id = $1 FOR UPDATE', [params.payoutId]);
       if (pRes.rows.length === 0) throw new Error('Payout not found');
       const payout = pRes.rows[0];
@@ -1796,15 +1754,26 @@ export class FinancialTransactionService {
         throw new Error('Provider reference is required to settle payout.');
       }
 
+      const verification = await paymentGatewayManager.verifyPayoutSettlement({
+        method: payout.method,
+        providerReference: params.providerReference || `MOCK-${params.payoutId}`,
+        amount: Number(payout.amount),
+        payoutId: params.payoutId
+      });
+
+      if (!verification || !verification.verified) {
+        throw new Error(`Payout settlement could not be verified with payment provider for payout ${params.payoutId}`);
+      }
+
       const amount = Number(payout.amount);
       await client.query('UPDATE wallets SET pending_withdrawals = pending_withdrawals - $1 WHERE user_id = $2', [amount, payout.freelancer_id]);
       await client.query("UPDATE payouts SET status = 'processed', processed_at = NOW() WHERE id = $1", [params.payoutId]);
 
       const journalId = 'jnl_' + randomUUID().slice(0, 12);
       await client.query(
-        `INSERT INTO ledger_journals (id, reference, description, event_type, actor)
-         VALUES ($1, $2, $3, 'PAYOUT_SETTLED', $4)`,
-        [journalId, `PAY-${params.payoutId}-SETTLED`, `Payout settled: ${params.providerReference || 'Direct transfer'}`, params.actor]
+        `INSERT INTO ledger_journals (id, reference, description, event_type, actor, idempotency_key)
+         VALUES ($1, $2, $3, 'PAYOUT_SETTLED', $4, $5)`,
+        [journalId, `PAY-${params.payoutId}-SETTLED`, `Payout settled: ${params.providerReference || 'Direct transfer'}`, params.actor, idempKey]
       );
       const entries = [
         { account_code: '2040', debit: amount, credit: 0, description: 'Clear pending payout liability', user_id: null },
@@ -1813,15 +1782,26 @@ export class FinancialTransactionService {
       await this.assertJournalBalanced(client, entries);
       for (const e of entries) await client.query('INSERT INTO ledger_entries (id, journal_id, account_code, debit, credit, description, payout_id) VALUES ($1, $2, $3, $4, $5, $6, $7)', [randomUUID(), journalId, e.account_code, e.debit, e.credit, e.description, params.payoutId]);
 
-      return { success: true, journal: { id: journalId, reference: `PAY-${params.payoutId}-SETTLED` } };
+      const result = { success: true, journal: { id: journalId, reference: `PAY-${params.payoutId}-SETTLED` } };
+      await recordIdempotencyResult(client, idempKey, 'settlePayout', result, payloadFingerprint);
+      return result;
     };
     if (externalClient) return run(externalClient);
     return postgresStore.executeInTransaction(run);
   }
 
-  async cancelPayout(params: { payoutId: string; reason: string; actor: string }, externalClient?: any) {
+  async cancelPayout(params: { payoutId: string; reason: string; actor: string; idempotencyKey?: string }, externalClient?: any) {
     if (!isPostgresEnabled()) return financeLedger.cancelPayout(params);
     const run = async (client: any) => {
+      const idempKey = params.idempotencyKey || `IDEMP-PAY-CANCEL-${params.payoutId}`;
+      const payloadFingerprint = {
+        payoutId: params.payoutId,
+        reason: params.reason
+      };
+
+      const check = await checkOrRecordIdempotency(client, idempKey, 'cancelPayout', payloadFingerprint);
+      if (check.replayed) return check.result;
+
       const pRes = await client.query('SELECT * FROM payouts WHERE id = $1 FOR UPDATE', [params.payoutId]);
       if (pRes.rows.length === 0) throw new Error('Payout not found');
       const payout = pRes.rows[0];
@@ -1833,7 +1813,7 @@ export class FinancialTransactionService {
       const amount = Number(payout.amount);
       await client.query('UPDATE wallets SET available_balance = available_balance + $1, pending_withdrawals = pending_withdrawals - $1 WHERE user_id = $2', [amount, amount, payout.freelancer_id]);
       await client.query('UPDATE users SET wallet_balance = (SELECT available_balance FROM wallets WHERE user_id = $1) WHERE id = $1', [payout.freelancer_id]);
-      await client.query('UPDATE payouts SET status = ' + "'cancelled'" + ' WHERE id = $1', [params.payoutId]);
+      await client.query("UPDATE payouts SET status = 'cancelled' WHERE id = $1", [params.payoutId]);
 
       await client.query(
         'INSERT INTO wallet_movements (id, user_id, amount, type, description) VALUES ($1, $2, $3, $4, $5)',
@@ -1842,9 +1822,9 @@ export class FinancialTransactionService {
 
       const journalId = 'jnl_' + randomUUID().slice(0, 12);
       await client.query(
-        `INSERT INTO ledger_journals (id, reference, description, event_type, actor)
-         VALUES ($1, $2, $3, 'PAYOUT_CANCELLED', $4)`,
-        [journalId, `PAY-${params.payoutId}-CANCELLED`, `Payout cancelled: ${params.reason}`, params.actor]
+        `INSERT INTO ledger_journals (id, reference, description, event_type, actor, idempotency_key)
+         VALUES ($1, $2, $3, 'PAYOUT_CANCELLED', $4, $5)`,
+        [journalId, `PAY-${params.payoutId}-CANCELLED`, `Payout cancelled: ${params.reason}`, params.actor, idempKey]
       );
       const entries = [
         { account_code: '2040', debit: amount, credit: 0, description: 'Release pending payout liability back to wallet', user_id: null },
@@ -1853,15 +1833,26 @@ export class FinancialTransactionService {
       await this.assertJournalBalanced(client, entries);
       for (const e of entries) await client.query('INSERT INTO ledger_entries (id, journal_id, account_code, debit, credit, description, user_id, payout_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)', [randomUUID(), journalId, e.account_code, e.debit, e.credit, e.description, payout.freelancer_id, params.payoutId]);
 
-      return { success: true };
+      const result = { success: true };
+      await recordIdempotencyResult(client, idempKey, 'cancelPayout', result, payloadFingerprint);
+      return result;
     };
     if (externalClient) return run(externalClient);
     return postgresStore.executeInTransaction(run);
   }
 
-  async failPayout(params: { payoutId: string; reason: string; actor: string }, externalClient?: any) {
+  async failPayout(params: { payoutId: string; reason: string; actor: string; idempotencyKey?: string }, externalClient?: any) {
     if (!isPostgresEnabled()) return financeLedger.failPayout(params);
     const run = async (client: any) => {
+      const idempKey = params.idempotencyKey || `IDEMP-PAY-FAIL-${params.payoutId}`;
+      const payloadFingerprint = {
+        payoutId: params.payoutId,
+        reason: params.reason
+      };
+
+      const check = await checkOrRecordIdempotency(client, idempKey, 'failPayout', payloadFingerprint);
+      if (check.replayed) return check.result;
+
       const pRes = await client.query('SELECT * FROM payouts WHERE id = $1 FOR UPDATE', [params.payoutId]);
       if (pRes.rows.length === 0) throw new Error('Payout not found');
       const payout = pRes.rows[0];
@@ -1873,7 +1864,7 @@ export class FinancialTransactionService {
       const amount = Number(payout.amount);
       await client.query('UPDATE wallets SET available_balance = available_balance + $1, pending_withdrawals = pending_withdrawals - $1 WHERE user_id = $2', [amount, amount, payout.freelancer_id]);
       await client.query('UPDATE users SET wallet_balance = (SELECT available_balance FROM wallets WHERE user_id = $1) WHERE id = $1', [payout.freelancer_id]);
-      await client.query('UPDATE payouts SET status = ' + "'failed'" + ' WHERE id = $1', [params.payoutId]);
+      await client.query("UPDATE payouts SET status = 'failed' WHERE id = $1", [params.payoutId]);
 
       await client.query(
         'INSERT INTO wallet_movements (id, user_id, amount, type, description) VALUES ($1, $2, $3, $4, $5)',
@@ -1882,9 +1873,9 @@ export class FinancialTransactionService {
 
       const journalId = 'jnl_' + randomUUID().slice(0, 12);
       await client.query(
-        `INSERT INTO ledger_journals (id, reference, description, event_type, actor)
-         VALUES ($1, $2, $3, 'PAYOUT_FAILED', $4)`,
-        [journalId, `PAY-${params.payoutId}-FAILED`, `Payout failed: ${params.reason}`, params.actor]
+        `INSERT INTO ledger_journals (id, reference, description, event_type, actor, idempotency_key)
+         VALUES ($1, $2, $3, 'PAYOUT_FAILED', $4, $5)`,
+        [journalId, `PAY-${params.payoutId}-FAILED`, `Payout failed: ${params.reason}`, params.actor, idempKey]
       );
       const entries = [
         { account_code: '2040', debit: amount, credit: 0, description: 'Release pending payout liability on transfer failure', user_id: null },
@@ -1893,13 +1884,15 @@ export class FinancialTransactionService {
       await this.assertJournalBalanced(client, entries);
       for (const e of entries) await client.query('INSERT INTO ledger_entries (id, journal_id, account_code, debit, credit, description, user_id, payout_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)', [randomUUID(), journalId, e.account_code, e.debit, e.credit, e.description, payout.freelancer_id, params.payoutId]);
 
-      return { success: true };
+      const result = { success: true };
+      await recordIdempotencyResult(client, idempKey, 'failPayout', result, payloadFingerprint);
+      return result;
     };
     if (externalClient) return run(externalClient);
     return postgresStore.executeInTransaction(run);
   }
 
-  async retryPayout(params: { payoutId: string; actor: string }, externalClient?: any) {
+  async retryPayout(params: { payoutId: string; actor: string; idempotencyKey?: string }, externalClient?: any) {
     if (!isPostgresEnabled()) return financeLedger.retryPayout(params);
     const run = async (client: any) => {
       const pRes = await client.query('SELECT * FROM payouts WHERE id = $1 FOR UPDATE', [params.payoutId]);
@@ -1910,6 +1903,18 @@ export class FinancialTransactionService {
         throw new Error('Only failed payouts can be retried.');
       }
 
+      const idempKey = params.idempotencyKey || `IDEMP-PAY-RETRY-${params.payoutId}-${payout.updated_at || payout.created_at || Date.now()}`;
+      const payloadFingerprint = {
+        payoutId: params.payoutId,
+        freelancerId: payout.freelancer_id,
+        amount: payout.amount,
+        method: payout.method,
+        accountDetails: payout.account_details || payout.accountDetails
+      };
+
+      const check = await checkOrRecordIdempotency(client, idempKey, 'retryPayout', payloadFingerprint);
+      if (check.replayed) return check.result;
+
       const amount = Number(payout.amount);
       const wRes = await client.query('SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE', [payout.freelancer_id]);
       if (wRes.rows.length === 0) throw new Error('Freelancer wallet not found');
@@ -1918,6 +1923,26 @@ export class FinancialTransactionService {
       if (wallet.status === 'frozen' || wallet.status === 'suspended') {
         throw new Error(`Cannot retry payout for a ${wallet.status} wallet.`);
       }
+      if (wallet.user_role !== 'freelancer') {
+        throw new Error('Only freelancers can retry payouts.');
+      }
+
+      const { siteSettings } = await import('../admin/siteSettings.js');
+      const walletConfig = siteSettings.getSettings().wallets;
+      const minPayout = walletConfig.minimumWithdrawalAmount ?? 10.00;
+      if (amount < minPayout) {
+        throw new Error(`Minimum payout withdrawal amount is $${minPayout.toFixed(2)}.`);
+      }
+      const dailyLimit = walletConfig.dailyWithdrawalLimit ?? 10000;
+      const dailyRes = await client.query(
+        `SELECT COALESCE(SUM(amount), 0) as total_today FROM payouts 
+         WHERE freelancer_id = $1 AND status IN ('pending', 'approved', 'processed') AND NULLIF(created_at::text, '')::timestamptz >= NOW() - INTERVAL '24 hours'`,
+        [payout.freelancer_id]
+      );
+      const totalToday = Number(dailyRes.rows[0]?.total_today || 0);
+      if (totalToday + amount > dailyLimit) {
+        throw new Error(`Daily withdrawal limit of $${dailyLimit.toFixed(2)} exceeded.`);
+      }
 
       if (Number(wallet.available_balance || 0) < amount) {
         throw new Error('Insufficient wallet balance to retry payout.');
@@ -1925,7 +1950,7 @@ export class FinancialTransactionService {
 
       await client.query('UPDATE wallets SET available_balance = available_balance - $1, pending_withdrawals = pending_withdrawals + $1 WHERE user_id = $2', [amount, amount, payout.freelancer_id]);
       await client.query('UPDATE users SET wallet_balance = (SELECT available_balance FROM wallets WHERE user_id = $1) WHERE id = $1', [payout.freelancer_id]);
-      await client.query('UPDATE payouts SET status = ' + "'pending'" + ' WHERE id = $1', [params.payoutId]);
+      await client.query("UPDATE payouts SET status = 'pending' WHERE id = $1", [params.payoutId]);
 
       await client.query(
         'INSERT INTO wallet_movements (id, user_id, amount, type, description) VALUES ($1, $2, $3, $4, $5)',
@@ -1934,9 +1959,9 @@ export class FinancialTransactionService {
 
       const journalId = 'jnl_' + randomUUID().slice(0, 12);
       await client.query(
-        `INSERT INTO ledger_journals (id, reference, description, event_type, actor)
-         VALUES ($1, $2, $3, 'PAYOUT_REQUESTED', $4)`,
-        [journalId, `PAY-${params.payoutId}-RETRY`, `Retried withdrawal #${params.payoutId}`, params.actor]
+        `INSERT INTO ledger_journals (id, reference, description, event_type, actor, idempotency_key)
+         VALUES ($1, $2, $3, 'PAYOUT_REQUESTED', $4, $5)`,
+        [journalId, `PAY-${params.payoutId}-RETRY`, `Retried withdrawal #${params.payoutId}`, params.actor, idempKey]
       );
       const entries = [
         { account_code: '2020', debit: amount, credit: 0, description: 'Re-debit freelancer wallet payable for payout retry', user_id: payout.freelancer_id },
@@ -1945,7 +1970,9 @@ export class FinancialTransactionService {
       await this.assertJournalBalanced(client, entries);
       for (const e of entries) await client.query('INSERT INTO ledger_entries (id, journal_id, account_code, debit, credit, description, user_id, payout_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)', [randomUUID(), journalId, e.account_code, e.debit, e.credit, e.description, payout.freelancer_id, params.payoutId]);
 
-      return { success: true };
+      const result = { success: true };
+      await recordIdempotencyResult(client, idempKey, 'retryPayout', result, payloadFingerprint);
+      return result;
     };
     if (externalClient) return run(externalClient);
     return postgresStore.executeInTransaction(run);
@@ -2101,6 +2128,12 @@ export class FinancialTransactionService {
 
     if (!isPostgresEnabled()) return financeLedger.reverseJournal(journalId, reason, actor);
     return postgresStore.executeInTransaction(async (client) => {
+      const idempKey = (typeof journalIdOrParams !== 'string' && journalIdOrParams.idempotencyKey) || `IDEMP-REV-${journalId}`;
+      const payloadFingerprint = { journalId, reason };
+
+      const check = await checkOrRecordIdempotency(client, idempKey, 'reverseJournal', payloadFingerprint);
+      if (check.replayed) return check.result;
+
       const jRes = await client.query('SELECT * FROM ledger_journals WHERE id = $1 FOR UPDATE', [journalId]);
       if (jRes.rows.length === 0) throw new Error('Journal not found');
       const origJournal = jRes.rows[0];
@@ -2133,9 +2166,9 @@ export class FinancialTransactionService {
 
       const revJournalId = 'jnl_' + randomUUID().slice(0, 12);
       await client.query(
-        `INSERT INTO ledger_journals (id, reference, description, event_type, actor)
-         VALUES ($1, $2, $3, 'REVERSAL', $4)`,
-        [revJournalId, revRef, `Reversal of ${origJournal.reference}: ${reason}`, actor]
+        `INSERT INTO ledger_journals (id, reference, description, event_type, actor, idempotency_key)
+         VALUES ($1, $2, $3, 'REVERSAL', $4, $5)`,
+        [revJournalId, revRef, `Reversal of ${origJournal.reference}: ${reason}`, actor, idempKey]
       );
 
       await client.query(
@@ -2161,7 +2194,6 @@ export class FinancialTransactionService {
           [randomUUID(), revJournalId, re.account_code, re.debit, re.credit, re.description, re.user_id, re.order_id, re.payout_id]
         );
 
-        // Safe reversal validation: ensure reversing a credit never produces negative wallet balance
         if (re.user_id && ['1010', '2010', '2020'].includes(re.account_code)) {
           const netDiff = re.credit - re.debit;
           if (netDiff !== 0) {
@@ -2177,12 +2209,11 @@ export class FinancialTransactionService {
           }
         }
 
-        // Adjust funds_on_hold if reversing active escrow hold
         if (re.account_code === '2030' && re.order_id) {
           const escRes = await client.query('SELECT buyer_id FROM escrows WHERE order_id = $1', [re.order_id]);
           if (escRes.rows.length > 0) {
             const buyerId = escRes.rows[0].buyer_id;
-            const holdDiff = re.credit - re.debit; // re.credit restores hold, re.debit reduces hold
+            const holdDiff = re.credit - re.debit;
             if (holdDiff !== 0) {
               await client.query('UPDATE wallets SET funds_on_hold = GREATEST(0, funds_on_hold + $1) WHERE user_id = $2', [holdDiff, buyerId]);
             }
@@ -2190,7 +2221,9 @@ export class FinancialTransactionService {
         }
       }
 
-      return { success: true, reversalJournalId: revJournalId };
+      const result = { success: true, reversalJournalId: revJournalId };
+      await recordIdempotencyResult(client, idempKey, 'reverseJournal', result, payloadFingerprint);
+      return result;
     });
   }
 
@@ -2205,6 +2238,12 @@ export class FinancialTransactionService {
       return { success: true, clearedCount };
     }
     const run = async (client: any) => {
+      const idempKey = `IDEMP-CLR-${params.clearingId}`;
+      const payloadFingerprint = { clearingId: params.clearingId };
+
+      const check = await checkOrRecordIdempotency(client, idempKey, 'processEarningsClearing', payloadFingerprint);
+      if (check.replayed) return check.result;
+
       const clrRes = await client.query(
         "SELECT * FROM earnings_clearing WHERE id = $1 AND status = 'clearing' AND clearance_end <= NOW() FOR UPDATE SKIP LOCKED",
         [params.clearingId]
@@ -2232,9 +2271,9 @@ export class FinancialTransactionService {
 
       const journalId = 'jnl_' + randomUUID().slice(0, 12);
       await client.query(
-        `INSERT INTO ledger_journals (id, reference, description, event_type, actor)
-         VALUES ($1, $2, $3, 'EARNINGS_CLEARED', $4)`,
-        [journalId, `CLR-${params.clearingId}`, `Earnings cleared for order #${clearing.order_id}`, params.actor || 'system:clearing']
+        `INSERT INTO ledger_journals (id, reference, description, event_type, actor, idempotency_key)
+         VALUES ($1, $2, $3, 'EARNINGS_CLEARED', $4, $5)`,
+        [journalId, `CLR-${params.clearingId}`, `Earnings cleared for order #${clearing.order_id}`, params.actor || 'system:clearing', idempKey]
       );
 
       const entries = [
@@ -2249,7 +2288,9 @@ export class FinancialTransactionService {
         );
       }
 
-      return { success: true, clearedCount: 1, clearingId: params.clearingId, newBalance: newBal };
+      const result = { success: true, clearedCount: 1, clearingId: params.clearingId, newBalance: newBal };
+      await recordIdempotencyResult(client, idempKey, 'processEarningsClearing', result, payloadFingerprint);
+      return result;
     };
     if (externalClient) return run(externalClient);
     return postgresStore.executeInTransaction(run);

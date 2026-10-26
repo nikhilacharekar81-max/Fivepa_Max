@@ -647,7 +647,59 @@ END $$;
 
 DO $$ BEGIN
   ALTER TABLE ledger_entries ADD CONSTRAINT fk_ledger_entries_journal FOREIGN KEY (journal_id) REFERENCES ledger_journals(id) ON DELETE CASCADE;
-EXCEPTION WHEN OTHERS THEN NULL;
+EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
+
+-- Authoritative Financial Database CHECK Constraints
+DO $$ BEGIN
+  ALTER TABLE wallets ADD CONSTRAINT check_wallets_available_balance CHECK (available_balance >= 0);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  ALTER TABLE wallets ADD CONSTRAINT check_wallets_funds_on_hold CHECK (funds_on_hold >= 0);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  ALTER TABLE wallets ADD CONSTRAINT check_wallets_pending_withdrawals CHECK (pending_withdrawals >= 0);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  ALTER TABLE escrows ADD CONSTRAINT check_escrows_amount CHECK (amount >= 0);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  ALTER TABLE escrows ADD CONSTRAINT check_escrows_remaining CHECK (remaining >= 0);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  ALTER TABLE payouts ADD CONSTRAINT check_payouts_amount CHECK (amount > 0);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  ALTER TABLE refunds ADD CONSTRAINT check_refunds_amount CHECK (amount > 0);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  ALTER TABLE earnings_clearing ADD CONSTRAINT check_earnings_clearing_amount CHECK (amount >= 0);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  ALTER TABLE ledger_entries ADD CONSTRAINT check_ledger_entries_debit CHECK (debit >= 0);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  ALTER TABLE ledger_entries ADD CONSTRAINT check_ledger_entries_credit CHECK (credit >= 0);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
 
 

@@ -81,16 +81,20 @@ export class FinanceRepo {
         const existing = await client.query('SELECT * FROM payouts WHERE id = $1 FOR UPDATE', [p.id]);
         if (existing.rows.length > 0) {
           const row = existing.rows[0];
-          if (Math.abs(Number(row.amount) - Number(p.amount)) > 0.001 || row.freelancer_id !== p.freelancerId) {
-            throw new Error(`Immutable financial record violation: Cannot modify amount or freelancer_id for payout ${p.id}`);
+          if (
+            Math.abs(Number(row.amount) - Number(p.amount)) > 0.001 ||
+            row.freelancer_id !== p.freelancerId ||
+            (row.method && p.method && row.method !== p.method) ||
+            (row.account_details && p.accountDetails && String(row.account_details).trim() !== String(p.accountDetails).trim())
+          ) {
+            throw new Error(`Immutable financial record violation: Cannot modify core payout parameters for payout ${p.id}`);
           }
         }
         await client.query(
           `INSERT INTO payouts (id, freelancer_id, amount, method, status, created_at, account_details)
            VALUES ($1, $2, $3, $4, $5, $6, $7)
            ON CONFLICT (id) DO UPDATE SET
-             status = EXCLUDED.status,
-             account_details = COALESCE(EXCLUDED.account_details, payouts.account_details)`,
+             status = EXCLUDED.status`,
           [p.id, p.freelancerId, p.amount, p.method, p.status, p.createdAt, p.accountDetails || null]
         );
         await client.query('COMMIT');
@@ -114,16 +118,20 @@ export class FinanceRepo {
           const existing = await client.query('SELECT * FROM payouts WHERE id = $1 FOR UPDATE', [p.id]);
           if (existing.rows.length > 0) {
             const row = existing.rows[0];
-            if (Math.abs(Number(row.amount) - Number(p.amount)) > 0.001 || row.freelancer_id !== p.freelancerId) {
-              throw new Error(`Immutable financial record violation: Cannot modify amount or freelancer_id for payout ${p.id}`);
+            if (
+              Math.abs(Number(row.amount) - Number(p.amount)) > 0.001 ||
+              row.freelancer_id !== p.freelancerId ||
+              (row.method && p.method && row.method !== p.method) ||
+              (row.account_details && p.accountDetails && String(row.account_details).trim() !== String(p.accountDetails).trim())
+            ) {
+              throw new Error(`Immutable financial record violation: Cannot modify core payout parameters for payout ${p.id}`);
             }
           }
           await client.query(
             `INSERT INTO payouts (id, freelancer_id, amount, method, status, created_at, account_details)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (id) DO UPDATE SET
-               status = EXCLUDED.status,
-               account_details = COALESCE(EXCLUDED.account_details, payouts.account_details)`,
+               status = EXCLUDED.status`,
             [p.id, p.freelancerId, p.amount, p.method, p.status, p.createdAt, p.accountDetails || null]
           );
         }
@@ -181,20 +189,30 @@ export class FinanceRepo {
   async savePaymentMethod(pm: PaymentMethodRecord | any): Promise<void> {
     if (!pm?.id) return;
     return this.ctx.withLock(`pm_${pm.userId}`, async () => {
-      if (pm.isDefault) {
-        await this.ctx.getPool().query('UPDATE payment_methods SET is_default = false WHERE user_id = $1', [pm.userId]);
+      const client = await this.ctx.getPool().connect();
+      try {
+        await client.query('BEGIN');
+        if (pm.isDefault) {
+          await client.query('UPDATE payment_methods SET is_default = false WHERE user_id = $1', [pm.userId]);
+        }
+        await client.query(
+          `INSERT INTO payment_methods (id, user_id, type, name, details, is_default, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (id) DO UPDATE SET
+             user_id = EXCLUDED.user_id,
+             type = EXCLUDED.type,
+             name = EXCLUDED.name,
+             details = EXCLUDED.details,
+             is_default = EXCLUDED.is_default`,
+          [pm.id, pm.userId, pm.type, pm.name, JSON.stringify(pm.details || {}), Boolean(pm.isDefault), pm.createdAt || new Date().toISOString().substring(0, 10)]
+        );
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        client.release();
       }
-      await this.ctx.getPool().query(
-        `INSERT INTO payment_methods (id, user_id, type, name, details, is_default, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (id) DO UPDATE SET
-           user_id = EXCLUDED.user_id,
-           type = EXCLUDED.type,
-           name = EXCLUDED.name,
-           details = EXCLUDED.details,
-           is_default = EXCLUDED.is_default`,
-        [pm.id, pm.userId, pm.type, pm.name, JSON.stringify(pm.details || {}), Boolean(pm.isDefault), pm.createdAt || new Date().toISOString().substring(0, 10)]
-      );
     });
   }
 
@@ -205,14 +223,24 @@ export class FinanceRepo {
   }
 
   async deletePaymentMethod(id: string): Promise<void> {
-    await this.ctx.getPool().query('SELECT * FROM payment_methods WHERE id = $1', [id]); // check existence
+    await this.ctx.getPool().query('SELECT * FROM payment_methods WHERE id = $1', [id]);
     await this.ctx.getPool().query('DELETE FROM payment_methods WHERE id = $1', [id]);
   }
 
   async setDefaultPaymentMethod(userId: string, id: string): Promise<void> {
     return this.ctx.withLock(`pm_${userId}`, async () => {
-      await this.ctx.getPool().query('UPDATE payment_methods SET is_default = false WHERE user_id = $1', [userId]);
-      await this.ctx.getPool().query('UPDATE payment_methods SET is_default = true WHERE id = $1 AND user_id = $2', [id, userId]);
+      const client = await this.ctx.getPool().connect();
+      try {
+        await client.query('BEGIN');
+        await client.query('UPDATE payment_methods SET is_default = false WHERE user_id = $1', [userId]);
+        await client.query('UPDATE payment_methods SET is_default = true WHERE id = $1 AND user_id = $2', [id, userId]);
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        client.release();
+      }
     });
   }
 
