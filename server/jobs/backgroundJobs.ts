@@ -1,12 +1,23 @@
 import { financialTransactionService } from '../services/financialService.js';
 import { processCancellationTimeouts, processAutoAcceptOrders } from '../services/orderService.js';
+import { postgresStore, isPostgresEnabled } from '../db/postgresStore.js';
 
 export async function runBackgroundJobs() {
   console.log('[BackgroundJobs] Starting financial and marketplace background jobs...');
 
-  // 1. Earnings Clearing Job (Every 5 minutes)
+  // 1. Earnings Clearing Job (Every 5 minutes with advisory locking)
   setInterval(async () => {
+    let client: any = null;
     try {
+      if (isPostgresEnabled()) {
+        client = await postgresStore.getPool().connect();
+        const lockRes = await client.query('SELECT pg_try_advisory_xact_lock(74218932) AS locked');
+        if (!lockRes.rows[0]?.locked) {
+          client.release();
+          return; // Another worker holds the advisory lock
+        }
+      }
+
       const clearableIds = await financialTransactionService.getClearableEarnings();
       if (clearableIds.length > 0) {
         console.log(`[BackgroundJobs] Found ${clearableIds.length} earnings to clear.`);
@@ -18,7 +29,14 @@ export async function runBackgroundJobs() {
           }
         }
       }
+
+      if (client) {
+        client.release();
+      }
     } catch (err) {
+      if (client) {
+        try { client.release(); } catch {}
+      }
       console.error('[BackgroundJobs] Error in earnings clearing job:', err);
     }
   }, 5 * 60 * 1000);
