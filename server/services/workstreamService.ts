@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { randomUUID } from 'crypto';
 import { Request } from 'express';
 import {
   store,
@@ -44,6 +45,27 @@ export const OFFER_LABEL: Record<WorkstreamOfferKind, string> = { proposal: 'pro
 export const OFFER_PREFIX: Record<WorkstreamOfferKind, string> = { proposal: 'PRP', invoice: 'INV', deposit: 'DEP' };
 export const FUNDED_STATUSES = ['funded_in_escrow', 'delivered', 'revision', 'completed', 'disputed'];
 
+export function generateCollisionSafeOfferNumber(kind: WorkstreamOfferKind): string {
+  const prefix = OFFER_PREFIX[kind] || 'OFF';
+  const tsPart = Date.now().toString(36).toUpperCase();
+  const rndPart = randomUUID().replace(/-/g, '').slice(0, 4).toUpperCase();
+  return `${prefix}-${tsPart}-${rndPart}`;
+}
+
+export async function cancelPendingOffersForOrder(orderId: string, actorId?: string): Promise<void> {
+  try {
+    const pool = postgresStore.getPool();
+    await pool.query(
+      `UPDATE workstream_offers
+       SET status = 'cancelled', resolved_at = NOW(), resolved_by = COALESCE($2, created_by)
+       WHERE order_id = $1 AND status = 'pending'`,
+      [orderId, actorId || null]
+    );
+  } catch (err) {
+    console.error(`[cancelPendingOffersForOrder] Failed for order ${orderId}:`, err);
+  }
+}
+
 export async function orderHasEscrow(orderId: string): Promise<boolean> {
   const esc = await financialRepository.getEscrow(orderId);
   return Boolean(esc && esc.status === 'held' && esc.remaining > 0);
@@ -63,14 +85,23 @@ export async function hasPaidInvoiceOrReleasedEscrow(order: Order): Promise<bool
 export async function findLinkedProposalForOffer(offer: WorkstreamOffer, order: Order): Promise<Proposal | undefined> {
   try {
     const pool = postgresStore.getPool();
-    const query = `
-      SELECT * FROM proposals
-      WHERE id = $1 OR offer_id = $2 OR (project_id = $3 AND freelancer_id = $4)
-      LIMIT 1
-    `;
-    const res = await pool.query(query, [offer.proposalId || null, offer.id, order.projectId || null, order.sellerId]);
-    if (res.rows.length === 0) return undefined;
-    return mapProposalRow(res.rows[0]);
+    if (offer.proposalId) {
+      const res = await pool.query('SELECT * FROM proposals WHERE id = $1', [offer.proposalId]);
+      if (res.rows.length > 0) return mapProposalRow(res.rows[0]);
+    }
+    const offerRes = await pool.query('SELECT * FROM proposals WHERE offer_id = $1', [offer.id]);
+    if (offerRes.rows.length > 0) return mapProposalRow(offerRes.rows[0]);
+
+    if (order.projectId && order.sellerId) {
+      const fallbackRes = await pool.query(
+        `SELECT * FROM proposals 
+         WHERE project_id = $1 AND freelancer_id = $2 AND status IN ('accepted', 'accepting', 'pending')
+         ORDER BY updated_at DESC, created_at DESC LIMIT 1`,
+        [order.projectId, order.sellerId]
+      );
+      if (fallbackRes.rows.length > 0) return mapProposalRow(fallbackRes.rows[0]);
+    }
+    return undefined;
   } catch {
     return undefined;
   }
@@ -105,7 +136,7 @@ export async function viewOffer(o: WorkstreamOffer) {
 
 export async function postOfferMessage(order: Order, offer: WorkstreamOffer, sender: { id: string; name: string } | null, text: string, action: string) {
   const msg: Message = {
-    id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+    id: `msg_${randomUUID()}`,
     orderId: order.id,
     senderId: sender?.id || 'system',
     senderName: sender?.name || 'Workstream',
@@ -114,9 +145,7 @@ export async function postOfferMessage(order: Order, offer: WorkstreamOffer, sen
     type: sender ? 'message' : 'system',
     metadata: { action, offerId: offer.id, offerKind: offer.kind }
   };
-  recordMessage(msg);
-  await store.addMessage(msg);
-  broadcastMessage(msg, order.id);
+  await recordMessage(msg);
 
   const recipientIds: string[] = [];
   if (sender?.id) {
@@ -151,25 +180,38 @@ export function workstreamFilenameFromUrl(url: unknown): string | null {
   const trimmed = url.trim();
   if (trimmed.startsWith(WORKSTREAM_FILE_URL_PREFIX)) {
     const name = path.basename(trimmed.slice(WORKSTREAM_FILE_URL_PREFIX.length).split('?')[0]);
-    if (name && workstreamFileExists(name)) return name;
+    if (name && name !== '.' && name !== '..') return name;
   }
   if (trimmed.startsWith('/uploads/workstream/')) {
     const name = path.basename(trimmed.slice('/uploads/workstream/'.length).split('?')[0]);
-    if (name && workstreamFileExists(name)) return name;
+    if (name && name !== '.' && name !== '..') return name;
   }
   if (trimmed.includes('workstream/')) {
     const parts = trimmed.split('workstream/');
     const lastPart = parts[parts.length - 1].split('?')[0];
     const name = path.basename(lastPart);
-    if (name && workstreamFileExists(name)) {
+    if (name && name !== '.' && name !== '..') {
       return name;
     }
   }
-  const baseName = path.basename(trimmed.split('?')[0]);
-  if (baseName && workstreamFileExists(baseName)) {
-    return baseName;
+  if (!/^https?:\/\//i.test(trimmed)) {
+    const baseName = path.basename(trimmed.split('?')[0]);
+    if (baseName && workstreamFileExists(baseName)) {
+      return baseName;
+    }
   }
   return null;
+}
+
+export async function workstreamFileExistsAsync(f: string): Promise<boolean> {
+  if (!f) return false;
+  const safeBase = path.basename(f);
+  if (fs.existsSync(path.join(WORKSTREAM_UPLOADS_DIR, safeBase))) return true;
+  try {
+    const rec = await store.getUploadRecord(safeBase);
+    if (rec) return true;
+  } catch {}
+  return false;
 }
 
 export async function canAccessWorkstreamFile(user: any, filename: string): Promise<boolean> {
@@ -200,35 +242,6 @@ export async function canAccessWorkstreamFile(user: any, filename: string): Prom
         }
       }
     }
-
-    if (!rec.orderId && !rec.workspaceId) {
-      // Backfill and authorize if file was attached to a message in an order
-      const msgCheck = await postgresStore.getPool().query(
-        "SELECT order_id FROM messages WHERE file_info IS NOT NULL AND file_info::text LIKE $1 LIMIT 1",
-        [`%${filename}%`]
-      );
-      if (msgCheck.rows.length > 0) {
-        const foundOrderId = msgCheck.rows[0].order_id;
-        await postgresStore.getPool().query("UPDATE uploads SET order_id = $1 WHERE filename = $2", [foundOrderId, filename]);
-        const order = await store.getOrder(foundOrderId);
-        if (order && (user.id === order.buyerId || user.id === order.sellerId)) {
-          return true;
-        }
-      }
-
-      // Backfill and authorize if file was uploaded as an order deliverable
-      const delivCheck = await postgresStore.getPool().query(
-        "SELECT id, buyer_id, seller_id FROM orders WHERE deliverable_files IS NOT NULL AND deliverable_files::text LIKE $1 LIMIT 1",
-        [`%${filename}%`]
-      );
-      if (delivCheck.rows.length > 0) {
-        const foundOrder = delivCheck.rows[0];
-        await postgresStore.getPool().query("UPDATE uploads SET order_id = $1 WHERE filename = $2", [foundOrder.id, filename]);
-        if (user.id === foundOrder.buyer_id || user.id === foundOrder.seller_id) {
-          return true;
-        }
-      }
-    }
   } catch (err) {
     console.error(`[canAccessWorkstreamFile] Authorization check error for file ${filename}:`, err);
   }
@@ -238,20 +251,32 @@ export async function canAccessWorkstreamFile(user: any, filename: string): Prom
 
 export const canAccessWorkstreamUpload = canAccessWorkstreamFile;
 
-export function validateMessageFileInfo(fileInfo: any, sender: any):
-  { ok: true; fileInfo: any } | { ok: false; error: string } {
+export async function validateMessageFileInfo(fileInfo: any, sender: any):
+  Promise<{ ok: true; fileInfo: any } | { ok: false; error: string }> {
   if (fileInfo === undefined || fileInfo === null) return { ok: true, fileInfo: undefined };
   if (typeof fileInfo !== 'object') return { ok: false, error: 'Invalid file attachment.' };
+
+  if (typeof fileInfo.url === 'string') {
+    const urlStr = fileInfo.url.trim().toLowerCase();
+    if (urlStr.startsWith('javascript:') || urlStr.startsWith('data:') || urlStr.startsWith('file:') || urlStr.startsWith('http:')) {
+      return { ok: false, error: 'Insecure URL scheme. Only https:// or internal /api/workstream/files/ links are accepted.' };
+    }
+  }
+
   const filename = workstreamFilenameFromUrl(fileInfo.url);
-  if (!filename || !workstreamFileExists(filename)) {
+  if (!filename || !(await workstreamFileExistsAsync(filename))) {
     return { ok: false, error: 'Attachments must be uploaded files; placeholder or external URLs are not accepted.' };
   }
-  const bytes = workstreamFileBytes(filename);
+  const dbRec = await store.getUploadRecord(filename).catch(() => undefined);
+  if (dbRec && sender && !isStaffUser(sender) && dbRec.ownerId && dbRec.ownerId !== sender.id) {
+    return { ok: false, error: 'Forbidden: You do not own this uploaded file.' };
+  }
+  const bytes = workstreamFileBytes(filename) || Number(dbRec?.size || 0);
   const size = bytes > 1024 * 1024 ? `${(bytes / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
   return {
     ok: true,
     fileInfo: {
-      name: typeof fileInfo.name === 'string' && fileInfo.name.trim() ? fileInfo.name.trim().slice(0, 200) : filename,
+      name: typeof fileInfo.name === 'string' && fileInfo.name.trim() ? fileInfo.name.trim().slice(0, 200) : (dbRec?.originalName || filename),
       size,
       url: `${WORKSTREAM_FILE_URL_PREFIX}${filename}`,
       ...(typeof fileInfo.type === 'string' ? { type: fileInfo.type.slice(0, 100) } : {})
@@ -275,6 +300,9 @@ export async function validateStoredWorkstreamFiles(
         return { ok: false, error: 'Invalid deliverable link.' };
       }
       const extUrl = f.url.trim();
+      if (!extUrl.startsWith('https://')) {
+        return { ok: false, error: 'Deliverable external links must use https:// scheme.' };
+      }
       out.push({
         name: typeof f?.name === 'string' && f.name.trim() ? f.name.trim().slice(0, 200) : 'External Deliverable',
         size: typeof f?.size === 'string' ? f.size : '1.0 MB',
@@ -288,16 +316,18 @@ export async function validateStoredWorkstreamFiles(
       return { ok: false, error: 'Access denied: Invalid file path.' };
     }
 
-    if (!workstreamFileExists(filename)) {
+    if (!(await workstreamFileExistsAsync(filename))) {
       return { ok: false, error: `Uploaded file not found on server: ${filename}` };
     }
 
+    let dbSize = 0;
     // Verify upload ownership and order/workspace binding in PostgreSQL
     try {
       const pool = postgresStore.getPool();
       const res = await pool.query('SELECT * FROM uploads WHERE filename = $1', [filename]);
       if (res.rows.length > 0) {
         const row = res.rows[0];
+        dbSize = Number(row.size || 0);
         if (submitter && !isStaffUser(submitter)) {
           if (row.owner_id && row.owner_id !== submitter.id) {
             return { ok: false, error: 'Forbidden: You do not have ownership of this uploaded file.', status: 403 };
@@ -309,9 +339,10 @@ export async function validateStoredWorkstreamFiles(
       }
     } catch (err: any) {
       console.error('[validateStoredWorkstreamFiles] DB verification error:', err);
+      return { ok: false, error: 'Failed to verify uploaded file ownership', status: 500 };
     }
 
-    const bytes = workstreamFileBytes(filename);
+    const bytes = workstreamFileBytes(filename) || dbSize;
     const size = bytes > 1024 * 1024 ? `${(bytes / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
     const parts = filename.split('_');
     const fallbackName = parts.length > 2 ? parts.slice(2).join('_') : filename;

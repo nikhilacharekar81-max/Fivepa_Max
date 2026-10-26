@@ -320,6 +320,14 @@ export function validateOrderReleasePreconditions(order: Order, isAdmin = false,
     diagnosticService.log('security', 'orderService', 'validateOrderReleasePreconditions', 'server/services/orderService.ts', 'release_preconditions', 'INTERCEPTED', { orderId: order.id, status: order.status }, 'Cannot release payment while dispute is open');
     return { status: 400, error: 'Cannot release payment while an active dispute is open. The dispute must be resolved first.' };
   }
+  const hasDeliverables = (Array.isArray(order.deliverableFiles) && order.deliverableFiles.length > 0) ||
+                          (Array.isArray(order.deliveryHistory) && order.deliveryHistory.length > 0) ||
+                          Boolean(order.deliveryReference) ||
+                          order.status === 'delivered';
+  if (!isAdmin && !hasDeliverables) {
+    diagnosticService.log('security', 'orderService', 'validateOrderReleasePreconditions', 'server/services/orderService.ts', 'release_preconditions', 'INTERCEPTED', { orderId: order.id, status: order.status }, 'Payment release attempted without deliverable evidence');
+    return { status: 400, error: 'Payment can only be released after deliverables have been submitted.' };
+  }
   if (!isAdmin && !isInvoiceApproval && order.status !== 'delivered') {
     diagnosticService.log('security', 'orderService', 'validateOrderReleasePreconditions', 'server/services/orderService.ts', 'release_preconditions', 'INTERCEPTED', { orderId: order.id, status: order.status }, 'Payment release attempted before work was delivered');
     return { status: 400, error: 'Payment can only be released after the freelancer has submitted deliverables.' };
@@ -374,26 +382,30 @@ export async function processCancellationTimeouts() {
           continue;
         }
         try {
-          const requestKey = `cancel_timeout_${order.id}_${order.cancellationRequest.requestedAt}`;
-          const refundRes = await refundOrderFunds(order, undefined, 'System Auto-Cancel', 'Cancellation request auto-cancelled after 48h timeout', requestKey);
-          order.cancellationRequest.status = 'auto_cancelled';
-          await store.saveOrder(order);
+          const freshOrder = await store.getOrder(order.id);
+          if (!freshOrder || freshOrder.status === 'completed' || freshOrder.status === 'cancelled' || !freshOrder.cancellationRequest || freshOrder.cancellationRequest.status !== 'pending') {
+            continue;
+          }
+          const requestKey = `cancel_timeout_${freshOrder.id}_${freshOrder.cancellationRequest.requestedAt}`;
+          const refundRes = await refundOrderFunds(freshOrder, undefined, 'System Auto-Cancel', 'Cancellation request auto-cancelled after 48h timeout', requestKey);
+          freshOrder.cancellationRequest.status = 'auto_cancelled';
+          await store.saveOrder(freshOrder);
 
-          const requesterId = order.cancellationRequest.requesterId;
-          const otherId = requesterId === order.buyerId ? order.sellerId : order.buyerId;
+          const requesterId = freshOrder.cancellationRequest.requesterId;
+          const otherId = requesterId === freshOrder.buyerId ? freshOrder.sellerId : freshOrder.buyerId;
           createNotification({
             userId: requesterId,
             title: 'Cancellation Auto-Cancelled',
-            message: `Order #${order.id} cancellation request timed out after 48h. Order cancelled & full refund issued ($${refundRes.refunded}).`,
+            message: `Order #${freshOrder.id} cancellation request timed out after 48h. Order cancelled & full refund issued ($${refundRes.refunded}).`,
             type: 'order',
-            link: `/messages/${order.id}`
+            link: `/messages/${freshOrder.id}`
           });
           createNotification({
             userId: otherId,
             title: 'Cancellation Auto-Cancelled',
-            message: `Order #${order.id} cancellation request timed out after 48h. Order cancelled & full refund issued ($${refundRes.refunded}).`,
+            message: `Order #${freshOrder.id} cancellation request timed out after 48h. Order cancelled & full refund issued ($${refundRes.refunded}).`,
             type: 'order',
-            link: `/messages/${order.id}`
+            link: `/messages/${freshOrder.id}`
           });
         } catch (err) {
           console.error(`[CancellationTimeout] Failed to auto-cancel order ${order.id}:`, err);
@@ -465,13 +477,21 @@ export async function processAutoAcceptOrders(customNow?: number): Promise<Array
 
       const requestKey = `auto_accept_${order.id}_v${latestDelivery.version}`;
       try {
-        const result = await releaseOrderFunds(order, 'System Auto-Accept', `Auto-accept after buyer review window (${days} days) elapsed`, false, requestKey);
-        order.acceptedVersion = latestDelivery.version;
-        await store.saveOrder(order);
+        const freshOrder = await store.getOrder(order.id);
+        if (!freshOrder || freshOrder.status !== 'delivered') {
+          continue;
+        }
+        if (Array.isArray(freshOrder.revisions) && freshOrder.revisions.some(rev => rev.status === 'requested')) {
+          continue;
+        }
+
+        const result = await releaseOrderFunds(freshOrder, 'System Auto-Accept', `Auto-accept after buyer review window (${days} days) elapsed`, false, requestKey);
+        freshOrder.acceptedVersion = latestDelivery.version;
+        await store.saveOrder(freshOrder);
 
         const sysMsg: Message = {
-          id: 'msg_' + now + '_' + Math.random().toString(36).slice(2, 6),
-          orderId: order.id,
+          id: `msg_${randomUUID()}`,
+          orderId: freshOrder.id,
           senderId: 'system',
           senderName: 'WorkPerHour System',
           text: `🎉 Deliverables automatically accepted: Buyer review window (${days} days) closed without revisions or dispute. Escrow funds released to seller.`,
@@ -483,25 +503,23 @@ export async function processAutoAcceptOrders(customNow?: number): Promise<Array
             reviewWindowDays: days
           }
         };
-        recordMessage(sysMsg);
-        await store.addMessage(sysMsg);
-        broadcastMessage(sysMsg, order.id);
+        await recordMessage(sysMsg);
 
         const autoLog: AuditLog = {
-          id: 'log_' + Date.now(),
+          id: 'log_' + randomUUID(),
           actor: 'System Auto-Accept',
           role: 'system',
           action: 'ORDER_AUTO_ACCEPTED',
-          target: `Order #${order.id}`,
+          target: `Order #${freshOrder.id}`,
           details: `Auto-accepted deliverables (version ${latestDelivery.version}) after ${days}-day buyer review window expired`,
           timestamp: new Date(now).toISOString()
         };
         registerAuditLog(autoLog);
 
         processed.push({
-          orderId: order.id,
+          orderId: freshOrder.id,
           acceptedVersion: latestDelivery.version,
-          amount: order.amount,
+          amount: freshOrder.amount,
           freelancerNet: result.freelancerNet
         });
       } catch (err: any) {

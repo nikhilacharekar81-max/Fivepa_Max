@@ -253,16 +253,15 @@ export class PostgresStore {
   public withLock<T = void>(key: string, fn: () => Promise<T>): Promise<T> {
     if (!isPostgresEnabled()) return Promise.resolve(undefined as any);
     if (!this.isHydrated && key !== 'initialization' && !key.startsWith('meta_')) return Promise.resolve(undefined as any);
-    const queued = this.pending.get(key);
-    if (queued) return queued as Promise<T>;
     const prev = this.locks.get(key) || Promise.resolve();
-    const next = prev.catch(() => {}).then(async () => {
-      this.pending.delete(key);
-      return await fn();
+    const tail = prev.catch(() => {}).then(() => fn());
+    this.locks.set(key, tail as any);
+    this.pending.set(key, tail as any);
+    return tail.finally(() => {
+      if (this.pending.get(key) === tail) {
+        this.pending.delete(key);
+      }
     });
-    this.pending.set(key, next as any);
-    this.locks.set(key, next as any);
-    return next as Promise<T>;
   }
 
   public async executeInTransaction<T>(fn: (client: pkg.PoolClient) => Promise<T>): Promise<T> {
@@ -530,6 +529,10 @@ export class PostgresStore {
 
   async deleteUploadRecord(filename: string): Promise<void> {
     return this.workspaceRepo.deleteUploadRecord(filename);
+  }
+
+  async getUploadRecord(filename: string): Promise<WorkstreamUploadRecord | undefined> {
+    return this.workspaceRepo.getUploadRecord(filename);
   }
 
   async listUploadRecords(): Promise<Record<string, WorkstreamUploadRecord>> {

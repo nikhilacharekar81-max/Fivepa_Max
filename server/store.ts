@@ -178,6 +178,7 @@ export interface StoreInterface {
 
   // Messages, Reviews, Uploads
   listMessages(orderId: string): Promise<Message[]>;
+  getMessageByClientMsgId(orderId: string, senderId: string, clientMsgId: string): Promise<Message | undefined>;
   addMessage(message: Message): Promise<void>;
   addReview(review: Review): Promise<void>;
   saveReview(review: Review): Promise<void>;
@@ -965,6 +966,30 @@ export class PostgresAsyncStore implements StoreInterface {
     }));
   }
 
+  async getMessageByClientMsgId(orderId: string, senderId: string, clientMsgId: string): Promise<Message | undefined> {
+    const res = await postgresStore.getPool().query(
+      `SELECT * FROM messages 
+       WHERE order_id = $1 AND sender_id = $2 AND metadata->>'clientMessageId' = $3 
+       LIMIT 1`,
+      [orderId, senderId, clientMsgId]
+    );
+    if (res.rows.length > 0) {
+      const r = res.rows[0];
+      return {
+        id: r.id,
+        orderId: r.order_id,
+        senderId: r.sender_id,
+        senderName: r.sender_name,
+        text: r.text,
+        timestamp: r.timestamp,
+        type: r.type || undefined,
+        fileInfo: r.file_info || undefined,
+        metadata: r.metadata || undefined
+      };
+    }
+    return undefined;
+  }
+
   async addMessage(message: Message): Promise<void> {
     await postgresStore.getPool().query(
       `INSERT INTO messages (id, order_id, sender_id, sender_name, text, timestamp, type, file_info, metadata)
@@ -1089,8 +1114,7 @@ export class PostgresAsyncStore implements StoreInterface {
   }
 
   async getUploadRecord(filename: string): Promise<WorkstreamUploadRecord | undefined> {
-    const records = await postgresStore.listUploadRecords();
-    return records[filename];
+    return await postgresStore.getUploadRecord(filename);
   }
 
   async saveUploadRecord(filename: string, record: WorkstreamUploadRecord): Promise<void> {
@@ -1323,12 +1347,16 @@ export async function hydrateStoreFromPostgres() {
     }
 
 
-    const isProduction = process.env.NODE_ENV === 'production' && process.env.SEED_DEMO_DATA !== 'true';
+    const isProduction = process.env.NODE_ENV === 'production';
+    if (isProduction) {
+      return;
+    }
+
     const pool = postgresStore.getPool();
     const userCountRes = await pool.query('SELECT COUNT(*) as c FROM users');
     const userCount = Number(userCountRes.rows[0]?.c || 0);
 
-    if (!isProduction && userCount === 0 && !(await postgresStore.isInitialized())) {
+    if (userCount === 0 && !(await postgresStore.isInitialized())) {
       const defaultPass = await bcrypt.hash('Password123!', 10);
       const nowIso = new Date().toISOString();
       const seedUsers: User[] = [

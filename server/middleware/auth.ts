@@ -37,6 +37,18 @@ export function apiError(res: Response, message: string, status: number = 400) {
   return res.status(status).json({ error: message });
 }
 
+export function formatApiError(err: any, fallbackMessage = 'An unexpected error occurred'): { error: string } {
+  if (!err) return { error: fallbackMessage };
+  const rawMessage = typeof err === 'string' ? err : (err.message || fallbackMessage);
+  if (IS_PRODUCTION) {
+    const isDbError = /SELECT|INSERT|UPDATE|DELETE|PG::|postgres|sql/i.test(rawMessage);
+    if (isDbError) {
+      return { error: 'A database error occurred. Please try again later.' };
+    }
+  }
+  return { error: rawMessage };
+}
+
 export function getUserActiveSessions(user: User): number[] {
   if (!Array.isArray((user as any).activeSessionVersions)) {
     const current = user.sessionVersion ? Number(user.sessionVersion) : 1;

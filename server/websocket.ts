@@ -2,7 +2,8 @@ import { WebSocketServer, WebSocket } from 'ws';
 import type { Server } from 'http';
 import { store, type Message, type Notification } from './store.js';
 import { verifyToken, getUserActiveSessions, canAccessOrderWorkstream, isStaffUser } from './middleware/auth.js';
-import { recordMessage } from './services/messagingService.js';
+import { recordMessage, sanitizeAndCreateMessage } from './services/messagingService.js';
+import { validateMessageFileInfo, workstreamFilenameFromUrl } from './services/workstreamService.js';
 import { postgresStore } from './db/postgresStore.js';
 import { diagnosticService } from './services/diagnosticService.js';
 
@@ -22,8 +23,18 @@ function checkWsIpRateLimit(ip: string, max = 50, windowMs = 60000): boolean {
   return record.count <= max;
 }
 
+// Periodic cleanup for expired IP rate-limit entries
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, rec] of wsConnectionBuckets.entries()) {
+    if (now > rec.resetAt) {
+      wsConnectionBuckets.delete(ip);
+    }
+  }
+}, 300000);
+
 export function initWebSocketServer(server: Server): WebSocketServer {
-  wss = new WebSocketServer({ noServer: true });
+  wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
 
   server.on('upgrade', (request, socket, head) => {
     const xff = request.headers['x-forwarded-for'];
@@ -62,12 +73,14 @@ export function initWebSocketServer(server: Server): WebSocketServer {
           diagnosticService.log('security', 'websocket', 'connection', 'server/websocket.ts', 'query_token_usage', 'INFO', {}, 'WebSocket connection established using token in URL query parameter. This may lead to token leakage in logs.');
           const payload = verifyToken(queryToken);
           if (!payload || !payload.id) {
+            clients.delete(ws);
             try { ws.close(1008, 'Invalid token in query'); } catch {}
             return;
           }
           const dbUser = await store.getUser(payload.id);
-          if (!dbUser || dbUser.status !== 'active') {
-            try { ws.close(1008, 'Account inactive or suspended'); } catch {}
+          if (!dbUser || dbUser.status === 'deactivated') {
+            clients.delete(ws);
+            try { ws.close(1008, 'Account deactivated'); } catch {}
             return;
           }
           (ws as any).authenticatedUserId = dbUser.id;
@@ -81,6 +94,7 @@ export function initWebSocketServer(server: Server): WebSocketServer {
         const timeoutMs = process.env.NODE_ENV === 'test' ? 1000 : 10000;
         authTimeout = setTimeout(() => {
           if (!(ws as any).isAuthenticated) {
+            clients.delete(ws);
             try { ws.close(1008, 'Authentication timeout'); } catch {}
           }
         }, timeoutMs);
@@ -89,6 +103,7 @@ export function initWebSocketServer(server: Server): WebSocketServer {
       setupWebSocketHandlers(ws, authTimeout);
     } catch (err) {
       console.error('WS Connection error:', err);
+      clients.delete(ws);
       try { ws.close(1011, 'Server error during connection'); } catch {}
     }
   });
@@ -199,6 +214,7 @@ function setupWebSocketHandlers(ws: WebSocket, authTimeout?: NodeJS.Timeout) {
         if (authAttempts > 3) {
           diagnosticService.log('security', 'websocket', 'authenticate', 'server/websocket.ts', 'auth_attempts', 'INTERCEPTED', { authAttempts }, 'Too many authentication attempts');
           ws.send(JSON.stringify({ error: 'Too many authentication attempts' }));
+          clients.delete(ws);
           try { ws.close(1008, 'Too many auth attempts'); } catch {}
           return;
         }
@@ -212,7 +228,7 @@ function setupWebSocketHandlers(ws: WebSocket, authTimeout?: NodeJS.Timeout) {
         const payload = verifyToken(token);
         if (payload && payload.id) {
           const dbUser = await store.getUser(payload.id);
-          if (dbUser && dbUser.status === 'active') {
+          if (dbUser && dbUser.status !== 'deactivated') {
             (ws as any).authenticatedUserId = dbUser.id;
             (ws as any).sessionVersion = payload.sessionVersion !== undefined ? payload.sessionVersion : Number(dbUser.sessionVersion || 1);
             (ws as any).isAuthenticated = true;
@@ -230,8 +246,9 @@ function setupWebSocketHandlers(ws: WebSocket, authTimeout?: NodeJS.Timeout) {
           }
         }
 
-        diagnosticService.log('security', 'websocket', 'authenticate', 'server/websocket.ts', 'verify_token', 'INTERCEPTED', {}, 'Invalid token or inactive account on WebSocket authenticate');
+        diagnosticService.log('security', 'websocket', 'authenticate', 'server/websocket.ts', 'verify_token', 'INTERCEPTED', {}, 'Invalid token or deactivated account on WebSocket authenticate');
         ws.send(JSON.stringify({ error: 'Invalid token' }));
+        clients.delete(ws);
         try { ws.close(1008, 'Authentication failed'); } catch {}
         return;
       }
@@ -243,14 +260,16 @@ function setupWebSocketHandlers(ws: WebSocket, authTimeout?: NodeJS.Timeout) {
 
       const currentDbUser = await store.getUser((ws as any).authenticatedUserId);
       const wsSessionVer = (ws as any).sessionVersion;
-      if (!currentDbUser || currentDbUser.status !== 'active') {
-        diagnosticService.log('security', 'websocket', 'checkSession', 'server/websocket.ts', 'account_status', 'INTERCEPTED', { userId: (ws as any).authenticatedUserId }, 'Session invalidated or account inactive on message');
-        try { ws.close(1008, 'Session invalidated or account inactive'); } catch {}
+      if (!currentDbUser || currentDbUser.status === 'deactivated') {
+        diagnosticService.log('security', 'websocket', 'checkSession', 'server/websocket.ts', 'account_status', 'INTERCEPTED', { userId: (ws as any).authenticatedUserId }, 'Session invalidated or account deactivated on message');
+        clients.delete(ws);
+        try { ws.close(1008, 'Session invalidated or account deactivated'); } catch {}
         return;
       }
       if (wsSessionVer !== undefined) {
         const activeSessions = getUserActiveSessions(currentDbUser);
         if (!activeSessions.includes(wsSessionVer) && wsSessionVer !== currentDbUser.sessionVersion) {
+          clients.delete(ws);
           try { ws.close(1008, 'Session invalidated or evicted (max 3 devices)'); } catch {}
           return;
         }
@@ -263,9 +282,13 @@ function setupWebSocketHandlers(ws: WebSocket, authTimeout?: NodeJS.Timeout) {
 
       if (parsed.type === 'NEW_MESSAGE') {
         const orderId = parsed.orderId;
-        const text = parsed.text;
         if (!orderId) {
           ws.send(JSON.stringify({ error: 'Order ID is required' }));
+          return;
+        }
+
+        if ((currentDbUser as any).status === 'suspended' && !orderId.startsWith('support_admin_')) {
+          ws.send(JSON.stringify({ error: 'Action forbidden: Your account is suspended. You can only message Support.' }));
           return;
         }
 
@@ -286,20 +309,44 @@ function setupWebSocketHandlers(ws: WebSocket, authTimeout?: NodeJS.Timeout) {
           return;
         }
 
-        const newMsg: Message = {
-          id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
-          orderId: order.id,
-          senderId: currentDbUser.id,
-          senderName: currentDbUser.name,
-          text: String(text || '').slice(0, 5000),
-          timestamp: new Date().toISOString(),
-          type: 'message'
-        };
+        const fileCheck = await validateMessageFileInfo(parsed.fileInfo, currentDbUser);
+        if (!fileCheck.ok) {
+          ws.send(JSON.stringify({ error: (fileCheck as any).error }));
+          return;
+        }
 
-        // Persist to PostgreSQL database FIRST before client broadcast
-        await store.addMessage(newMsg);
-        recordMessage(newMsg);
-        await broadcastMessage(newMsg, order.id);
+        const clientMessageId = typeof parsed.clientMessageId === 'string'
+          ? parsed.clientMessageId
+          : (typeof parsed.metadata?.clientMessageId === 'string' ? parsed.metadata.clientMessageId : undefined);
+        if (clientMessageId) {
+          const existingMsg = await store.getMessageByClientMsgId(order.id, currentDbUser.id, clientMessageId);
+          if (existingMsg) {
+            ws.send(JSON.stringify({ type: 'MESSAGE_RECEIVED', message: existingMsg, deduplicated: true }));
+            return;
+          }
+        }
+
+        const newMsg = sanitizeAndCreateMessage(currentDbUser, order, parsed, fileCheck);
+        if (newMsg.fileInfo?.url) {
+          const fn = workstreamFilenameFromUrl(newMsg.fileInfo.url);
+          if (fn) {
+            await postgresStore.getPool().query('UPDATE uploads SET order_id = $1 WHERE filename = $2 AND order_id IS NULL', [order.id, fn]);
+          }
+        }
+
+        try {
+          // Persist to PostgreSQL database FIRST (recordMessage handles broadcast)
+          await recordMessage(newMsg);
+        } catch (msgErr: any) {
+          if (clientMessageId) {
+            const existingMsg = await store.getMessageByClientMsgId(order.id, currentDbUser.id, clientMessageId);
+            if (existingMsg) {
+              ws.send(JSON.stringify({ type: 'MESSAGE_RECEIVED', message: existingMsg, deduplicated: true }));
+              return;
+            }
+          }
+          throw msgErr;
+        }
 
         diagnosticService.log('info', 'websocket', 'onNewMessage', 'server/websocket.ts', 'send_message', 'SUCCESS', { orderId: order.id, messageId: newMsg.id });
         return;

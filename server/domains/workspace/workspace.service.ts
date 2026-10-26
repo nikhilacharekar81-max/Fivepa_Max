@@ -70,8 +70,8 @@ class WorkspaceService {
       orderIds: params.activeOrderId ? [params.activeOrderId] : [],
       title: params.title || params.originId
     };
-    this.workspaces.set(workspaceId, workspace);
     await this.persistWorkspace(workspace);
+    this.workspaces.set(workspaceId, workspace);
     return workspace;
   }
 
@@ -99,7 +99,9 @@ class WorkspaceService {
       title: params.title || params.originId
     };
     this.workspaces.set(workspaceId, workspace);
-    this.persistWorkspace(workspace).catch(() => {});
+    this.persistWorkspace(workspace).catch(err => {
+      console.error(`[WorkspaceService] Workspace creation persist error for ${workspace.workspaceId}:`, err);
+    });
     return workspace;
   }
 
@@ -142,22 +144,28 @@ class WorkspaceService {
   public async ensureWorkspaceForOrderAsync(order: Order): Promise<Workspace> {
     let ws: (Workspace & { orderIds?: string[]; updatedAt?: string }) | undefined;
 
-    if (order.workspaceId && this.workspaces.has(order.workspaceId)) {
-      ws = this.workspaces.get(order.workspaceId)! as Workspace & { orderIds?: string[]; updatedAt?: string };
-    } else if (order.workspaceId) {
-      const dbWsList = await postgresStore.listWorkspaces();
-      this.loadFromList(dbWsList);
-      ws = this.workspaces.get(order.workspaceId) as (Workspace & { orderIds?: string[]; updatedAt?: string }) | undefined;
+    if (order.workspaceId) {
+      const dbWs = await postgresStore.getWorkspace(order.workspaceId);
+      if (dbWs) {
+        ws = dbWs as Workspace & { orderIds?: string[]; updatedAt?: string };
+      } else if (this.workspaces.has(order.workspaceId)) {
+        ws = this.workspaces.get(order.workspaceId)! as Workspace & { orderIds?: string[]; updatedAt?: string };
+      }
     }
 
     if (ws) {
-      if (!ws.activeOrderId) ws.activeOrderId = order.id;
-      if (!Array.isArray(ws.orderIds)) ws.orderIds = [];
-      if (!ws.orderIds.includes(order.id)) ws.orderIds.push(order.id);
-      ws.updatedAt = new Date().toISOString();
-      await this.persistWorkspace(ws);
-      order.workspaceId = ws.workspaceId;
-      return ws;
+      const updatedOrderIds = Array.isArray(ws.orderIds) ? [...ws.orderIds] : [];
+      if (!updatedOrderIds.includes(order.id)) updatedOrderIds.push(order.id);
+      const updatedWs: Workspace & { orderIds?: string[]; updatedAt?: string } = {
+        ...ws,
+        activeOrderId: ws.activeOrderId || order.id,
+        orderIds: updatedOrderIds,
+        updatedAt: new Date().toISOString()
+      };
+      await this.persistWorkspace(updatedWs);
+      this.workspaces.set(updatedWs.workspaceId, updatedWs);
+      order.workspaceId = updatedWs.workspaceId;
+      return updatedWs;
     }
 
     const originType = order.projectId ? 'project' : 'gig';
@@ -184,13 +192,16 @@ class WorkspaceService {
     }
 
     if (ws) {
-      if (!ws.activeOrderId) ws.activeOrderId = order.id;
-      if (!Array.isArray(ws.orderIds)) ws.orderIds = [];
-      if (!ws.orderIds.includes(order.id)) ws.orderIds.push(order.id);
-      ws.updatedAt = new Date().toISOString();
-      this.persistWorkspace(ws).catch(() => {});
-      order.workspaceId = ws.workspaceId;
-      return ws;
+      const targetWs = ws;
+      if (!targetWs.activeOrderId) targetWs.activeOrderId = order.id;
+      if (!Array.isArray(targetWs.orderIds)) targetWs.orderIds = [];
+      if (!targetWs.orderIds.includes(order.id)) targetWs.orderIds.push(order.id);
+      targetWs.updatedAt = new Date().toISOString();
+      this.persistWorkspace(targetWs).catch(err => {
+        console.error(`[WorkspaceService] Workspace update persist error for ${targetWs.workspaceId}:`, err);
+      });
+      order.workspaceId = targetWs.workspaceId;
+      return targetWs;
     }
 
     const originType = order.projectId ? 'project' : 'gig';

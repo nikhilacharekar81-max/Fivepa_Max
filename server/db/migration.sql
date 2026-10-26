@@ -729,3 +729,29 @@ CREATE TABLE IF NOT EXISTS reconciliation_exceptions (
 
 CREATE INDEX IF NOT EXISTS idx_reconciliation_exceptions_status ON reconciliation_exceptions(status);
 CREATE INDEX IF NOT EXISTS idx_reconciliation_exceptions_entity ON reconciliation_exceptions(entity_id);
+
+DO $$ BEGIN
+  ALTER TABLE workstream_offers ADD CONSTRAINT fk_offers_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE;
+EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  ALTER TABLE messages ADD CONSTRAINT fk_messages_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE;
+EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  ALTER TABLE uploads ADD CONSTRAINT fk_uploads_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_uploads_order_id ON uploads(order_id);
+CREATE INDEX IF NOT EXISTS idx_uploads_owner_id ON uploads(owner_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_messages_client_msg_id 
+ON messages (order_id, sender_id, (metadata->>'clientMessageId')) 
+WHERE metadata->>'clientMessageId' IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_workstream_offers_number
+ON workstream_offers (number)
+WHERE number IS NOT NULL;

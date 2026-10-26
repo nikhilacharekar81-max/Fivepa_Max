@@ -1007,6 +1007,14 @@ export class FinancialTransactionService {
       await this.ensureWallet({ userId: escrow.seller_id, role: 'freelancer' }, client);
 
       if (escrow.status === 'released') {
+        const prevIdemp = await client.query(
+          "SELECT result FROM financial_idempotency WHERE operation = 'releaseOrderFunds' AND request_fingerprint->>'orderId' = $1 AND status = 'completed' ORDER BY updated_at DESC LIMIT 1",
+          [params.orderId]
+        );
+        if (prevIdemp.rows.length > 0) {
+          const resVal = typeof prevIdemp.rows[0].result === 'string' ? JSON.parse(prevIdemp.rows[0].result) : prevIdemp.rows[0].result;
+          return resVal;
+        }
         throw new Error('Escrow has already been released.');
       }
       if (escrow.status !== 'held' && escrow.status !== 'split') {
@@ -1096,6 +1104,14 @@ export class FinancialTransactionService {
       await this.ensureWallet({ userId: escrow.seller_id, role: 'freelancer' }, client);
 
       if (escrow.status === 'refunded') {
+        const prevIdemp = await client.query(
+          "SELECT result FROM financial_idempotency WHERE operation = 'refundOrderFunds' AND request_fingerprint->>'orderId' = $1 AND status = 'completed' ORDER BY updated_at DESC LIMIT 1",
+          [params.orderId]
+        );
+        if (prevIdemp.rows.length > 0) {
+          const resVal = typeof prevIdemp.rows[0].result === 'string' ? JSON.parse(prevIdemp.rows[0].result) : prevIdemp.rows[0].result;
+          return resVal;
+        }
         throw new Error('Escrow has already been fully refunded.');
       }
       if (escrow.status !== 'held' && escrow.status !== 'split') {
@@ -1211,6 +1227,19 @@ export class FinancialTransactionService {
       }
       if (escrow.seller_id !== params.sellerId) {
         throw new Error(`Top-up seller mismatch: expected ${escrow.seller_id}, got ${params.sellerId}`);
+      }
+
+      const orderCheckRes = await client.query('SELECT status FROM orders WHERE id = $1 FOR UPDATE', [params.orderId]);
+      if (orderCheckRes.rows.length > 0) {
+        const ordStatus = orderCheckRes.rows[0].status;
+        if (['disputed', 'cancelled', 'completed', 'refunded'].includes(ordStatus)) {
+          throw new Error(`Cannot top up escrow for order in status "${ordStatus}".`);
+        }
+      }
+
+      const dispCheck = await client.query("SELECT 1 FROM disputes WHERE order_id = $1 AND status IN ('open', 'under_review')", [params.orderId]);
+      if (dispCheck.rows.length > 0) {
+        throw new Error('Cannot top up escrow while an active dispute exists on this order.');
       }
 
       await this.ensureWallet({ userId: params.buyerId, role: 'buyer' }, client);
@@ -1757,7 +1786,7 @@ export class FinancialTransactionService {
       }
 
       const amount = Number(payout.amount);
-      await client.query('UPDATE wallets SET available_balance = available_balance + $1, pending_withdrawals = pending_withdrawals - $1 WHERE user_id = $2', [amount, amount, payout.freelancer_id]);
+      await client.query('UPDATE wallets SET available_balance = available_balance + $1, pending_withdrawals = pending_withdrawals - $1 WHERE user_id = $2', [amount, payout.freelancer_id]);
       await client.query('UPDATE users SET wallet_balance = (SELECT available_balance FROM wallets WHERE user_id = $1) WHERE id = $1', [payout.freelancer_id]);
       await client.query("UPDATE payouts SET status = 'cancelled' WHERE id = $1", [params.payoutId]);
 
@@ -1808,7 +1837,7 @@ export class FinancialTransactionService {
       }
 
       const amount = Number(payout.amount);
-      await client.query('UPDATE wallets SET available_balance = available_balance + $1, pending_withdrawals = pending_withdrawals - $1 WHERE user_id = $2', [amount, amount, payout.freelancer_id]);
+      await client.query('UPDATE wallets SET available_balance = available_balance + $1, pending_withdrawals = pending_withdrawals - $1 WHERE user_id = $2', [amount, payout.freelancer_id]);
       await client.query('UPDATE users SET wallet_balance = (SELECT available_balance FROM wallets WHERE user_id = $1) WHERE id = $1', [payout.freelancer_id]);
       await client.query("UPDATE payouts SET status = 'failed' WHERE id = $1", [params.payoutId]);
 
@@ -1933,7 +1962,7 @@ export class FinancialTransactionService {
         throw new Error('Insufficient wallet balance to retry payout.');
       }
 
-      await client.query('UPDATE wallets SET available_balance = available_balance - $1, pending_withdrawals = pending_withdrawals + $1 WHERE user_id = $2', [amount, amount, payout.freelancer_id]);
+      await client.query('UPDATE wallets SET available_balance = available_balance - $1, pending_withdrawals = pending_withdrawals + $1 WHERE user_id = $2', [amount, payout.freelancer_id]);
       await client.query('UPDATE users SET wallet_balance = (SELECT available_balance FROM wallets WHERE user_id = $1) WHERE id = $1', [payout.freelancer_id]);
       await client.query("UPDATE payouts SET status = 'pending' WHERE id = $1", [params.payoutId]);
 

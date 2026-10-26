@@ -29,7 +29,8 @@ import {
   adminActor,
   rateLimit,
   resolveAuthenticatedUserId,
-  IS_PRODUCTION
+  IS_PRODUCTION,
+  formatApiError
 } from '../../middleware/auth.js';
 import {
   orderStateLocks,
@@ -131,7 +132,7 @@ router.get('/disputes', requireAuth, async (req: Request, res: Response) => {
     }
     res.json(result.rows.map(mapDisputeRow));
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -157,7 +158,7 @@ router.get('/refunds', requireAuth, async (req: Request, res: Response) => {
     }
     res.json(result.rows.map(formatRefundRow));
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -174,7 +175,7 @@ router.get('/payouts', requireAuth, async (req: Request, res: Response) => {
       : await store.listPayoutsForUser(authUserId);
     res.json(payoutsList);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -244,7 +245,7 @@ router.get('/payments/user/:userId', requireAuth, async (req: Request, res: Resp
       walletStatus: wallet?.status || 'active'
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -357,7 +358,7 @@ router.post('/payments/gateway/checkout', requireAuth, rateLimit(10, 60_000), as
       redirectUrl: providerSession.checkoutUrl || `/checkout/success?session_id=${checkoutId}&amount=${amt}`
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -514,9 +515,7 @@ router.post('/payments/escrow/release', requireAuth, requireActiveStatus, async 
         type: 'system',
         metadata: { action: 'revision_resolved' }
       };
-      recordMessage(sysMsg);
-      await store.addMessage(sysMsg);
-      broadcastMessage(sysMsg, order.id);
+      await recordMessage(sysMsg);
     }
 
     const esc = await financialRepository.getEscrow(order.id);
@@ -538,12 +537,6 @@ router.post('/payments/escrow/release', requireAuth, requireActiveStatus, async 
     }
 
     const pendingMatchingInvoice = pendingInvoices[0];
-    if (pendingMatchingInvoice) {
-      await pool.query(
-        "UPDATE workstream_offers SET status = 'paid', resolved_at = $1, resolved_by = $2 WHERE id = $3",
-        [new Date().toISOString(), caller?.id || userId, pendingMatchingInvoice.id]
-      );
-    }
 
     const seller = await store.getUser(order.sellerId);
     const buyer = await store.getUser(order.buyerId);
@@ -554,6 +547,13 @@ router.post('/payments/escrow/release', requireAuth, requireActiveStatus, async 
     const actorName = isAdmin ? adminActor(req) : (buyer?.name || 'Authorized Buyer');
     const requestKey = req.body?.requestKey || req.body?.idempotencyKey;
     const result = await releaseOrderFunds(order, actorName, 'Buyer approved work', true, requestKey);
+
+    if (pendingMatchingInvoice) {
+      await pool.query(
+        "UPDATE workstream_offers SET status = 'paid', resolved_at = $1, resolved_by = $2 WHERE id = $3",
+        [new Date().toISOString(), caller?.id || userId, pendingMatchingInvoice.id]
+      );
+    }
 
     registerAuditLog({
       id: 'log_' + Date.now(),
@@ -702,7 +702,7 @@ router.get('/payments/transactions/:userId', requireAuth, async (req: Request, r
 
     res.json(userTxns);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -775,7 +775,7 @@ router.get('/payments/invoices/:userId', requireAuth, async (req: Request, res: 
 
     res.json([...orderInvoices, ...userCustom]);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -873,7 +873,7 @@ router.get('/payments/methods/:userId', requireAuth, async (req: Request, res: R
     }));
     res.json(sanitized);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -947,7 +947,7 @@ router.delete('/payments/methods/:id', requireAuth, async (req: Request, res: Re
     await store.deletePaymentMethod(req.params.id);
     res.json({ success: true, id: req.params.id });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -970,7 +970,7 @@ router.patch('/payments/methods/:id/default', requireAuth, async (req: Request, 
     method.isDefault = true;
     res.json(method);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -1053,7 +1053,7 @@ router.get('/admin/finance/overview', requireRole(['admin', 'super_admin']), asy
     const overview = await financialRepository.getFinancialOverview();
     res.json(overview);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -1062,7 +1062,7 @@ router.get('/admin/finance/wallets', requireAdmin, async (req: Request, res: Res
     const wallets = await financialRepository.getWallets();
     res.json(wallets);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -1072,7 +1072,7 @@ router.get('/admin/finance/wallets/:id', requireAdmin, async (req: Request, res:
     if (!data) return res.status(404).json({ error: 'Wallet not found' });
     res.json(data);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -1113,7 +1113,7 @@ router.get('/admin/finance/transactions', requireAdmin, async (req: Request, res
     const txns = await financialRepository.getTransactions();
     res.json(txns);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -1124,7 +1124,7 @@ router.get('/admin/finance/transactions/:id', requireAdmin, async (req: Request,
     const journal = txn.journalId ? await financialRepository.getJournalById(txn.journalId) : null;
     res.json({ transaction: txn, journal });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -1133,7 +1133,7 @@ router.get('/admin/finance/ledger', requireAdmin, async (req: Request, res: Resp
     const journals = await financialRepository.getJournals();
     res.json(journals);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -1143,7 +1143,7 @@ router.get('/admin/finance/ledger/:id', requireAdmin, async (req: Request, res: 
     if (!journal) return res.status(404).json({ error: 'Journal not found' });
     res.json(journal);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -1201,7 +1201,7 @@ router.get('/admin/finance/escrow', requireAdmin, async (req: Request, res: Resp
     }));
     res.json(escrowOrders);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -1315,7 +1315,7 @@ router.get('/admin/finance/payouts', requireAdmin, async (req: Request, res: Res
     }));
     res.json(enrichedPayouts);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -1334,7 +1334,7 @@ router.get('/admin/finance/reconciliation', requireAdmin, async (req: Request, r
     const recon = await financialRepository.getReconciliationSummary();
     res.json(recon);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -1367,7 +1367,7 @@ router.get('/admin/finance/audit', requireAdmin, async (req: Request, res: Respo
     const logs = await postgresStore.listAuditLogs();
     res.json(logs);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -1419,7 +1419,7 @@ router.get('/admin/finance/diagnostics', requireAdmin, async (req: Request, res:
     const logs = await postgresStore.getPool().query(sql, params);
     res.json(logs.rows);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 

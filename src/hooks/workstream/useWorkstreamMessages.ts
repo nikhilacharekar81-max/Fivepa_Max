@@ -50,7 +50,12 @@ export function useWorkstreamMessages(options: UseWorkstreamMessagesOptions = {}
         return;
       }
 
-      const data = res.ok ? await res.json() : [];
+      if (!res.ok) {
+        console.error(`Failed to fetch messages for ${orderId}: status ${res.status}`);
+        return;
+      }
+
+      const data = await res.json();
       const newOrderMessages: Message[] = Array.isArray(data) ? data : [];
 
       // Isolated cache merge: preserve all messages for other workstreams, update this order's messages
@@ -58,8 +63,9 @@ export function useWorkstreamMessages(options: UseWorkstreamMessagesOptions = {}
         const otherMessages = prev.filter(m => m.orderId !== orderId);
         const byId = new Map<string, Message>();
         for (const m of [...otherMessages, ...newOrderMessages]) {
-          if (m?.id) {
-            byId.set(m.id, m);
+          const key = m?.metadata?.clientMessageId || m?.id;
+          if (key) {
+            byId.set(key, m);
           }
         }
         const combined = Array.from(byId.values());

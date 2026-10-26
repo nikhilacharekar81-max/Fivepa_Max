@@ -32,11 +32,17 @@ export class WorkspaceRepo {
       ON CONFLICT (workspace_id) DO UPDATE SET
         buyer_id = EXCLUDED.buyer_id,
         seller_id = EXCLUDED.seller_id,
-        order_ids = EXCLUDED.order_ids,
+        order_ids = (
+          SELECT COALESCE(jsonb_agg(DISTINCT elem), '[]'::jsonb)
+          FROM (
+            SELECT jsonb_array_elements_text(COALESCE(workspaces.order_ids, '[]'::jsonb)) AS elem
+            UNION
+            SELECT jsonb_array_elements_text(EXCLUDED.order_ids) AS elem
+          ) s
+        ),
         title = EXCLUDED.title,
-        created_at = EXCLUDED.created_at,
         updated_at = EXCLUDED.updated_at,
-        last_activity_at = EXCLUDED.last_activity_at,
+        last_activity_at = COALESCE(EXCLUDED.last_activity_at, workspaces.last_activity_at),
         metadata = EXCLUDED.metadata`,
       [
         w.workspaceId, w.buyerId, w.sellerId, JSON.stringify(orderIds),
@@ -177,6 +183,17 @@ export class WorkspaceRepo {
         for (const o of offers) {
           if (!o?.id || seen.has(o.id)) continue;
           seen.add(o.id);
+          const mergedMetadata = {
+            ...(o.metadata || {}),
+            ...(o.note !== undefined ? { note: o.note } : {}),
+            ...(o.files !== undefined ? { files: o.files } : {}),
+            ...(o.reference !== undefined ? { reference: o.reference } : {}),
+            ...(o.responseDeadline !== undefined ? { responseDeadline: o.responseDeadline } : {}),
+            ...(o.rejectionReason !== undefined ? { rejectionReason: o.rejectionReason } : {}),
+            ...(o.rejectedBy !== undefined ? { rejectedBy: o.rejectedBy } : {}),
+            ...(o.rejectedAt !== undefined ? { rejectedAt: o.rejectedAt } : {}),
+            ...(o.proposalId !== undefined ? { proposalId: o.proposalId } : {})
+          };
           await client.query(
             `INSERT INTO workstream_offers (
               id, number, order_id, workspace_id, kind, title, amount, delivery_days, status, 
@@ -199,7 +216,7 @@ export class WorkspaceRepo {
             [
               o.id, o.number, o.orderId, o.workspaceId || null, o.kind, o.title, o.amount,
               o.deliveryDays ?? null, o.status, o.createdBy, o.createdAt,
-              o.resolvedAt || null, o.resolvedBy || null, JSON.stringify(o.metadata || null)
+              o.resolvedAt || null, o.resolvedBy || null, JSON.stringify(mergedMetadata)
             ]
           );
         }
@@ -354,6 +371,23 @@ export class WorkspaceRepo {
   async deleteUploadRecord(_filename: string): Promise<void> {
     // Workstream uploads are permanently retained and cannot be deleted.
     return;
+  }
+
+  async getUploadRecord(filename: string): Promise<WorkstreamUploadRecord | undefined> {
+    if (!filename) return undefined;
+    const res = await this.ctx.getPool().query('SELECT * FROM uploads WHERE filename = $1 LIMIT 1', [filename]);
+    if (res.rows.length === 0) return undefined;
+    const r = res.rows[0];
+    return {
+      ownerId: r.owner_id,
+      originalName: r.original_name || undefined,
+      mime: r.mime || undefined,
+      size: Number(r.size),
+      createdAt: r.created_at,
+      sha256: r.sha256 || undefined,
+      orderId: r.order_id || undefined,
+      workspaceId: r.workspace_id || undefined
+    };
   }
 
   async listUploadRecords(): Promise<Record<string, WorkstreamUploadRecord>> {

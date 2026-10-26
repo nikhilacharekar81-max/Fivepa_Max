@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
-import { randomUUID } from 'crypto';
+import crypto, { randomUUID } from 'crypto';
 import {
   store,
   mapOfferRow,
@@ -22,7 +22,8 @@ import {
   rateLimit,
   isStaffUser,
   canAccessOrderWorkstream,
-  resolveAuthenticatedUserId
+  resolveAuthenticatedUserId,
+  formatApiError
 } from '../middleware/auth.js';
 import {
   tryAcquireOrderLock,
@@ -44,13 +45,14 @@ import {
   sanitizeAndCreateMessage,
   emitSystemEvent
 } from '../services/messagingService.js';
-import { uploadFileToCloudStorage, openCloudFileStream } from '../cloudStorage.js';
+import { uploadFileToCloudStorage, openCloudFileStream, deleteFileFromCloudStorage } from '../cloudStorage.js';
 import {
   WORKSTREAM_UPLOADS_DIR,
   WORKSTREAM_FILE_URL_PREFIX,
   workstreamFileExists,
   WORKSTREAM_MAX_UPLOAD_BYTES,
   WORKSTREAM_INLINE_EXTENSIONS,
+  WORKSTREAM_ALLOWED_EXTENSIONS,
   OFFER_LABEL,
   OFFER_PREFIX,
   orderHasEscrow,
@@ -62,7 +64,8 @@ import {
   canAccessWorkstreamFile,
   validateMessageFileInfo,
   validateStoredWorkstreamFiles,
-  workstreamFilenameFromUrl
+  workstreamFilenameFromUrl,
+  generateCollisionSafeOfferNumber
 } from '../services/workstreamService.js';
 
 function escapeHtml(text: string): string {
@@ -93,7 +96,7 @@ router.get('/workspaces', requireAuth, async (req: Request, res: Response) => {
 
     const [workspaces, allOrders] = await Promise.all([
       isAdmin ? workspaceService.listAllAsync() : workspaceService.getWorkspacesForUserAsync(authUserId),
-      store.listOrders()
+      isAdmin ? store.listOrders() : store.listOrdersForUser(authUserId)
     ]);
 
     const ordersByWorkspace = new Map<string, Order[]>();
@@ -107,18 +110,22 @@ router.get('/workspaces', requireAuth, async (req: Request, res: Response) => {
     }
 
     const enrichedWorkspaces = workspaces.map(ws => {
-      const wsOrders = ordersByWorkspace.get(ws.workspaceId) || [];
+      const candidateOrders = ordersByWorkspace.get(ws.workspaceId) || [];
+      const wsOrders = candidateOrders.filter(o =>
+        (o.buyerId === ws.buyerId && o.sellerId === ws.sellerId) ||
+        (o.buyerId === ws.sellerId && o.sellerId === ws.buyerId)
+      );
       return {
         ...ws,
         orders: wsOrders,
-        orderIds: ws.orderIds && ws.orderIds.length > 0 ? ws.orderIds : wsOrders.map(o => o.id),
+        orderIds: ws.orderIds && ws.orderIds.length > 0 ? ws.orderIds.filter(id => wsOrders.some(o => o.id === id)) : wsOrders.map(o => o.id),
         activeOrder: wsOrders.find(o => o.id === ws.activeOrderId) || wsOrders[0] || null
       };
     });
 
     res.json(enrichedWorkspaces);
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to fetch workspaces' });
+    res.status(500).json(formatApiError(err, 'Failed to fetch workspaces'));
   }
 });
 
@@ -137,17 +144,20 @@ router.get('/workspaces/:id', requireAuth, async (req: Request, res: Response) =
 
     const allOrders = await store.listOrders();
     const wsOrders = allOrders
-      .filter(o => o.workspaceId === ws.workspaceId || (ws.orderIds && ws.orderIds.includes(o.id)))
+      .filter(o =>
+        (o.workspaceId === ws.workspaceId || (ws.orderIds && ws.orderIds.includes(o.id))) &&
+        ((o.buyerId === ws.buyerId && o.sellerId === ws.sellerId) || (o.buyerId === ws.sellerId && o.sellerId === ws.buyerId))
+      )
       .map(o => enrichOrderWithServiceInfo(o, isAdmin));
 
     res.json({
       ...ws,
       orders: wsOrders,
-      orderIds: ws.orderIds && ws.orderIds.length > 0 ? ws.orderIds : wsOrders.map(o => o.id),
+      orderIds: ws.orderIds && ws.orderIds.length > 0 ? ws.orderIds.filter(id => wsOrders.some(o => o.id === id)) : wsOrders.map(o => o.id),
       activeOrder: wsOrders.find(o => o.id === ws.activeOrderId) || wsOrders[0] || null
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to fetch workspace details' });
+    res.status(500).json(formatApiError(err, 'Failed to fetch workspace details'));
   }
 });
 
@@ -168,6 +178,10 @@ router.post(
       try { decodedName = decodeURIComponent(rawName); } catch { decodedName = rawName; }
       const safeBase = path.basename(decodedName).replace(/[^a-zA-Z0-9._-]/g, '_') || 'file';
       const ext = path.extname(safeBase).toLowerCase();
+      if (!WORKSTREAM_ALLOWED_EXTENSIONS.has(ext)) {
+        return res.status(400).json({ error: `File extension "${ext}" is not permitted.` });
+      }
+
       const nameWithoutExt = path.basename(safeBase, path.extname(safeBase));
       const storedFilename = `${Date.now()}_${randomUUID().slice(0, 8)}_${nameWithoutExt}${ext}`;
 
@@ -179,7 +193,7 @@ router.post(
         return res.status(413).json({ error: 'File is too large (25 MB maximum).' });
       }
 
-      // Magic byte validation (.pdf `%PDF`, .png `\x89PNG`, .jpg/.jpeg `\xFF\xD8\xFF`, .gif `GIF8`, .webp `RIFF`, .zip `PK\x03\x04`)
+      // Magic byte validation
       if (ext === '.pdf') {
         if (buffer.length < 4 || buffer.toString('utf8', 0, 4) !== '%PDF') {
           return res.status(400).json({ error: 'Invalid file signature: PDF files must start with %PDF.' });
@@ -213,8 +227,9 @@ router.post(
         return res.status(400).json({ error: 'Context required: must provide orderId or workspaceId' });
       }
 
+      let targetOrder: Order | null = null;
       if (orderId) {
-        const targetOrder = await store.getOrder(orderId);
+        targetOrder = (await store.getOrder(orderId)) || null;
         if (!targetOrder) {
           return res.status(404).json({ error: 'Associated order not found' });
         }
@@ -225,13 +240,19 @@ router.post(
       }
 
       if (workspaceId) {
-        const wsRes = await postgresStore.getPool().query('SELECT buyer_id, seller_id FROM workspaces WHERE workspace_id = $1', [workspaceId]);
+        const wsRes = await postgresStore.getPool().query('SELECT workspace_id, buyer_id, seller_id FROM workspaces WHERE workspace_id = $1', [workspaceId]);
         if (wsRes.rows.length === 0) {
-          const maybeOrder = await store.getOrder(workspaceId);
-          if (maybeOrder) {
-            const isParticipant = maybeOrder.buyerId === caller.id || maybeOrder.sellerId === caller.id || (maybeOrder as any).clientId === caller.id || (maybeOrder as any).freelancerId === caller.id;
-            if (!isStaffUser(caller) && !isParticipant) {
-              return res.status(403).json({ error: 'Forbidden: You are not a participant of the specified workspace' });
+          if (targetOrder && (workspaceId === `ws-${targetOrder.id}` || workspaceId === targetOrder.workspaceId)) {
+            // Valid legacy workspace reference matching order
+          } else if (!targetOrder && workspaceId.startsWith('ws-')) {
+            const maybeOrder = await store.getOrder(workspaceId.slice(3));
+            if (maybeOrder) {
+              const isParticipant = maybeOrder.buyerId === caller.id || maybeOrder.sellerId === caller.id || (maybeOrder as any).clientId === caller.id || (maybeOrder as any).freelancerId === caller.id;
+              if (!isStaffUser(caller) && !isParticipant) {
+                return res.status(403).json({ error: 'Forbidden: You are not a participant of the specified workspace' });
+              }
+            } else {
+              return res.status(404).json({ error: 'Associated workspace not found' });
             }
           } else {
             return res.status(404).json({ error: 'Associated workspace not found' });
@@ -241,22 +262,37 @@ router.post(
           if (!isStaffUser(caller) && wsRow.buyer_id !== caller.id && wsRow.seller_id !== caller.id) {
             return res.status(403).json({ error: 'Forbidden: You are not a participant of the specified workspace' });
           }
+          if (targetOrder) {
+            const orderMatchesWs = targetOrder.workspaceId === workspaceId ||
+              ((targetOrder.buyerId === wsRow.buyer_id && targetOrder.sellerId === wsRow.seller_id) ||
+               (targetOrder.buyerId === wsRow.seller_id && targetOrder.sellerId === wsRow.buyer_id));
+            if (!orderMatchesWs) {
+              return res.status(400).json({ error: 'Mismatched orderId and workspaceId context.' });
+            }
+          }
         }
       }
 
+      const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
       const mimeType = (req.headers['content-type'] as string) || 'application/octet-stream';
       await uploadFileToCloudStorage(storedFilename, buffer, mimeType);
       const fileUrl = `${WORKSTREAM_FILE_URL_PREFIX}${storedFilename}`;
 
-      await store.saveUploadRecord(storedFilename, {
-        ownerId: caller.id,
-        originalName: safeBase,
-        mime: mimeType,
-        size: buffer.length,
-        createdAt: new Date().toISOString(),
-        orderId: orderId || undefined,
-        workspaceId: workspaceId || undefined
-      });
+      try {
+        await store.saveUploadRecord(storedFilename, {
+          ownerId: caller.id,
+          originalName: safeBase,
+          mime: mimeType,
+          size: buffer.length,
+          sha256,
+          createdAt: new Date().toISOString(),
+          orderId: orderId || undefined,
+          workspaceId: workspaceId || undefined
+        });
+      } catch (recErr) {
+        try { await deleteFileFromCloudStorage(storedFilename); } catch {}
+        throw recErr;
+      }
 
       const bytes = buffer.length;
       const sizeStr = bytes > 1024 * 1024
@@ -271,7 +307,7 @@ router.post(
       });
     } catch (err: any) {
       console.error('Workstream file upload error:', err);
-      res.status(500).json({ error: 'Failed to save uploaded file' });
+      res.status(500).json(formatApiError(err, 'Failed to save uploaded file'));
     }
   }
 );
@@ -343,10 +379,28 @@ router.get('/messages/:orderId', requireAuth, async (req: Request, res: Response
     if (!canAccessOrderWorkstream((req as any).authenticatedUser, order)) {
       return res.status(403).json({ error: 'Forbidden: You are not a participant of this Workstream.' });
     }
-    const msgs = await store.listMessages(req.params.orderId);
+    let msgs = await store.listMessages(req.params.orderId);
+
+    const before = typeof req.query.before === 'string' ? req.query.before : undefined;
+    const limit = req.query.limit ? Math.min(200, Math.max(1, Number(req.query.limit))) : undefined;
+    const offset = req.query.offset ? Math.max(0, Number(req.query.offset)) : undefined;
+
+    if (before) {
+      const beforeTime = new Date(before).getTime();
+      if (!isNaN(beforeTime)) {
+        msgs = msgs.filter(m => new Date(m.timestamp).getTime() < beforeTime);
+      }
+    }
+    if (offset !== undefined) {
+      msgs = msgs.slice(offset);
+    }
+    if (limit !== undefined) {
+      msgs = msgs.slice(-limit);
+    }
+
     res.json(msgs);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -368,15 +422,20 @@ router.post('/messages', requireAuth, rateLimit(120, 60_000), async (req: Reques
     if (!canAccessOrderWorkstream(caller, order)) {
       return res.status(403).json({ error: 'Forbidden: You are not a participant of this Workstream.' });
     }
-    const fileCheck = validateMessageFileInfo(req.body.fileInfo, caller);
+
+    if (order.isMuted && !isStaffUser(caller)) {
+      return res.status(403).json({ error: 'Chat is currently paused.' });
+    }
+
+    const fileCheck = await validateMessageFileInfo(req.body.fileInfo, caller);
     if (!fileCheck.ok) return res.status(400).json({ error: (fileCheck as any).error });
 
     const clientMessageId = typeof req.body.clientMessageId === 'string' ? req.body.clientMessageId : undefined;
     if (clientMessageId) {
       const pool = postgresStore.getPool();
       const existingRes = await pool.query(
-        "SELECT * FROM messages WHERE order_id = $1 AND metadata->>'clientMessageId' = $2 LIMIT 1",
-        [orderId, clientMessageId]
+        "SELECT * FROM messages WHERE order_id = $1 AND sender_id = $2 AND metadata->>'clientMessageId' = $3 LIMIT 1",
+        [orderId, caller.id, clientMessageId]
       );
       if (existingRes.rows.length > 0) {
         const r = existingRes.rows[0];
@@ -405,8 +464,17 @@ router.post('/messages', requireAuth, rateLimit(120, 60_000), async (req: Reques
         await postgresStore.getPool().query("UPDATE uploads SET order_id = $1 WHERE filename = $2 AND order_id IS NULL", [order.id, fn]);
       }
     }
-    await recordMessage(newMsg);
-    broadcastMessage(newMsg, order.id);
+    try {
+      await recordMessage(newMsg);
+    } catch (msgErr: any) {
+      if (clientMessageId) {
+        const existingMsg = await store.getMessageByClientMsgId(order.id, caller.id, clientMessageId);
+        if (existingMsg) {
+          return res.json({ success: true, message: existingMsg, deduplicated: true });
+        }
+      }
+      throw msgErr;
+    }
 
     const otherUserId = order.buyerId === caller.id ? order.sellerId : order.buyerId;
     createNotification({
@@ -433,21 +501,26 @@ router.post('/orders/:id/message', requireAuth, rateLimit(120, 60_000), async (r
     const userId = (req as any).authenticatedUserId;
     const user = await store.getUser(userId);
     if (!user) return res.status(401).json({ error: 'User not found' });
+
+    if (user.status === 'suspended' && !order.id.startsWith('support_admin_')) {
+      return res.status(403).json({ error: 'Action forbidden: Your account is suspended. You can only message Support.' });
+    }
+
     if (!canAccessOrderWorkstream(user, order)) {
       return res.status(403).json({ error: 'Forbidden: You are not a participant of this Workstream.' });
     }
     if (order.isMuted && !isStaffUser(user)) {
       return res.status(403).json({ error: 'Chat is currently paused.' });
     }
-    const fileCheck = validateMessageFileInfo(req.body.fileInfo, user);
+    const fileCheck = await validateMessageFileInfo(req.body.fileInfo, user);
     if (!fileCheck.ok) return res.status(400).json({ error: (fileCheck as any).error });
 
     const clientMessageId = typeof req.body.clientMessageId === 'string' ? req.body.clientMessageId : undefined;
     if (clientMessageId) {
       const pool = postgresStore.getPool();
       const existingRes = await pool.query(
-        "SELECT * FROM messages WHERE order_id = $1 AND metadata->>'clientMessageId' = $2 LIMIT 1",
-        [order.id, clientMessageId]
+        "SELECT * FROM messages WHERE order_id = $1 AND sender_id = $2 AND metadata->>'clientMessageId' = $3 LIMIT 1",
+        [order.id, user.id, clientMessageId]
       );
       if (existingRes.rows.length > 0) {
         const r = existingRes.rows[0];
@@ -476,8 +549,17 @@ router.post('/orders/:id/message', requireAuth, rateLimit(120, 60_000), async (r
         await postgresStore.getPool().query("UPDATE uploads SET order_id = $1 WHERE filename = $2 AND order_id IS NULL", [order.id, fn]);
       }
     }
-    await recordMessage(newMsg);
-    broadcastMessage(newMsg, order.id);
+    try {
+      await recordMessage(newMsg);
+    } catch (msgErr: any) {
+      if (clientMessageId) {
+        const existingMsg = await store.getMessageByClientMsgId(order.id, user.id, clientMessageId);
+        if (existingMsg) {
+          return res.json({ success: true, message: existingMsg, deduplicated: true });
+        }
+      }
+      throw msgErr;
+    }
 
     res.json({ success: true, message: newMsg });
   } catch (err: any) {
@@ -504,7 +586,7 @@ router.get('/offers', requireAuth, async (req: Request, res: Response) => {
     const viewed = await Promise.all(offers.map(viewOffer));
     res.json(viewed);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -527,7 +609,7 @@ router.get('/orders/:id/offers', requireAuth, async (req: Request, res: Response
       hasPaidInvoice: await hasPaidInvoiceOrReleasedEscrow(order)
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json(formatApiError(err));
   }
 });
 
@@ -603,13 +685,9 @@ router.post('/orders/:id/offers', requireAuth, requireActiveStatus, rateLimit(20
       ? new Date(Date.now() + 7 * 86400000).toISOString()
       : undefined;
 
-    const pool = postgresStore.getPool();
-    const countRes = await pool.query('SELECT COUNT(*) as cnt FROM workstream_offers WHERE kind = $1', [kind]);
-    const kindCount = Number(countRes.rows[0]?.cnt || 0);
-
     const offer: WorkstreamOffer = {
       id: 'off_' + randomUUID().slice(0, 12),
-      number: `${OFFER_PREFIX[kind]}-${String(kindCount + 1001)}`,
+      number: generateCollisionSafeOfferNumber(kind),
       orderId: order.id,
       kind,
       title,
@@ -645,7 +723,11 @@ router.post('/orders/:id/offers', requireAuth, requireActiveStatus, rateLimit(20
       });
     }
 
-    if (kind === 'invoice' && (req.body?.deliverWork || note || uploadedFiles.length > 0 || rawRef)) {
+    const deliverWorkRequested = Boolean(req.body?.deliverWork);
+    const hasDeliveryEvidence = uploadedFiles.length > 0 || Boolean(rawRef) || (Array.isArray(order.deliverableFiles) && order.deliverableFiles.length > 0) || (Array.isArray(order.deliveryHistory) && order.deliveryHistory.length > 0);
+    const isWorkableStatus = ['funded_in_escrow', 'in_progress', 'accepted'].includes(order.status);
+
+    if (kind === 'invoice' && deliverWorkRequested && hasDeliveryEvidence && isWorkableStatus) {
       if (!order.deliverableFiles) order.deliverableFiles = [];
       if (!order.deliveryHistory) order.deliveryHistory = [];
       if (uploadedFiles.length > 0) order.deliverableFiles.push(...uploadedFiles);
@@ -677,13 +759,19 @@ router.post('/orders/:id/offers', requireAuth, requireActiveStatus, rateLimit(20
 });
 
 router.post('/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimit(20, 60_000), async (req: Request, res: Response) => {
-  const offer = await store.getOfferById(req.params.id);
-  if (!offer) return res.status(404).json({ error: 'Not found' });
-  const order = await store.getOrder(offer.orderId);
-  if (!order) return res.status(404).json({ error: 'Not found' });
+  const initialOffer = await store.getOfferById(req.params.id);
+  if (!initialOffer) return res.status(404).json({ error: 'Not found' });
+  const initialOrder = await store.getOrder(initialOffer.orderId);
+  if (!initialOrder) return res.status(404).json({ error: 'Not found' });
 
-  if (!tryAcquireOrderLock(order.id, res)) return;
+  const lockedOrderId = initialOrder.id;
+  if (!tryAcquireOrderLock(lockedOrderId, res)) return;
   try {
+    const offer = await store.getOfferById(req.params.id);
+    if (!offer) return res.status(404).json({ error: 'Not found' });
+    const order = await store.getOrder(offer.orderId);
+    if (!order) return res.status(404).json({ error: 'Not found' });
+
     const caller = await offerCaller(req);
     if (!caller || (caller.status !== 'active' && caller.status !== 'restricted')) return res.status(403).json({ error: 'Account is not active' });
     if (!canAccessOrderWorkstream(caller, order)) return res.status(403).json({ error: 'Forbidden' });
@@ -740,6 +828,13 @@ router.post('/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimit
 
     if (caller.id !== order.buyerId) return res.status(403).json({ error: 'Only the buyer can respond to this.' });
 
+    if (action === 'accept') {
+      const isTerminal = ['completed', 'cancelled', 'refunded'].includes(order.status);
+      const isDisputed = order.status === 'disputed';
+      if ((isTerminal || isDisputed) && offer.kind !== 'proposal') {
+        return res.status(400).json({ error: `Cannot accept ${OFFER_LABEL[offer.kind]} on an order that is ${order.status}.` });
+      }
+    }
     if (order.orderType === 'project' && (order.status === 'completed' || order.status === 'cancelled') && offer.kind !== 'proposal') {
       return res.status(400).json({ error: `Cannot accept ${offer.kind} on a ${order.status} project order.` });
     }
@@ -980,7 +1075,13 @@ router.post('/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimit
         await syncUserBalances();
       } catch (fundingErr: any) {
         const pool = postgresStore.getPool();
-        await pool.query('DELETE FROM orders WHERE id = $1', [newOrder.id]);
+        const escCheck = await pool.query('SELECT 1 FROM escrows WHERE order_id = $1', [newOrder.id]);
+        if (escCheck.rows.length === 0) {
+          await pool.query('DELETE FROM orders WHERE id = $1', [newOrder.id]);
+        } else {
+          enrichedOrder.status = 'payment_pending';
+          await store.saveOrder(enrichedOrder);
+        }
         return res.status(400).json({ error: fundingErr.message || 'Failed to fund escrow for follow-on order.' });
       }
 
@@ -1040,138 +1141,189 @@ router.post('/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimit
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   } finally {
-    releaseOrderLock(order.id);
+    releaseOrderLock(lockedOrderId);
   }
 });
 
 router.post(
   ['/workstream/messages/:id/accept-offer', '/messages/:id/accept-offer'],
   requireAuth,
+  requireActiveStatus,
   rateLimit(20, 60_000),
   async (req: Request, res: Response) => {
-    const msgId = req.params.id;
-    const caller = (req as any).authenticatedUser;
-    const pool = postgresStore.getPool();
+    try {
+      const msgId = req.params.id;
+      const caller = (req as any).authenticatedUser;
+      if (!caller || (caller.status !== 'active' && caller.status !== 'restricted')) {
+        return res.status(403).json({ error: 'Account is not active' });
+      }
+      const pool = postgresStore.getPool();
 
-    let offer = await store.getOfferById(msgId);
-    let msg: any = null;
-    if (!offer) {
-      const msgRes = await pool.query("SELECT * FROM messages WHERE id = $1", [msgId]);
-      if (msgRes.rows.length > 0) {
-        msg = msgRes.rows[0];
-        const offerId = msg.metadata?.offerId || msg.metadata?.offer?.id || msg.metadata?.id;
-        if (offerId) {
-          offer = await store.getOfferById(offerId);
+      let offer = await store.getOfferById(msgId);
+      let msg: any = null;
+      if (!offer) {
+        const msgRes = await pool.query("SELECT * FROM messages WHERE id = $1", [msgId]);
+        if (msgRes.rows.length > 0) {
+          msg = msgRes.rows[0];
+          const offerId = msg.metadata?.offerId || msg.metadata?.offer?.id || msg.metadata?.id;
+          if (offerId) {
+            offer = await store.getOfferById(offerId);
+          }
         }
       }
-    }
 
-    const idempotencyKey = req.body?.idempotencyKey || (req.headers['x-idempotency-key'] as string) || `offer-accept-${msgId}`;
-
-    let order = offer ? await store.getOrder(offer.orderId) : null;
-    if (!order && msg?.order_id) {
-      order = await store.getOrder(msg.order_id);
-    }
-
-    if (!order) {
-      // When custom offer creates a brand-new order, initialize with status: 'payment_pending'
-      const clientId = caller.id;
-      const sellerId = offer?.createdBy || msg?.sender_id || req.body?.sellerId;
-      const offerAmount = Number(offer?.amount || req.body?.amount || msg?.metadata?.amount || 0);
-      const offerTitle = offer?.title || req.body?.title || msg?.metadata?.title || 'Custom Offer';
-
-      if (!sellerId || offerAmount <= 0) {
-        return res.status(400).json({ error: 'Invalid custom offer details.' });
+      if (!offer) {
+        return res.status(404).json({ error: 'Offer not found' });
+      }
+      if (caller.id === offer.createdBy) {
+        return res.status(403).json({ error: 'You cannot accept your own offer.' });
+      }
+      if (offer.status !== 'pending') {
+        if (offer.status === 'accepted' || offer.status === 'paid') {
+          const existingOrder = offer.orderId ? await store.getOrder(offer.orderId) : null;
+          return res.json({
+            success: true,
+            order: existingOrder ? enrichOrderWithServiceInfo(existingOrder) : null,
+            offer: await viewOffer(offer)
+          });
+        }
+        return res.status(409).json({ error: `This offer is already ${offer.status}.` });
       }
 
-      await ensureWallet(clientId);
-      await ensureWallet(sellerId);
+      const idempotencyKey = req.body?.idempotencyKey || (req.headers['x-idempotency-key'] as string) || `offer-accept-${offer.id}`;
 
-      const newOrderId = 'ord_' + randomUUID().slice(0, 12);
-      const today = new Date().toISOString().split('T')[0];
-      const protectionDays = siteSettings.getSettings().commission.escrowProtectionDays || 14;
+      let order = offer.orderId ? await store.getOrder(offer.orderId) : null;
+      if (!order && msg?.order_id) {
+        order = await store.getOrder(msg.order_id);
+      }
 
-      const newOrder: Order = {
-        id: newOrderId,
-        workspaceId: newOrderId,
-        title: offerTitle,
-        buyerId: clientId,
-        sellerId: sellerId,
-        amount: offerAmount,
-        status: 'payment_pending',
-        createdAt: today,
-        dueDate: new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0],
-        escrowProtectionStartDate: today,
-        escrowProtectionEndDate: new Date(Date.now() + protectionDays * 86400000).toISOString().split('T')[0],
-        feeBreakdown: calculateOrderFees(offerAmount)
-      };
+      if (!order) {
+        const clientId = caller.id;
+        const sellerId = offer.createdBy;
+        const offerAmount = Number(offer.amount);
+        const offerTitle = offer.title || 'Custom Offer';
 
-      await workspaceService.ensureWorkspaceForOrderAsync(newOrder);
-      await store.saveOrder(newOrder);
+        if (!sellerId || !Number.isFinite(offerAmount) || offerAmount <= 0) {
+          return res.status(400).json({ error: 'Invalid custom offer details.' });
+        }
 
-      try {
-        await fundOrderEscrowWithEvent({
-          orderId: newOrder.id,
-          orderTitle: newOrder.title,
-          amount: newOrder.amount,
-          buyerId: newOrder.buyerId,
-          sellerId: newOrder.sellerId,
-          actor: `user:${caller.id}`,
-          idempotencyKey
-        });
+        await ensureWallet(clientId);
+        await ensureWallet(sellerId);
 
-        // ONLY after escrow succeeds, transition to in_progress
-        newOrder.status = 'in_progress';
+        const newOrderId = 'ord_' + randomUUID().slice(0, 12);
+        const today = new Date().toISOString().split('T')[0];
+        const protectionDays = siteSettings.getSettings().commission.escrowProtectionDays || 14;
+
+        const newOrder: Order = {
+          id: newOrderId,
+          workspaceId: newOrderId,
+          title: offerTitle,
+          buyerId: clientId,
+          sellerId: sellerId,
+          amount: offerAmount,
+          status: 'payment_pending',
+          createdAt: today,
+          dueDate: new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0],
+          escrowProtectionStartDate: today,
+          escrowProtectionEndDate: new Date(Date.now() + protectionDays * 86400000).toISOString().split('T')[0],
+          feeBreakdown: calculateOrderFees(offerAmount)
+        };
+
+        await workspaceService.ensureWorkspaceForOrderAsync(newOrder);
         await store.saveOrder(newOrder);
-        await syncUserBalances();
 
-        if (offer) {
+        try {
+          await fundOrderEscrowWithEvent({
+            orderId: newOrder.id,
+            orderTitle: newOrder.title,
+            amount: newOrder.amount,
+            buyerId: newOrder.buyerId,
+            sellerId: newOrder.sellerId,
+            actor: `user:${caller.id}`,
+            idempotencyKey
+          });
+
+          newOrder.status = 'in_progress';
+          await store.saveOrder(newOrder);
+          await syncUserBalances();
+
           offer.status = 'accepted';
           offer.orderId = newOrder.id;
           offer.resolvedAt = new Date().toISOString();
           offer.resolvedBy = caller.id;
           await saveOfferToDb(offer);
+
+          return res.json({ success: true, order: enrichOrderWithServiceInfo(newOrder), offer: await viewOffer(offer) });
+        } catch (err: any) {
+          const escCheck = await pool.query("SELECT 1 FROM escrows WHERE order_id = $1", [newOrder.id]);
+          if (escCheck.rows.length === 0) {
+            await pool.query("DELETE FROM orders WHERE id = $1", [newOrder.id]);
+          } else {
+            newOrder.status = 'payment_pending';
+            await store.saveOrder(newOrder);
+          }
+          return res.status(400).json({ error: err.message || 'Failed to fund escrow for custom offer' });
+        }
+      }
+
+      if (caller.id !== order.buyerId) {
+        return res.status(403).json({ error: 'Only the buyer can accept this offer.' });
+      }
+
+      const lockedExistingOrderId = order.id;
+      if (!tryAcquireOrderLock(lockedExistingOrderId, res)) return;
+      try {
+        const freshOrder = await store.getOrder(lockedExistingOrderId);
+        if (!freshOrder) return res.status(404).json({ error: 'Order not found' });
+        const targetOffer = await store.getOfferById(offer.id);
+        if (!targetOffer) return res.status(404).json({ error: 'Offer not found' });
+
+        if (targetOffer.status !== 'pending') {
+          if (targetOffer.status === 'accepted' || targetOffer.status === 'paid') {
+            return res.json({
+              success: true,
+              order: enrichOrderWithServiceInfo(freshOrder),
+              offer: await viewOffer(targetOffer)
+            });
+          }
+          return res.status(409).json({ error: `This offer is already ${targetOffer.status}.` });
         }
 
-        return res.json({ success: true, order: enrichOrderWithServiceInfo(newOrder), offer });
-      } catch (err: any) {
-        await pool.query("DELETE FROM orders WHERE id = $1", [newOrder.id]);
-        return res.status(400).json({ error: err.message || 'Failed to fund escrow for custom offer' });
+        const amountToFund = Number(targetOffer.amount);
+        if (!Number.isFinite(amountToFund) || amountToFund <= 0) {
+          return res.status(400).json({ error: 'Invalid offer amount.' });
+        }
+
+        await ensureWallet(freshOrder.buyerId);
+        await ensureWallet(freshOrder.sellerId);
+
+        await topUpOrderEscrowWithEvent({
+          orderId: freshOrder.id,
+          orderTitle: targetOffer.title || freshOrder.title,
+          amount: amountToFund,
+          buyerId: freshOrder.buyerId,
+          sellerId: freshOrder.sellerId,
+          actor: `user:${caller.id}`,
+          idempotencyKey
+        });
+
+        targetOffer.status = 'accepted';
+        targetOffer.resolvedAt = new Date().toISOString();
+        targetOffer.resolvedBy = caller.id;
+        await saveOfferToDb(targetOffer);
+
+        freshOrder.amount = Math.round((Number(freshOrder.amount || 0) + amountToFund) * 100) / 100;
+        freshOrder.status = 'in_progress';
+        await store.saveOrder(freshOrder);
+        await syncUserBalances();
+
+        return res.json({ success: true, order: enrichOrderWithServiceInfo(freshOrder), offer: await viewOffer(targetOffer) });
+      } finally {
+        releaseOrderLock(lockedExistingOrderId);
       }
+    } catch (err: any) {
+      return res.status(500).json(formatApiError(err, 'Failed to accept offer'));
     }
-
-    // Existing order
-    const clientWalletId = order.buyerId;
-    await ensureWallet(clientWalletId);
-    await ensureWallet(order.sellerId);
-
-    const targetOffer = offer || (await store.getOfferById(msgId));
-    const amountToFund = targetOffer ? targetOffer.amount : Number(req.body?.amount || 0);
-
-    if (amountToFund > 0) {
-      await topUpOrderEscrowWithEvent({
-        orderId: order.id,
-        orderTitle: targetOffer?.title || order.title,
-        amount: amountToFund,
-        buyerId: order.buyerId,
-        sellerId: order.sellerId,
-        actor: `user:${caller.id}`,
-        idempotencyKey
-      });
-    }
-
-    if (targetOffer) {
-      targetOffer.status = 'accepted';
-      targetOffer.resolvedAt = new Date().toISOString();
-      targetOffer.resolvedBy = caller.id;
-      await saveOfferToDb(targetOffer);
-    }
-
-    order.status = 'in_progress';
-    await store.saveOrder(order);
-    await syncUserBalances();
-
-    return res.json({ success: true, order: enrichOrderWithServiceInfo(order), offer: targetOffer ? await viewOffer(targetOffer) : null });
   }
 );
 

@@ -12,5 +12,6 @@ export async function closeActiveDispute(orderId: string, status: Dispute['statu
     }
   } catch (err) {
     console.error(`[disputeService] Error closing dispute for order ${orderId}:`, err);
+    throw err;
   }
 }

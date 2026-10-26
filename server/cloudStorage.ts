@@ -2,13 +2,20 @@ import { Storage } from '@google-cloud/storage';
 import fs from 'fs';
 import path from 'path';
 
-const bucketName = process.env.GCS_BUCKET_NAME || process.env.CLOUD_STORAGE_BUCKET || 'workperhour-uploads-bucket';
+const configuredBucketName = process.env.GCS_BUCKET_NAME || process.env.CLOUD_STORAGE_BUCKET;
+const bucketName = configuredBucketName || 'workperhour-uploads-bucket';
 const storage = new Storage();
 const bucket = storage.bucket(bucketName);
 
+function assertProductionBucketConfigured(): void {
+  if (process.env.NODE_ENV === 'production' && !configuredBucketName) {
+    throw new Error('Cloud storage configuration missing: GCS_BUCKET_NAME or CLOUD_STORAGE_BUCKET must be set in production.');
+  }
+}
+
 export async function uploadFileToCloudStorage(filename: string, buffer: Buffer, mimeType: string): Promise<string> {
   const safeFilename = path.basename(filename);
-  const isTestOrLocal = process.env.NODE_ENV === 'test' || (!process.env.GCS_BUCKET_NAME && !process.env.GOOGLE_CLOUD_PROJECT && process.env.NODE_ENV !== 'production');
+  const isTestOrLocal = process.env.NODE_ENV === 'test' || (!configuredBucketName && !process.env.GOOGLE_CLOUD_PROJECT && process.env.NODE_ENV !== 'production');
   
   if (isTestOrLocal) {
     const localDir = path.join(process.cwd(), 'data', 'uploads', 'workstream');
@@ -17,6 +24,8 @@ export async function uploadFileToCloudStorage(filename: string, buffer: Buffer,
     fs.writeFileSync(localPath, buffer);
     return `/uploads/workstream/${safeFilename}`;
   }
+
+  assertProductionBucketConfigured();
 
   try {
     const file = bucket.file(`workstream/${safeFilename}`);
@@ -33,12 +42,14 @@ export async function uploadFileToCloudStorage(filename: string, buffer: Buffer,
 
 export async function deleteFileFromCloudStorage(filename: string): Promise<void> {
   const safeFilename = path.basename(filename);
-  const isTestOrLocal = process.env.NODE_ENV === 'test' || (!process.env.GCS_BUCKET_NAME && !process.env.GOOGLE_CLOUD_PROJECT && process.env.NODE_ENV !== 'production');
+  const isTestOrLocal = process.env.NODE_ENV === 'test' || (!configuredBucketName && !process.env.GOOGLE_CLOUD_PROJECT && process.env.NODE_ENV !== 'production');
   if (isTestOrLocal) {
     const localPath = path.join(process.cwd(), 'data', 'uploads', 'workstream', safeFilename);
     try { if (fs.existsSync(localPath)) fs.unlinkSync(localPath); } catch {}
     return;
   }
+
+  assertProductionBucketConfigured();
 
   try {
     const file = bucket.file(`workstream/${safeFilename}`);
@@ -53,6 +64,7 @@ export function openCloudFileStream(
   authUser?: any,
   checkAccess?: (user: any, filename: string) => boolean
 ) {
+  assertProductionBucketConfigured();
   const safeFilename = path.basename(filename);
   if (checkAccess && (!authUser || !checkAccess(authUser, safeFilename))) {
     throw new Error('Unauthorized file access');

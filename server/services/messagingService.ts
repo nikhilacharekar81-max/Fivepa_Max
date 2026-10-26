@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import {
   store,
   type Message,
@@ -17,8 +18,20 @@ export function registerMessage(m: Message) {
   return;
 }
 
-export async function recordMessage(m: Message): Promise<void> {
+export async function recordMessage(m: Message): Promise<Message> {
   await store.addMessage(m);
+  if (m.orderId) {
+    try {
+      await postgresStore.getPool().query(
+        "UPDATE orders SET updated_at = NOW() WHERE id = $1",
+        [m.orderId]
+      );
+    } catch {
+      // Ignore timestamp touch failure
+    }
+    broadcastMessage(m, m.orderId);
+  }
+  return m;
 }
 
 export function sanitizeAndCreateMessage(
@@ -44,6 +57,18 @@ export function sanitizeAndCreateMessage(
   delete metadata.offerId;
   delete metadata.offerKind;
 
+  // Remove reserved metadata.action for all user-submitted messages
+  if (typeof metadata.action === 'string') {
+    const action = metadata.action.trim().toLowerCase();
+    const isReservedAction =
+      /^(offer_|escrow_|deliverable_|delivery_|revision_|dispute_|review_|order_|payment_|payout_|refund_|wallet_|transaction_|deposit_|system_|admin_|staff_|moderation_|audit_|project_proposal)/i.test(action) ||
+      ['auto_accept', 'order_auto_accepted', 'release_escrow', 'escrow_release'].includes(action);
+
+    if (isReservedAction) {
+      delete metadata.action;
+    }
+  }
+
   if (!isSystemOrStaff) {
     const FORBIDDEN_METADATA_KEYS = [
       'disputeId', 'revisionId', 'reviewId', 'ticketId', 'payoutId', 'refundId', 'transactionId',
@@ -55,28 +80,13 @@ export function sanitizeAndCreateMessage(
       delete metadata[key];
     }
 
-    if (typeof metadata.action === 'string') {
-      const action = metadata.action.trim().toLowerCase();
-      const isReservedAction =
-        /^(offer_|escrow_|deliverable_|delivery_|revision_|dispute_|review_|order_|payment_|payout_|refund_|wallet_|transaction_|deposit_|system_|admin_|staff_|moderation_|audit_|project_proposal)/i.test(action) ||
-        ['auto_accept', 'order_auto_accepted', 'release_escrow', 'escrow_release'].includes(action);
-
-      if (isReservedAction) {
-        delete metadata.action;
-      }
-    }
-
     for (const k of Object.keys(metadata)) {
-      if (k !== 'requirementText') delete metadata[k];
+      if (k !== 'requirementText' && k !== 'clientMessageId') delete metadata[k];
     }
     if (typeof metadata.requirementText === 'string') {
       metadata.requirementText = metadata.requirementText.slice(0, 2000);
     } else {
       delete metadata.requirementText;
-    }
-  } else {
-    if (typeof metadata.action === 'string' && /^offer_/i.test(metadata.action)) {
-      delete metadata.action;
     }
   }
 
@@ -88,12 +98,12 @@ export function sanitizeAndCreateMessage(
   }
 
   const requestedType = typeof body.type === 'string' ? body.type : 'text';
-  const NON_STAFF_TYPES = ['message', 'text', 'file'];
-  const safeType = (isSystemOrStaff || NON_STAFF_TYPES.includes(requestedType)) ? requestedType : 'text';
+  const ALLOWED_CHAT_TYPES = ['message', 'text', 'file'];
+  const safeType = ALLOWED_CHAT_TYPES.includes(requestedType) ? requestedType : 'text';
   if (safeType !== 'file' && !text) throw new Error('Message text is required.');
 
   return {
-    id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+    id: 'msg_' + randomUUID(),
     orderId: order.id,
     senderId: sender.id,
     senderName: sender.name,
@@ -107,7 +117,7 @@ export function sanitizeAndCreateMessage(
 
 export async function emitSystemEvent(orderId: string, action: string, text: string, metadata: Record<string, any> = {}): Promise<void> {
   const sysMsg: Message = {
-    id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+    id: 'msg_' + randomUUID(),
     orderId,
     senderId: 'system',
     senderName: 'WorkSphere System',
@@ -117,7 +127,6 @@ export async function emitSystemEvent(orderId: string, action: string, text: str
     metadata: { ...metadata, action }
   };
   await recordMessage(sysMsg);
-  broadcastMessage(sysMsg, orderId);
   notifyOrderParties(orderId, action, text, sysMsg.id);
 }
 

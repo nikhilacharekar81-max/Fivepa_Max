@@ -14,7 +14,8 @@ import {
   resolveAuthenticatedUserId,
   adminActor,
   rateLimit,
-  isStaffUser
+  isStaffUser,
+  formatApiError
 } from '../middleware/auth.js';
 import { workspaceService } from '../../src/server/workspaceService.js';
 import { calculateOrderFees } from '../domains/finance/fees.js';
@@ -31,7 +32,7 @@ import {
   enrichOrderWithServiceInfo,
   registerAuditLog
 } from '../services/orderService.js';
-import { postOfferMessage, viewOffer } from '../services/workstreamService.js';
+import { postOfferMessage, viewOffer, generateCollisionSafeOfferNumber } from '../services/workstreamService.js';
 
 export const proposalRouter = Router();
 
@@ -39,7 +40,10 @@ export async function enrichProposalWithWorkstream(p: Proposal): Promise<Proposa
   let workstreamOrderId = p.workstreamOrderId;
   let offerId = p.offerId;
   if (!workstreamOrderId) {
-    const ordRes = await postgresStore.getPool().query("SELECT id FROM orders WHERE fee_breakdown->>'proposalId' = $1 OR requirements LIKE $2", [p.id, `%${p.id}%`]);
+    const ordRes = await postgresStore.getPool().query(
+      "SELECT id FROM orders WHERE fee_breakdown->>'proposalId' = $1 OR requirements = $1 OR metadata->>'proposalId' = $1",
+      [p.id]
+    );
     if (ordRes.rows.length > 0) workstreamOrderId = ordRes.rows[0].id;
   }
   if (!offerId && workstreamOrderId) {
@@ -71,7 +75,7 @@ proposalRouter.get('/proposals', async (req: Request, res: Response) => {
     const enriched = await Promise.all(userProposals.map(enrichProposalWithWorkstream));
     res.json(enriched);
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to list proposals' });
+    res.status(500).json(formatApiError(err, 'Failed to list proposals'));
   }
 });
 
@@ -134,7 +138,7 @@ proposalRouter.post('/proposals', requireAuth, requireActiveStatus, rateLimit(30
 
     res.json(newProp);
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to submit proposal' });
+    res.status(500).json(formatApiError(err, 'Failed to submit proposal'));
   }
 });
 
@@ -187,146 +191,158 @@ export async function processProposalAccept(req: any, res: any) {
     }
     const maxHires = lockResult.maxHires || Math.max(1, Number(proj.maxHires || (proj as any).freelancersNeeded || 1));
 
-    await ensureWallet(buyerId);
-    await ensureWallet(proposal.freelancerId);
-
-    const workspace = await workspaceService.createWorkspaceAsync({
-      buyerId,
-      sellerId: proposal.freelancerId,
-      originType: 'project',
-      originId: proj.id
-    });
-
-    const orderId = 'ord_' + randomUUID().slice(0, 12);
-    const today = new Date().toISOString().split('T')[0];
-    const protectionDays = siteSettings.getSettings().commission.escrowProtectionDays;
-    const deliveryDays = proposal.deliveryDays || 7;
-    const dueDate = new Date(Date.now() + deliveryDays * 86400000).toISOString().split('T')[0];
-
-    const order: Order = {
-      id: orderId,
-      projectOrderId: orderId,
-      workspaceId: workspace.workspaceId,
-      orderType: 'project',
-      type: 'project',
-      title: proj.title,
-      buyerId,
-      sellerId: proposal.freelancerId,
-      amount: proposal.bidAmount,
-      status: 'payment_pending',
-      createdAt: today,
-      dueDate,
-      escrowProtectionStartDate: today,
-      escrowProtectionEndDate: new Date(Date.now() + protectionDays * 86400000).toISOString().split('T')[0],
-      projectId: proj.id,
-      proposalId: proposal.id,
-      feeBreakdown: calculateOrderFees(proposal.bidAmount)
-    };
-
-    await workspaceService.ensureWorkspaceForOrderAsync(order);
-
-    const offerId = 'off_' + randomUUID().slice(0, 12);
-    const offerNum = `PRP-${Date.now().toString().slice(-4)}`;
-    const offer: WorkstreamOffer = {
-      id: offerId,
-      number: offerNum,
-      orderId: order.id,
-      proposalId: proposal.id,
-      kind: 'proposal',
-      title: proj.title,
-      amount: proposal.bidAmount,
-      deliveryDays: proposal.deliveryDays,
-      note: proposal.coverLetter ? proposal.coverLetter.slice(0, 1000) : undefined,
-      status: 'pending',
-      createdBy: proposal.freelancerId,
-      createdAt: new Date().toISOString()
-    };
-
-    await postgresStore.getPool().query(
-      `INSERT INTO workstream_offers (id, number, order_id, kind, title, amount, delivery_days, status, created_by, created_at, metadata)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-      [offer.id, offer.number, offer.orderId, offer.kind, offer.title, offer.amount, offer.deliveryDays, offer.status, offer.createdBy, offer.createdAt, JSON.stringify({ proposalId: proposal.id })]
-    );
-
-    await recordOrder(order);
-    await store.saveOrder(order);
-
     try {
-      await fundOrderEscrowWithEvent({
-        orderId: order.id,
-        orderTitle: order.title,
-        amount: order.amount,
-        buyerId: order.buyerId,
-        sellerId: order.sellerId,
-        actor: `user:${order.buyerId}`
+      await ensureWallet(buyerId);
+      await ensureWallet(proposal.freelancerId);
+
+      const workspace = await workspaceService.createWorkspaceAsync({
+        buyerId,
+        sellerId: proposal.freelancerId,
+        originType: 'project',
+        originId: proj.id
       });
 
-      order.status = 'funded_in_escrow';
-      await store.saveOrder(order);
-    } catch (fundingErr: any) {
-      await postgresStore.getPool().query("UPDATE proposals SET status = 'pending', workstream_order_id = NULL, offer_id = NULL WHERE id = $1", [proposal.id]);
-      await postgresStore.getPool().query("UPDATE projects SET status = 'open' WHERE id = $1", [proj.id]);
-      await postgresStore.getPool().query('DELETE FROM orders WHERE id = $1', [order.id]);
-      await postgresStore.getPool().query('DELETE FROM workstream_offers WHERE id = $1', [offer.id]);
+      const orderId = 'ord_' + randomUUID().slice(0, 12);
+      const today = new Date().toISOString().split('T')[0];
+      const protectionDays = siteSettings.getSettings().commission.escrowProtectionDays;
+      const deliveryDays = proposal.deliveryDays || 7;
+      const dueDate = new Date(Date.now() + deliveryDays * 86400000).toISOString().split('T')[0];
 
-      if (workspace) {
-        await workspaceService.deleteWorkspace(workspace.workspaceId);
+      const order: Order = {
+        id: orderId,
+        projectOrderId: orderId,
+        workspaceId: workspace.workspaceId,
+        orderType: 'project',
+        type: 'project',
+        title: proj.title,
+        buyerId,
+        sellerId: proposal.freelancerId,
+        amount: proposal.bidAmount,
+        status: 'payment_pending',
+        createdAt: today,
+        dueDate,
+        escrowProtectionStartDate: today,
+        escrowProtectionEndDate: new Date(Date.now() + protectionDays * 86400000).toISOString().split('T')[0],
+        projectId: proj.id,
+        proposalId: proposal.id,
+        feeBreakdown: calculateOrderFees(proposal.bidAmount)
+      };
+
+      await workspaceService.ensureWorkspaceForOrderAsync(order);
+
+      const offerId = 'off_' + randomUUID().slice(0, 12);
+      const offerNum = generateCollisionSafeOfferNumber('proposal');
+      const offer: WorkstreamOffer = {
+        id: offerId,
+        number: offerNum,
+        orderId: order.id,
+        proposalId: proposal.id,
+        kind: 'proposal',
+        title: proj.title,
+        amount: proposal.bidAmount,
+        deliveryDays: proposal.deliveryDays,
+        note: proposal.coverLetter ? proposal.coverLetter.slice(0, 1000) : undefined,
+        status: 'pending',
+        createdBy: proposal.freelancerId,
+        createdAt: new Date().toISOString()
+      };
+
+      await postgresStore.getPool().query(
+        `INSERT INTO workstream_offers (id, number, order_id, kind, title, amount, delivery_days, status, created_by, created_at, metadata)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [offer.id, offer.number, offer.orderId, offer.kind, offer.title, offer.amount, offer.deliveryDays, offer.status, offer.createdBy, offer.createdAt, JSON.stringify({ proposalId: proposal.id })]
+      );
+
+      await recordOrder(order);
+      await store.saveOrder(order);
+
+      try {
+        await fundOrderEscrowWithEvent({
+          orderId: order.id,
+          orderTitle: order.title,
+          amount: order.amount,
+          buyerId: order.buyerId,
+          sellerId: order.sellerId,
+          actor: `user:${order.buyerId}`
+        });
+
+        order.status = 'funded_in_escrow';
+        await store.saveOrder(order);
+      } catch (fundingErr: any) {
+        await postgresStore.getPool().query("UPDATE proposals SET status = 'pending', workstream_order_id = NULL, offer_id = NULL WHERE id = $1", [proposal.id]);
+        await postgresStore.getPool().query("UPDATE projects SET status = 'open' WHERE id = $1", [proj.id]);
+        const escCheck = await postgresStore.getPool().query('SELECT 1 FROM escrows WHERE order_id = $1', [order.id]);
+        if (escCheck.rows.length === 0) {
+          await postgresStore.getPool().query('DELETE FROM orders WHERE id = $1', [order.id]);
+        } else {
+          order.status = 'payment_pending';
+          await store.saveOrder(order);
+        }
+        await postgresStore.getPool().query('DELETE FROM workstream_offers WHERE id = $1', [offer.id]);
+
+        if (workspace) {
+          await workspaceService.deleteWorkspace(workspace.workspaceId);
+        }
+
+        return res.status(400).json({ error: fundingErr.message || 'Failed to fund escrow for proposal.' });
       }
 
-      return res.status(400).json({ error: fundingErr.message || 'Failed to fund escrow for proposal.' });
+      await emitSystemEvent(order.id, 'order_created', `Order placed: ${order.title}. Payment is held in escrow until the work is approved.`);
+      await postOfferMessage(order, offer, null, `Proposal ${offer.number} was created.`, 'offer_created');
+
+      proposal.status = 'accepted';
+      proposal.workstreamOrderId = order.id;
+      proposal.offerId = offer.id;
+      await postgresStore.getPool().query(
+        'UPDATE proposals SET status = $1, workstream_order_id = $2, offer_id = $3 WHERE id = $4',
+        ['accepted', order.id, offer.id, proposal.id]
+      );
+
+      const newHiresRes = await postgresStore.getPool().query(
+        "SELECT COUNT(*) FROM proposals WHERE project_id = $1 AND status = 'accepted'",
+        [proj.id]
+      );
+      const newHiresCount = parseInt(newHiresRes.rows[0]?.count || '0', 10);
+      if (newHiresCount >= maxHires) {
+        proj.status = 'in-progress';
+        await postgresStore.getPool().query("UPDATE projects SET status = 'in-progress' WHERE id = $1", [proj.id]);
+        await postgresStore.getPool().query("UPDATE proposals SET status = 'declined' WHERE project_id = $1 AND status = 'pending'", [proj.id]);
+      } else {
+        proj.status = 'open';
+        await postgresStore.getPool().query("UPDATE projects SET status = 'open' WHERE id = $1", [proj.id]);
+      }
+      if (Array.isArray((proj as any).proposalsList)) {
+        (proj as any).proposalsList = (proj as any).proposalsList.map((p: any) => p.id === proposal.id ? { ...p, status: 'accepted', workstreamOrderId: order.id, offerId: offer.id } : p);
+      }
+      await store.saveProject(proj);
+
+      await syncUserBalances();
+
+      offer.status = 'accepted';
+      offer.resolvedAt = new Date().toISOString();
+      offer.resolvedBy = caller.id;
+      await postgresStore.getPool().query(
+        'UPDATE workstream_offers SET status = $1, resolved_at = $2, resolved_by = $3 WHERE id = $4',
+        ['accepted', offer.resolvedAt, offer.resolvedBy, offer.id]
+      );
+
+      await postOfferMessage(order, offer, null, `Proposal ${offer.number} was accepted and escrow funded ($${order.amount}).`, 'offer_accepted');
+
+      createNotification({
+        userId: proposal.freelancerId,
+        type: 'proposal_accepted',
+        title: 'Proposal accepted',
+        message: `Your proposal for "${proj.title}" was accepted and escrow has been funded.`,
+        link: `/workstream/${order.id}`,
+        metadata: { orderId: order.id, projectId: proj.id, proposalId: proposal.id }
+      });
+
+      res.json({ success: true, proposal: await enrichProposalWithWorkstream(proposal), order: enrichOrderWithServiceInfo(order), workspace, offer: await viewOffer(offer) });
+    } catch (acceptErr: any) {
+      await postgresStore.getPool().query("UPDATE proposals SET status = 'pending', workstream_order_id = NULL, offer_id = NULL WHERE id = $1 AND status = 'accepting'", [proposal.id]);
+      proposal.status = 'pending';
+      return res.status(400).json({ error: acceptErr.message || 'Failed to accept proposal.' });
     }
-
-    await emitSystemEvent(order.id, 'order_created', `Order placed: ${order.title}. Payment is held in escrow until the work is approved.`);
-    await postOfferMessage(order, offer, null, `Proposal ${offer.number} was created.`, 'offer_created');
-
-    proposal.status = 'accepted';
-    proposal.workstreamOrderId = order.id;
-    proposal.offerId = offer.id;
-    await postgresStore.getPool().query(
-      'UPDATE proposals SET status = $1, workstream_order_id = $2, offer_id = $3 WHERE id = $4',
-      ['accepted', order.id, offer.id, proposal.id]
-    );
-
-    const newHiresRes = await postgresStore.getPool().query(
-      "SELECT COUNT(*) FROM proposals WHERE project_id = $1 AND status = 'accepted'",
-      [proj.id]
-    );
-    const newHiresCount = parseInt(newHiresRes.rows[0]?.count || '0', 10);
-    if (newHiresCount >= maxHires) {
-      proj.status = 'in-progress';
-      await postgresStore.getPool().query("UPDATE projects SET status = 'in-progress' WHERE id = $1", [proj.id]);
-      await postgresStore.getPool().query("UPDATE proposals SET status = 'declined' WHERE project_id = $1 AND status = 'pending'", [proj.id]);
-    } else {
-      proj.status = 'open';
-      await postgresStore.getPool().query("UPDATE projects SET status = 'open' WHERE id = $1", [proj.id]);
-    }
-    if (Array.isArray((proj as any).proposalsList)) {
-      (proj as any).proposalsList = (proj as any).proposalsList.map((p: any) => p.id === proposal.id ? { ...p, status: 'accepted', workstreamOrderId: order.id, offerId: offer.id } : p);
-    }
-    await store.saveProject(proj);
-
-    await syncUserBalances();
-
-    offer.status = 'accepted';
-    offer.resolvedAt = new Date().toISOString();
-    offer.resolvedBy = caller.id;
-    await postgresStore.getPool().query(
-      'UPDATE workstream_offers SET status = $1, resolved_at = $2, resolved_by = $3 WHERE id = $4',
-      ['accepted', offer.resolvedAt, offer.resolvedBy, offer.id]
-    );
-
-    await postOfferMessage(order, offer, null, `Proposal ${offer.number} was accepted and escrow funded ($${order.amount}).`, 'offer_accepted');
-
-    createNotification({
-      userId: proposal.freelancerId,
-      type: 'proposal_accepted',
-      title: 'Proposal accepted',
-      message: `Your proposal for "${proj.title}" was accepted and escrow has been funded.`,
-      link: `/workstream/${order.id}`,
-      metadata: { orderId: order.id, projectId: proj.id, proposalId: proposal.id }
-    });
-
-    res.json({ success: true, proposal: await enrichProposalWithWorkstream(proposal), order: enrichOrderWithServiceInfo(order), workspace, offer: await viewOffer(offer) });
   } finally {
     releaseOrderLock(proposal.id);
   }
@@ -418,7 +434,7 @@ const handleProposalUpdate = async (req: Request, res: Response) => {
 
     res.json(await enrichProposalWithWorkstream(proposal));
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to update proposal' });
+    res.status(500).json(formatApiError(err, 'Failed to update proposal'));
   }
 };
 
@@ -451,7 +467,7 @@ proposalRouter.post('/proposals/:id/withdraw', requireAuth, requireActiveStatus,
 
     res.json({ success: true, proposal: await enrichProposalWithWorkstream(proposal) });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to withdraw proposal' });
+    res.status(500).json(formatApiError(err, 'Failed to withdraw proposal'));
   }
 });
 
@@ -503,7 +519,7 @@ proposalRouter.patch('/admin/proposals/:id', requireAdmin, async (req: Request, 
     const updated = await store.getProposal(req.params.id);
     res.json(updated);
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to update proposal' });
+    res.status(500).json(formatApiError(err, 'Failed to update proposal'));
   }
 });
 
@@ -527,7 +543,7 @@ proposalRouter.patch('/admin/proposals/:id/status', requireAdmin, async (req: Re
 
     res.json({ ...p, status: req.body.status });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to update status' });
+    res.status(500).json(formatApiError(err, 'Failed to update status'));
   }
 });
 
@@ -551,6 +567,6 @@ proposalRouter.delete('/admin/proposals/:id', requireAdmin, async (req: Request,
 
     res.json({ success: true, id: deleted.id });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to delete proposal' });
+    res.status(500).json(formatApiError(err, 'Failed to delete proposal'));
   }
 });
