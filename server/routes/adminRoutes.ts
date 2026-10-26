@@ -1181,13 +1181,13 @@ router.post('/admin/refunds/:id/approve', requireAdmin, async (req: Request, res
         throw new Error(`Cannot approve refund in status "${r.status}".`);
       }
 
+      const immutableAmount = Number(r.amount);
       const orderRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [r.order_id]);
       if (orderRes.rows.length === 0) throw new Error(`Order ${r.order_id} not found`);
-      const orderRow = orderRes.rows[0];
 
       await financialTransactionService.refundOrderFunds({
         orderId: r.order_id,
-        amount: Number(r.amount),
+        amount: immutableAmount,
         reason: r.reason || 'Admin approved refund',
         actor: adminActor(req)
       }, client);
@@ -1195,6 +1195,19 @@ router.post('/admin/refunds/:id/approve', requireAdmin, async (req: Request, res
       await client.query(
         "UPDATE refunds SET status = 'approved' WHERE id = $1",
         [r.id]
+      );
+
+      await client.query(
+        `INSERT INTO audit_logs (id, actor, role, action, target, details, timestamp)
+         VALUES ($1, $2, $3, 'ADMIN_REFUND_APPROVED', $4, $5, $6)`,
+        [
+          'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
+          adminActor(req),
+          (req as any).authenticatedUser?.role || 'admin',
+          `Refund #${r.id}`,
+          `Approved refund of $${immutableAmount.toFixed(2)} for Order #${r.order_id}. Buyer wallet credited.`,
+          new Date().toLocaleString()
+        ]
       );
     });
 
@@ -1239,10 +1252,26 @@ router.post('/admin/refunds/:id/reject', requireAdmin, async (req: Request, res:
       if (r.status === 'approved' || r.status === 'executed') {
         throw new Error('Cannot reject a refund that has already been executed.');
       }
+      if (r.status === 'rejected') {
+        throw new Error('Refund is already rejected.');
+      }
 
       await client.query(
         "UPDATE refunds SET status = 'rejected' WHERE id = $1",
         [r.id]
+      );
+
+      await client.query(
+        `INSERT INTO audit_logs (id, actor, role, action, target, details, timestamp)
+         VALUES ($1, $2, $3, 'ADMIN_REFUND_REJECTED', $4, $5, $6)`,
+        [
+          'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
+          adminActor(req),
+          (req as any).authenticatedUser?.role || 'admin',
+          `Refund #${r.id}`,
+          `Rejected refund request of $${Number(r.amount).toFixed(2)} for Order #${r.order_id}`,
+          new Date().toLocaleString()
+        ]
       );
     });
 

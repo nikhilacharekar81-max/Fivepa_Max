@@ -219,36 +219,38 @@ export async function handleLogin(req: Request, res: Response) {
         }
       }
     } catch {}
-  }
-
-  for (const key of attemptKeys) {
-    const attemptRecord = loginAttempts.get(key);
-    if (!attemptRecord) continue;
-    if (now < attemptRecord.resetAt && attemptRecord.count >= 5) {
-      return res.status(429).json({ error: 'Too many failed login attempts. Please try again later.' });
-    }
-    if (now >= attemptRecord.resetAt) {
-      loginAttempts.delete(key);
+  } else {
+    for (const key of attemptKeys) {
+      const attemptRecord = loginAttempts.get(key);
+      if (!attemptRecord) continue;
+      if (now < attemptRecord.resetAt && attemptRecord.count >= 5) {
+        return res.status(429).json({ error: 'Too many failed login attempts. Please try again later.' });
+      }
+      if (now >= attemptRecord.resetAt) {
+        loginAttempts.delete(key);
+      }
     }
   }
 
   async function recordFailedLogin() {
-    for (const key of attemptKeys) {
-      const record = loginAttempts.get(key) || { count: 0, resetAt: Date.now() + cooldownMs };
-      record.count++;
-      loginAttempts.set(key, record);
-
-      if (isPostgresEnabled()) {
-        try {
-          const pool = postgresStore.getPool();
-          const expiresAt = new Date(Date.now() + cooldownMs);
+    if (isPostgresEnabled()) {
+      try {
+        const pool = postgresStore.getPool();
+        const expiresAt = new Date(Date.now() + cooldownMs);
+        for (const key of attemptKeys) {
           await pool.query(
             `INSERT INTO auth_verification_codes (email, code, type, attempts, last_resend_at, expires_at, created_at)
              VALUES ($1, '0', 'login_attempts', 1, $2, $3, NOW())
              ON CONFLICT (email, type) DO UPDATE SET attempts = auth_verification_codes.attempts + 1, expires_at = $3`,
             [`login:${key}`, Date.now(), expiresAt]
           );
-        } catch {}
+        }
+      } catch {}
+    } else {
+      for (const key of attemptKeys) {
+        const record = loginAttempts.get(key) || { count: 0, resetAt: Date.now() + cooldownMs };
+        record.count++;
+        loginAttempts.set(key, record);
       }
     }
   }
