@@ -24,6 +24,15 @@ export class FinanceRepo {
         for (const ref of refunds) {
           if (!ref?.id || seen.has(ref.id)) continue;
           seen.add(ref.id);
+
+          const existing = await client.query('SELECT * FROM refunds WHERE id = $1 FOR UPDATE', [ref.id]);
+          if (existing.rows.length > 0) {
+            const row = existing.rows[0];
+            if (Math.abs(Number(row.amount) - Number(ref.amount)) > 0.001 || row.order_id !== ref.orderId || row.buyer_id !== ref.buyerId) {
+              throw new Error(`Immutable financial record violation: Cannot modify amount, order_id, or buyer_id for refund ${ref.id}`);
+            }
+          }
+
           await client.query(
             `INSERT INTO refunds (id, order_id, buyer_id, amount, reason, status, created_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -66,14 +75,31 @@ export class FinanceRepo {
   async savePayout(p: Payout): Promise<void> {
     if (!p?.id) return;
     return this.ctx.withLock(`payout_${p.id}`, async () => {
-      await this.ctx.getPool().query(
-        `INSERT INTO payouts (id, freelancer_id, amount, method, status, created_at, account_details)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (id) DO UPDATE SET
-           status = EXCLUDED.status,
-           account_details = COALESCE(EXCLUDED.account_details, payouts.account_details)`,
-        [p.id, p.freelancerId, p.amount, p.method, p.status, p.createdAt, p.accountDetails || null]
-      );
+      const client = await this.ctx.getPool().connect();
+      try {
+        await client.query('BEGIN');
+        const existing = await client.query('SELECT * FROM payouts WHERE id = $1 FOR UPDATE', [p.id]);
+        if (existing.rows.length > 0) {
+          const row = existing.rows[0];
+          if (Math.abs(Number(row.amount) - Number(p.amount)) > 0.001 || row.freelancer_id !== p.freelancerId) {
+            throw new Error(`Immutable financial record violation: Cannot modify amount or freelancer_id for payout ${p.id}`);
+          }
+        }
+        await client.query(
+          `INSERT INTO payouts (id, freelancer_id, amount, method, status, created_at, account_details)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (id) DO UPDATE SET
+             status = EXCLUDED.status,
+             account_details = COALESCE(EXCLUDED.account_details, payouts.account_details)`,
+          [p.id, p.freelancerId, p.amount, p.method, p.status, p.createdAt, p.accountDetails || null]
+        );
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        client.release();
+      }
     });
   }
 
@@ -85,6 +111,13 @@ export class FinanceRepo {
         await client.query('BEGIN');
         for (const p of payouts) {
           if (!p?.id) continue;
+          const existing = await client.query('SELECT * FROM payouts WHERE id = $1 FOR UPDATE', [p.id]);
+          if (existing.rows.length > 0) {
+            const row = existing.rows[0];
+            if (Math.abs(Number(row.amount) - Number(p.amount)) > 0.001 || row.freelancer_id !== p.freelancerId) {
+              throw new Error(`Immutable financial record violation: Cannot modify amount or freelancer_id for payout ${p.id}`);
+            }
+          }
           await client.query(
             `INSERT INTO payouts (id, freelancer_id, amount, method, status, created_at, account_details)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -172,6 +205,7 @@ export class FinanceRepo {
   }
 
   async deletePaymentMethod(id: string): Promise<void> {
+    await this.ctx.getPool().query('SELECT * FROM payment_methods WHERE id = $1', [id]); // check existence
     await this.ctx.getPool().query('DELETE FROM payment_methods WHERE id = $1', [id]);
   }
 

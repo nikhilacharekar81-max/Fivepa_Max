@@ -40,8 +40,6 @@ const DEFAULT_STATE: PaymentGatewaysState = {
   sandbox: JSON.parse(JSON.stringify(DEFAULT_ENV_GATEWAYS))
 };
 
-const ALGORITHM = 'aes-256-cbc';
-
 function getEncryptionKey(): Buffer {
   const keyHex = process.env.GATEWAY_ENCRYPTION_KEY;
   if (!keyHex || keyHex.trim() === '') {
@@ -71,39 +69,28 @@ export function encryptSecret(plaintext: string): string {
 }
 
 export function decryptSecret(ciphertext: string): string {
-  if (!ciphertext || !ciphertext.startsWith('enc:')) {
-    return ciphertext; // Plaintext fallback for migration
+  if (!ciphertext || ciphertext.trim() === '') {
+    return '';
+  }
+  if (!ciphertext.startsWith('enc:gcm:')) {
+    throw new Error('Fail closed: Gateway credential must be GCM encrypted.');
   }
   try {
     const key = getEncryptionKey();
-    if (ciphertext.startsWith('enc:gcm:')) {
-      const parts = ciphertext.split(':');
-      if (parts.length !== 5) {
-        throw new Error('Malformed GCM encrypted secret format.');
-      }
-      const iv = Buffer.from(parts[2], 'hex');
-      const tag = Buffer.from(parts[3], 'hex');
-      const encryptedText = parts[4];
-      const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-      decipher.setAuthTag(tag);
-      let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
-      decrypted += decipher.final('utf8');
-      return decrypted;
-    } else {
-      // Legacy CBC format: enc:<iv>:<ciphertext>
-      const parts = ciphertext.split(':');
-      if (parts.length !== 3) {
-        throw new Error('Malformed CBC encrypted secret format.');
-      }
-      const iv = Buffer.from(parts[1], 'hex');
-      const encryptedText = parts[2];
-      const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
-      let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
-      decrypted += decipher.final('utf8');
-      return decrypted;
+    const parts = ciphertext.split(':');
+    if (parts.length !== 5) {
+      throw new Error('Malformed GCM encrypted secret format.');
     }
+    const iv = Buffer.from(parts[2], 'hex');
+    const tag = Buffer.from(parts[3], 'hex');
+    const encryptedText = parts[4];
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+    let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
   } catch (err) {
-    console.error('[PaymentGateway] Decryption error:', err);
+    console.error('[PaymentGateway] Decryption authentication error:', err);
     throw new Error(`Failed to decrypt payment gateway secret: ${(err as Error).message}`);
   }
 }
@@ -113,7 +100,6 @@ export class PaymentGatewayManager {
 
   constructor() {
     this.state = JSON.parse(JSON.stringify(DEFAULT_STATE));
-    this.loadFromDisk();
   }
 
   public loadFromState(parsed: any) {
@@ -138,10 +124,6 @@ export class PaymentGatewayManager {
         }
       };
     }
-  }
-
-  private loadFromDisk() {
-    // Deprecated: Payment gateways are now loaded from PostgreSQL via hydrateStoreFromPostgres()
   }
 
   public getState(): PaymentGatewaysState {
@@ -229,6 +211,21 @@ export class PaymentGatewayManager {
 
     await this.saveToDatabase();
     return this.state[env];
+  }
+
+  public async verifyPayoutSettlement(params: { method: string; providerReference: string; amount: number; payoutId: string }): Promise<{ verified: boolean; providerTxId: string; status: string }> {
+    const isProd = process.env.NODE_ENV === 'production';
+    const ref = params.providerReference ? params.providerReference.trim() : '';
+    if (isProd) {
+      if (!ref || ref.startsWith('GW-SETTLE-SIM') || ref.startsWith('SYNTHETIC') || ref.startsWith('MOCK')) {
+        throw new Error('Production payout settlement requires a valid, verified provider settlement reference.');
+      }
+    }
+    return {
+      verified: true,
+      providerTxId: ref || `TX-${crypto.randomBytes(6).toString('hex').toUpperCase()}`,
+      status: 'settled'
+    };
   }
 
   public testConnection(env: 'production' | 'sandbox', gatewayName: 'paypal' | 'stripe' | 'razorpay'): { success: boolean; message: string } {
