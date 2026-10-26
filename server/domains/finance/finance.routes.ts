@@ -43,6 +43,7 @@ import {
   fundOrderEscrowWithEvent,
   syncUserBalances,
   ensureWallet,
+  LATE_ORDER_PROTECTION_HOURS,
   registerAuditLog,
   validateOrderReleasePreconditions
 } from '../../services/orderService.js';
@@ -634,7 +635,7 @@ router.post('/payments/escrow/refund', requireAuth, async (req: Request, res: Re
 
     const isGigOrder = order.orderType === 'gig' || Boolean(order.gigOrderId);
     if (isGigOrder && isSeller && !isAdmin) return res.status(403).json({ error: 'Sellers must use the cancellation request.' });
-    const overdueThresholdHours = 48;
+    const overdueThresholdHours = LATE_ORDER_PROTECTION_HOURS;
     const isOverdueByThreshold = order.dueDate ? (Date.now() > new Date(order.dueDate).getTime() + overdueThresholdHours * 60 * 60 * 1000) : false;
 
     if (!isAdmin && !isSeller) {

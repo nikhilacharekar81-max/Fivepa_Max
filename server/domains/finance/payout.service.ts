@@ -53,9 +53,9 @@ export async function handlePayoutRequest(req: Request, res: Response) {
     }
     await financialTransactionService.ensureWallet(freelancerId);
 
-    const verification = await verifyAndConsumeWithdrawalCode(freelancerId, req.body?.code);
-    if (!verification.ok) {
-      return res.status(verification.status).json({ error: verification.error });
+    const rawCode = req.body?.code;
+    if (!rawCode || typeof rawCode !== 'string' || !rawCode.trim()) {
+      return res.status(400).json({ error: 'Email verification code is required for withdrawal. Please request a code first via /api/auth/withdrawal/request-code.' });
     }
 
     const rawMethod = String(req.body?.method || 'Bank Transfer');
@@ -67,8 +67,47 @@ export async function handlePayoutRequest(req: Request, res: Response) {
     }
 
     const numAmount = Number(req.body?.amount);
-    if (!Number.isFinite(numAmount) || numAmount <= 0) {
+    if (!Number.isFinite(numAmount) || numAmount <= 0 || Math.round(numAmount * 100) !== numAmount * 100) {
       return res.status(400).json({ error: 'Please enter a valid withdrawal amount greater than $0.00' });
+    }
+
+    const walletConfig = liveSettings?.wallets || DEFAULT_SITE_SETTINGS.wallets;
+    const minPayout = walletConfig?.minimumWithdrawalAmount ?? 10.00;
+    if (numAmount < minPayout) {
+      return res.status(400).json({ error: `Minimum payout withdrawal amount is $${minPayout.toFixed(2)}.` });
+    }
+
+    const pool = postgresStore.getPool();
+    const walletRes = await pool.query('SELECT available_balance, status, user_role FROM wallets WHERE user_id = $1', [freelancerId]);
+    if (walletRes.rows.length > 0) {
+      const wallet = walletRes.rows[0];
+      if (wallet.status === 'frozen' || wallet.status === 'suspended') {
+        return res.status(400).json({ error: `Cannot request payout from a ${wallet.status} wallet.` });
+      }
+      if (wallet.user_role && wallet.user_role !== 'freelancer') {
+        return res.status(400).json({ error: 'Only freelancers can request payouts.' });
+      }
+      if (Number(wallet.available_balance || 0) < numAmount) {
+        return res.status(400).json({ error: 'Insufficient available balance.' });
+      }
+    }
+
+    const dailyLimit = walletConfig?.dailyWithdrawalLimit ?? 10000;
+    const dailyRes = await pool.query(
+      `SELECT COALESCE(SUM(amount), 0) as total_today FROM payouts
+       WHERE freelancer_id = $1 AND status IN ('pending', 'approved', 'processed') AND NULLIF(created_at::text, '')::timestamptz >= NOW() - INTERVAL '24 hours'`,
+      [freelancerId]
+    );
+    const totalToday = Number(dailyRes.rows[0]?.total_today || 0);
+    if (totalToday + numAmount > dailyLimit) {
+      return res.status(400).json({
+        error: `Daily withdrawal limit of $${dailyLimit.toFixed(2)} exceeded. Requested: $${numAmount.toFixed(2)}, Already requested today: $${totalToday.toFixed(2)}.`
+      });
+    }
+
+    const verification = await verifyAndConsumeWithdrawalCode(freelancerId, rawCode);
+    if (!verification.ok) {
+      return res.status(verification.status).json({ error: verification.error });
     }
 
     const idempotencyKey = String(req.body?.idempotencyKey || req.headers['x-idempotency-key'] || '').trim();

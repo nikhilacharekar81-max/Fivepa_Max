@@ -285,9 +285,20 @@ export class PostgresStore {
 
   async runMigrations(): Promise<void> {
     if (!isPostgresEnabled()) return;
-    const migrationPath = path.join(__dirname, 'migration.sql');
-    if (!fs.existsSync(migrationPath)) return;
+    const candidatePaths = [
+      path.join(__dirname, 'migration.sql'),
+      path.resolve(process.cwd(), 'server', 'db', 'migration.sql')
+    ];
+    const migrationPath = candidatePaths.find(p => fs.existsSync(p));
+    if (!migrationPath) {
+      throw new Error(
+        `FATAL: Required database migration file (migration.sql) is missing. Searched paths: ${candidatePaths.join(', ')}`
+      );
+    }
     const sql = fs.readFileSync(migrationPath, 'utf-8');
+    if (!sql || !sql.trim()) {
+      throw new Error(`FATAL: Database migration file (${migrationPath}) is empty.`);
+    }
 
     if (!isRemotePostgresConfigured()) {
       await this.getPool().query(sql);

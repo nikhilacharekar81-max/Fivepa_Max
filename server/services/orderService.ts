@@ -200,6 +200,8 @@ export function isAutoAcceptEnabled(): boolean {
   return getReviewWindowDays() > 0;
 }
 
+export const LATE_ORDER_PROTECTION_HOURS = 48;
+
 export function assertOrderOpen(order: Order) {
   if (order.status === 'completed') throw new Error('Order is already completed; funds were already released.');
   if (order.status === 'cancelled') throw new Error('Order is already cancelled; funds were already handled.');
@@ -237,7 +239,10 @@ export async function releaseOrderFunds(order: Order, actor: string, reason: str
   }
 
   await syncUserBalances();
-  await store.saveOrder(order);
+  await postgresStore.getPool().query(
+    'UPDATE orders SET status = $1, completed_at = COALESCE(completed_at, $2), accepted_version = COALESCE($3, accepted_version) WHERE id = $4',
+    ['completed', order.completedAt, order.acceptedVersion ?? null, order.id]
+  );
 
   if (approvedByBuyer) {
     await emitSystemEvent(order.id, 'deliverable_approved', `✅ Deliverables approved by buyer.`, {
@@ -271,7 +276,10 @@ export async function refundOrderFunds(order: Order, amount: number | undefined,
   }
 
   await syncUserBalances();
-  await store.saveOrder(order);
+  await postgresStore.getPool().query(
+    'UPDATE orders SET status = $1, cancellation_type = COALESCE($2, cancellation_type) WHERE id = $3',
+    [order.status, order.cancellationType || null, order.id]
+  );
 
   await emitSystemEvent(order.id, 'escrow_refunded', `💸 Escrow refunded ($${result.refunded.toLocaleString()}) to buyer wallet. Reason: ${reason}`, {
     refunded: result.refunded,
@@ -290,7 +298,10 @@ export async function splitOrderFunds(order: Order, refundAmount: number, actor:
   }
 
   await syncUserBalances();
-  await store.saveOrder(order);
+  await postgresStore.getPool().query(
+    'UPDATE orders SET status = $1, completed_at = COALESCE(completed_at, $2) WHERE id = $3',
+    ['completed', order.completedAt, order.id]
+  );
 
   await emitSystemEvent(order.id, 'escrow_refunded', `💸 Partial refund of $${refundAmount.toLocaleString()} returned to buyer wallet. Reason: ${reason}`, {
     refunded: refundAmount,

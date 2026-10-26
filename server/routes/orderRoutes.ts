@@ -39,7 +39,8 @@ import {
   syncUserBalances,
   ensureWallet,
   registerAuditLog,
-  getActiveEscrowRemaining
+  getActiveEscrowRemaining,
+  LATE_ORDER_PROTECTION_HOURS
 } from '../services/orderService.js';
 import { broadcastMessage } from '../websocket.js';
 import {
@@ -430,7 +431,7 @@ const handleOrderExtendTime = async (req: Request, res: Response) => {
   }
 
   order.dueDate = targetDate;
-  await store.saveOrder(order);
+  await postgresStore.getPool().query('UPDATE orders SET due_date = $1 WHERE id = $2', [targetDate, order.id]);
 
   const sysMsg: Message = {
     id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
@@ -505,7 +506,14 @@ router.post('/orders/:id/extension-request', requireAuth, requireActiveStatus, r
 
     if (!order.extensionRequests) order.extensionRequests = [];
     order.extensionRequests.push(newRequest);
-    await store.saveOrder(order);
+    const extUpdated = await store.updateOrderStatus(
+      order.id,
+      { extension_requests: JSON.stringify(order.extensionRequests) },
+      ['funded_in_escrow', 'in_progress', 'delivered', 'revision', 'draft_review', 'work_in_progress']
+    );
+    if (!extUpdated) {
+      return res.status(409).json({ error: 'Order status changed concurrently; cannot request an extension.' });
+    }
 
     const sysMsg: Message = {
       id: `msg_${randomUUID()}`,
@@ -549,7 +557,10 @@ router.post('/orders/:id/extension-request/respond', requireAuth, requireActiveS
 
     if (request.responseDeadline && new Date() > new Date(request.responseDeadline)) {
       request.status = 'expired';
-      await store.saveOrder(order);
+      await postgresStore.getPool().query(
+        'UPDATE orders SET extension_requests = $1 WHERE id = $2',
+        [JSON.stringify(order.extensionRequests), order.id]
+      );
 
       const expireMsg: Message = {
         id: `msg_${randomUUID()}`,
@@ -567,6 +578,7 @@ router.post('/orders/:id/extension-request/respond', requireAuth, requireActiveS
     }
 
     const { action, reason } = req.body;
+    const allowedExtRespondStatuses = ['funded_in_escrow', 'in_progress', 'delivered', 'revision', 'draft_review', 'work_in_progress'];
     if (action === 'approve') {
       request.status = 'approved';
       request.respondedBy = userId;
@@ -574,7 +586,18 @@ router.post('/orders/:id/extension-request/respond', requireAuth, requireActiveS
       request.resultingDueDate = request.requestedDueDate;
       order.dueDate = request.requestedDueDate;
       order.freeExtensionUsed = true;
-      await store.saveOrder(order);
+      const updated = await store.updateOrderStatus(
+        order.id,
+        {
+          extension_requests: JSON.stringify(order.extensionRequests),
+          due_date: order.dueDate,
+          free_extension_used: true
+        },
+        allowedExtRespondStatuses
+      );
+      if (!updated) {
+        return res.status(409).json({ error: 'Order status changed concurrently; cannot approve extension.' });
+      }
 
       const sysMsg: Message = {
         id: `msg_${randomUUID()}`,
@@ -594,7 +617,14 @@ router.post('/orders/:id/extension-request/respond', requireAuth, requireActiveS
       request.rejectionReason = reason.trim();
       request.respondedBy = userId;
       request.respondedAt = new Date().toISOString();
-      await store.saveOrder(order);
+      const updated = await store.updateOrderStatus(
+        order.id,
+        { extension_requests: JSON.stringify(order.extensionRequests) },
+        allowedExtRespondStatuses
+      );
+      if (!updated) {
+        return res.status(409).json({ error: 'Order status changed concurrently; cannot reject extension.' });
+      }
 
       const sysMsg: Message = {
         id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
@@ -624,7 +654,7 @@ const handleOrderAdminNotes = async (req: Request, res: Response) => {
   if (!order) return res.status(404).json({ error: 'Order not found' });
 
   order.adminNotes = req.body.notes || '';
-  await store.saveOrder(order);
+  await postgresStore.getPool().query('UPDATE orders SET admin_notes = $1 WHERE id = $2', [order.adminNotes, order.id]);
   res.json({ success: true, adminNotes: order.adminNotes });
 };
 router.post('/orders/:id/admin-notes', requireAdmin, handleOrderAdminNotes);
@@ -880,7 +910,14 @@ router.post('/orders/:id/revision', requireAuth, requireActiveStatus, async (req
     order.revisions.push(revisionEntry);
     order.status = 'revision';
 
-    await store.saveOrder(order);
+    const revUpdated = await store.updateOrderStatus(
+      order.id,
+      { status: 'revision', revisions: JSON.stringify(order.revisions) },
+      allowedRevisionStatuses
+    );
+    if (!revUpdated) {
+      return res.status(409).json({ error: 'Order status changed concurrently; cannot request revisions.' });
+    }
 
     await emitSystemEvent(order.id, 'revision_requested', `Revision requested: "${reason}"`, {
       revisionId: revisionEntry.id,
@@ -946,10 +983,13 @@ const handleOpenDispute = async (req: Request, res: Response) => {
       createdAt
     };
 
+    const allowedDisputeStatuses = ['funded_in_escrow', 'in_progress', 'delivered', 'revision', 'draft_review', 'work_in_progress'];
+    const dispUpdated = await store.updateOrderStatus(order.id, { status: 'disputed' }, allowedDisputeStatuses);
+    if (!dispUpdated) {
+      return res.status(409).json({ error: 'Cannot open a dispute: order status changed concurrently.' });
+    }
     await store.saveDispute(newDispute);
-
     order.status = 'disputed';
-    await store.saveOrder(order);
 
     const sysMsg: Message = {
       id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
@@ -987,7 +1027,7 @@ const handleOrderMute = async (req: Request, res: Response) => {
   if (!order) return res.status(404).json({ error: 'Order not found' });
 
   order.isMuted = req.body?.isMuted !== undefined ? Boolean(req.body.isMuted) : !order.isMuted;
-  await store.saveOrder(order);
+  await postgresStore.getPool().query('UPDATE orders SET is_muted = $1 WHERE id = $2', [order.isMuted, order.id]);
 
   const sysMsg: Message = {
     id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
@@ -1016,7 +1056,7 @@ const handleOrderPauseTimer = async (req: Request, res: Response) => {
   if (!order) return res.status(404).json({ error: 'Order not found' });
 
   order.isTimerPaused = !order.isTimerPaused;
-  await store.saveOrder(order);
+  await postgresStore.getPool().query('UPDATE orders SET is_timer_paused = $1 WHERE id = $2', [order.isTimerPaused, order.id]);
 
   const sysMsg: Message = {
     id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
@@ -1067,8 +1107,6 @@ const handleOrderForceComplete = async (req: Request, res: Response) => {
     const result = await releaseOrderFunds(order, adminActor(req), reason, false, req.body.requestKey);
     await closeActiveDispute(order.id, 'resolved_release', reason);
 
-    await store.saveOrder(order);
-
     res.json({ success: true, order: enrichOrderWithServiceInfo(order), result });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -1109,8 +1147,6 @@ const handleOrderForceCancel = async (req: Request, res: Response) => {
       refundAmount = result.refunded;
       await closeActiveDispute(order.id, 'resolved_refund', reason);
     }
-
-    await store.saveOrder(order);
 
     res.json({ success: true, order: enrichOrderWithServiceInfo(order), result });
   } catch (err: any) {
@@ -1169,7 +1205,17 @@ router.post('/orders/:id/cancel-request', requireAuth, requireActiveStatus, rate
     if (!order.cancellationHistory) order.cancellationHistory = [];
     order.cancellationHistory.push(order.cancellationRequest);
 
-    await store.saveOrder(order);
+    const cancelReqUpdated = await store.updateOrderStatus(
+      order.id,
+      {
+        cancellation_request: JSON.stringify(order.cancellationRequest),
+        cancellation_history: JSON.stringify(order.cancellationHistory)
+      },
+      ['payment_pending', 'funded_in_escrow', 'in_progress', 'delivered', 'revision', 'draft_review', 'work_in_progress']
+    );
+    if (!cancelReqUpdated) {
+      return res.status(409).json({ error: 'Order status changed concurrently; cannot submit cancellation request.' });
+    }
 
     const recipientId = isBuyer ? order.sellerId : order.buyerId;
     createNotification({
@@ -1249,7 +1295,10 @@ router.post('/orders/:id/cancel-request/respond', requireAuth, requireActiveStat
       const refundRes = await refundOrderFunds(order, undefined, actorName, `Mutual cancellation accepted: ${order.cancellationRequest.reason}`, requestKey);
       order.cancellationRequest.status = 'accepted';
 
-      await store.saveOrder(order);
+      await postgresStore.getPool().query(
+        'UPDATE orders SET cancellation_request = $1, cancellation_history = $2 WHERE id = $3',
+        [JSON.stringify(order.cancellationRequest), JSON.stringify(order.cancellationHistory || []), order.id]
+      );
 
       createNotification({
         userId: order.cancellationRequest.requesterId,
@@ -1277,7 +1326,18 @@ router.post('/orders/:id/cancel-request/respond', requireAuth, requireActiveStat
         order.reviewWindowRestartedAt = now;
       }
 
-      await store.saveOrder(order);
+      const rejectUpdated = await store.updateOrderStatus(
+        order.id,
+        {
+          cancellation_request: JSON.stringify(order.cancellationRequest),
+          cancellation_history: JSON.stringify(order.cancellationHistory || []),
+          review_window_restarted_at: order.reviewWindowRestartedAt || null
+        },
+        ['payment_pending', 'funded_in_escrow', 'in_progress', 'delivered', 'revision', 'draft_review', 'work_in_progress']
+      );
+      if (!rejectUpdated) {
+        return res.status(409).json({ error: 'Order status changed concurrently; cannot reject cancellation request.' });
+      }
 
       const actorName = caller?.name || (isBuyer ? 'Buyer' : 'Seller');
       createNotification({
@@ -1361,12 +1421,13 @@ const handleOrderCancel = async (req: Request, res: Response) => {
         }
         if (['funded_in_escrow', 'in_progress'].includes(order.status) || hasFundedEscrow) {
           const hasZeroDeliveries = (!order.deliveryHistory || order.deliveryHistory.length === 0) && (!order.deliverableFiles || order.deliverableFiles.length === 0);
-          const isVeryLateGig = isGigOrder && Boolean(order.dueDate) && (Date.now() > new Date(order.dueDate).getTime() + 24 * 3600 * 1000) && hasZeroDeliveries;
+          const isVeryLateGig = isGigOrder && Boolean(order.dueDate) && (Date.now() > new Date(order.dueDate).getTime() + LATE_ORDER_PROTECTION_HOURS * 3600 * 1000) && hasZeroDeliveries;
           if (!isVeryLateGig) {
             return res.status(403).json({
               error: 'Cannot directly cancel an active or delivered order. Please submit a cancellation request (POST /api/orders/:id/cancel-request) or open a dispute (POST /api/orders/:id/dispute).'
             });
           }
+          order.cancellationType = 'very_late';
         }
       }
     }
@@ -1376,8 +1437,15 @@ const handleOrderCancel = async (req: Request, res: Response) => {
     if (hasFundedEscrow) {
       await refundOrderFunds(order, undefined, actor, reason);
     } else {
+      const cancelUpdated = await store.updateOrderStatus(
+        order.id,
+        { status: 'cancelled', cancellation_type: order.cancellationType || null },
+        ['payment_pending', 'funded_in_escrow', 'in_progress']
+      );
+      if (!cancelUpdated) {
+        return res.status(409).json({ error: 'Order status changed concurrently; cannot cancel order.' });
+      }
       order.status = 'cancelled';
-      await store.saveOrder(order);
     }
     await cancelPendingOffersForOrder(order.id, caller?.id);
     await emitSystemEvent(order.id, 'order_cancelled', `Order was cancelled. Reason: ${reason}`);

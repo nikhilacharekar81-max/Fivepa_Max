@@ -997,6 +997,11 @@ export class FinancialTransactionService {
       const check = await checkOrRecordIdempotency(client, idempKey, 'releaseOrderFunds', payloadFingerprint);
       if (check.replayed) return check.result;
 
+      const orderRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [params.orderId]);
+      if (orderRes.rows.length > 0 && orderRes.rows[0].status === 'cancelled') {
+        throw new Error('Cannot release escrow: Order has already been cancelled.');
+      }
+
       const escRes = await client.query('SELECT * FROM escrows WHERE order_id = $1 FOR UPDATE', [params.orderId]);
       if (escRes.rows.length === 0) {
         throw new Error(`Escrow record not found in PostgreSQL for order ${params.orderId}`);
@@ -1041,7 +1046,7 @@ export class FinancialTransactionService {
       await client.query('UPDATE wallets SET funds_on_hold = funds_on_hold - $1 WHERE user_id = $2', [gross, escrow.buyer_id]);
       
       // Update Order
-      await client.query('UPDATE orders SET status = $1, completed_at = NOW() WHERE id = $2', ['completed', params.orderId]);
+      await client.query('UPDATE orders SET status = $1, completed_at = COALESCE(completed_at, NOW()::text) WHERE id = $2', ['completed', params.orderId]);
 
       // 14-day Earnings Clearing Entry in Authoritative Table
       const clearingId = 'clr_' + params.orderId;
@@ -1094,6 +1099,11 @@ export class FinancialTransactionService {
 
     assertPostgresAvailable();
     const run = async (client: any) => {
+      const orderRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [params.orderId]);
+      if (orderRes.rows.length > 0 && orderRes.rows[0].status === 'completed') {
+        throw new Error('Cannot refund escrow: Order has already been completed.');
+      }
+
       const escRes = await client.query('SELECT * FROM escrows WHERE order_id = $1 FOR UPDATE', [params.orderId]);
       if (escRes.rows.length === 0) {
         throw new Error(`Escrow record not found in PostgreSQL for order ${params.orderId}`);
@@ -1215,6 +1225,14 @@ export class FinancialTransactionService {
     assertPostgresAvailable();
 
     const run = async (client: any) => {
+      const orderCheckRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [params.orderId]);
+      if (orderCheckRes.rows.length > 0) {
+        const ordStatus = orderCheckRes.rows[0].status;
+        if (['disputed', 'cancelled', 'completed', 'refunded'].includes(ordStatus)) {
+          throw new Error(`Cannot top up escrow for order in status "${ordStatus}".`);
+        }
+      }
+
       const escRes = await client.query('SELECT * FROM escrows WHERE order_id = $1 FOR UPDATE', [params.orderId]);
       if (escRes.rows.length === 0) return this.fundEscrow(params, client);
       
@@ -1227,14 +1245,6 @@ export class FinancialTransactionService {
       }
       if (escrow.seller_id !== params.sellerId) {
         throw new Error(`Top-up seller mismatch: expected ${escrow.seller_id}, got ${params.sellerId}`);
-      }
-
-      const orderCheckRes = await client.query('SELECT status FROM orders WHERE id = $1 FOR UPDATE', [params.orderId]);
-      if (orderCheckRes.rows.length > 0) {
-        const ordStatus = orderCheckRes.rows[0].status;
-        if (['disputed', 'cancelled', 'completed', 'refunded'].includes(ordStatus)) {
-          throw new Error(`Cannot top up escrow for order in status "${ordStatus}".`);
-        }
       }
 
       const dispCheck = await client.query("SELECT 1 FROM disputes WHERE order_id = $1 AND status IN ('open', 'under_review')", [params.orderId]);

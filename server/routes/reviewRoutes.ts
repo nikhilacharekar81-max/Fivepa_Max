@@ -194,10 +194,11 @@ export const handleSubmitReview = async (req: Request, res: Response) => {
 
     if (isBuyerReviewer) {
       order.review = newReview;
+      await postgresStore.getPool().query('UPDATE orders SET review = $1 WHERE id = $2', [JSON.stringify(newReview), order.id]);
     } else {
       (order as any).sellerReview = newReview;
+      await postgresStore.getPool().query('UPDATE orders SET seller_review = $1 WHERE id = $2', [JSON.stringify(newReview), order.id]);
     }
-    await store.saveOrder(order);
 
     recalculateUserRating(resolvedTargetUserId);
 
@@ -282,7 +283,7 @@ router.put('/reviews/:id', requireAuth, async (req: Request, res: Response) => {
       if (order && order.review && order.review.id === review.id) {
         order.review.rating = newRating;
         order.review.comment = newComment;
-        await store.saveOrder(order);
+        await postgresStore.getPool().query('UPDATE orders SET review = $1 WHERE id = $2', [JSON.stringify(order.review), order.id]);
       }
     }
 
@@ -350,7 +351,7 @@ router.post('/reviews/:id/reply', requireAuth, async (req: Request, res: Respons
       if (order) {
         if (order.review && order.review.id === review.id) {
           order.review.reply = replyObj;
-          await store.saveOrder(order);
+          await postgresStore.getPool().query('UPDATE orders SET review = $1 WHERE id = $2', [JSON.stringify(order.review), order.id]);
         }
 
         const sysMsg: Message = {

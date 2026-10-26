@@ -11,6 +11,36 @@ export const clients = new Set<WebSocket>();
 let wss: WebSocketServer | null = null;
 
 const wsConnectionBuckets = new Map<string, { count: number; resetAt: number }>();
+
+function isTrustedProxyPeer(remoteAddress?: string): boolean {
+  if (!remoteAddress) return false;
+  if (process.env.TRUST_PROXY === 'false' || process.env.TRUST_PROXY === '0') return false;
+  const addr = remoteAddress.replace(/^::ffff:/, '');
+  return (
+    addr === '127.0.0.1' ||
+    addr === '::1' ||
+    addr.startsWith('10.') ||
+    addr.startsWith('192.168.') ||
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(addr) ||
+    addr.startsWith('169.254.')
+  );
+}
+
+function resolveWsClientIp(request: any): string {
+  const socketIp = request?.socket?.remoteAddress || 'unknown';
+  if (isTrustedProxyPeer(socketIp)) {
+    const xff = request?.headers?.['x-forwarded-for'];
+    const parts = (Array.isArray(xff) ? xff.join(',') : (xff || ''))
+      .split(',')
+      .map((s: string) => s.trim())
+      .filter(Boolean);
+    if (parts.length > 0) {
+      return parts[parts.length - 1];
+    }
+  }
+  return socketIp.replace(/^::ffff:/, '') || 'unknown';
+}
+
 function checkWsIpRateLimit(ip: string, max = 50, windowMs = 60000): boolean {
   const now = Date.now();
   const record = wsConnectionBuckets.get(ip) || { count: 0, resetAt: now + windowMs };
@@ -37,9 +67,7 @@ export function initWebSocketServer(server: Server): WebSocketServer {
   wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
 
   server.on('upgrade', (request, socket, head) => {
-    const xff = request.headers['x-forwarded-for'];
-    const parts = (Array.isArray(xff) ? xff.join(',') : (xff || '')).split(',').map(s => s.trim()).filter(Boolean);
-    const ip = parts.length ? parts[parts.length - 1] : (request.socket.remoteAddress || 'unknown');
+    const ip = resolveWsClientIp(request);
     if (!checkWsIpRateLimit(ip)) {
       console.warn(`[Security] WebSocket connection attempt from ${ip} rejected: rate limit exceeded.`);
       socket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n');

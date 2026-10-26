@@ -862,10 +862,16 @@ export class PostgresAsyncStore implements StoreInterface {
         buyer_id = EXCLUDED.buyer_id,
         seller_id = EXCLUDED.seller_id,
         amount = EXCLUDED.amount,
-        status = EXCLUDED.status,
+        status = CASE
+          WHEN orders.status IN ('completed', 'cancelled') AND EXCLUDED.status NOT IN ('completed', 'cancelled') THEN orders.status
+          ELSE EXCLUDED.status
+        END,
         created_at = EXCLUDED.created_at,
         due_date = EXCLUDED.due_date,
-        completed_at = EXCLUDED.completed_at,
+        completed_at = CASE
+          WHEN orders.status IN ('completed', 'cancelled') AND EXCLUDED.status NOT IN ('completed', 'cancelled') THEN orders.completed_at
+          ELSE COALESCE(EXCLUDED.completed_at, orders.completed_at)
+        END,
         requirements = EXCLUDED.requirements,
         deliverables = EXCLUDED.deliverables,
         deliverable_files = EXCLUDED.deliverable_files,
@@ -887,7 +893,10 @@ export class PostgresAsyncStore implements StoreInterface {
         delivery_history = EXCLUDED.delivery_history,
         delivery_notes = EXCLUDED.delivery_notes,
         delivery_reference = EXCLUDED.delivery_reference,
-        accepted_version = EXCLUDED.accepted_version,
+        accepted_version = CASE
+          WHEN orders.status IN ('completed', 'cancelled') AND EXCLUDED.status NOT IN ('completed', 'cancelled') THEN orders.accepted_version
+          ELSE COALESCE(EXCLUDED.accepted_version, orders.accepted_version)
+        END,
         review_window_days = EXCLUDED.review_window_days,
         review_window_expires_at = EXCLUDED.review_window_expires_at,
         review = EXCLUDED.review,
@@ -902,7 +911,10 @@ export class PostgresAsyncStore implements StoreInterface {
         free_extension_used = EXCLUDED.free_extension_used,
         cancellation_request = EXCLUDED.cancellation_request,
         cancellation_history = EXCLUDED.cancellation_history,
-        cancellation_type = EXCLUDED.cancellation_type,
+        cancellation_type = CASE
+          WHEN orders.status IN ('completed', 'cancelled') AND EXCLUDED.status NOT IN ('completed', 'cancelled') THEN orders.cancellation_type
+          ELSE COALESCE(EXCLUDED.cancellation_type, orders.cancellation_type)
+        END,
         review_window_restarted_at = EXCLUDED.review_window_restarted_at,
         response_deadline = EXCLUDED.response_deadline`,
       [
