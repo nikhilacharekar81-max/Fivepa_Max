@@ -1202,12 +1202,11 @@ export class FinancialTransactionService {
         await client.query('UPDATE orders SET status = $1 WHERE id = $2', ['cancelled', params.orderId]);
       }
 
-      // Record refund in authoritative refunds table inside the same transaction
+      // Record refund in authoritative refunds table inside the same transaction (immutable INSERT)
       const refundRecordId = 'ref_' + params.orderId + '_' + nextSeq;
       await client.query(
         `INSERT INTO refunds (id, order_id, buyer_id, amount, reason, status, created_at)
-         VALUES ($1, $2, $3, $4, $5, 'approved', $6)
-         ON CONFLICT (id) DO UPDATE SET amount = EXCLUDED.amount, status = EXCLUDED.status`,
+         VALUES ($1, $2, $3, $4, $5, 'approved', $6)`,
         [refundRecordId, params.orderId, escrow.buyer_id, refundAmount, params.reason, new Date().toISOString().substring(0, 10)]
       );
 

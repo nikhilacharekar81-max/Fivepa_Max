@@ -218,7 +218,12 @@ export async function handleLogin(req: Request, res: Response) {
           return res.status(429).json({ error: 'Too many failed login attempts. Please try again later.' });
         }
       }
-    } catch {}
+    } catch (err) {
+      console.error('[Auth] Database error checking login rate limit:', err);
+      if (IS_PRODUCTION) {
+        return res.status(500).json({ error: 'Security verification database query failed.' });
+      }
+    }
   } else {
     for (const key of attemptKeys) {
       const attemptRecord = loginAttempts.get(key);

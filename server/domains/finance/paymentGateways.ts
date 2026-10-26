@@ -234,6 +234,12 @@ export class PaymentGatewayManager {
 
       if (!parts.t || !parts.v1) return false;
 
+      const timestamp = Number(parts.t);
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (!Number.isFinite(timestamp) || Math.abs(nowSec - timestamp) > 300) {
+        return false;
+      }
+
       const signedPayload = `${parts.t}.${bodyStr}`;
       const expectedSig = crypto.createHmac('sha256', webhookSecret).update(signedPayload).digest('hex');
 
