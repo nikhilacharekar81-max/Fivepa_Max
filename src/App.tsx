@@ -768,7 +768,15 @@ export default function App({ initialPath = '/', initialData }: { initialPath?: 
             orders={orders}
             allGigs={gigs}
             categories={appData.categories}
+            projects={projects}
+            proposals={proposals}
+            users={users}
             navigate={navigate}
+            onOpenWorkstream={(order) => {
+              setSelectedOrder(order);
+              workstream.fetchMessages(order.id);
+              navigate(`/messages/${order.id}`);
+            }}
             onRefresh={refresh}
           />
         ) : path === '/buyer-activity' || path === '/activity' ? (

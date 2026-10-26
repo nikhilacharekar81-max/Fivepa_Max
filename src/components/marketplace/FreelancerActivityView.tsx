@@ -1,17 +1,12 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import {
   Briefcase,
-  Search,
-  PlusCircle,
-  ShieldCheck,
   CheckCircle2,
-  Clock,
-  Layers,
-  Sparkles,
-  ArrowRight
+  PlusCircle
 } from 'lucide-react';
-import { Gig, Order, UserAccount, Category } from '../../types';
+import { Gig, Order, UserAccount, Category, Project, Proposal } from '../../types';
 import { UserFreelanceOffersList } from '../user_dashboard/UserFreelanceOffersList';
+import { UserFreelanceProjectsList, FreelancerProjectActivityItem } from '../user_dashboard/UserFreelanceProjectsList';
 import { UserActivitySummarySidebar } from '../user_dashboard/UserActivitySummarySidebar';
 import { EditGigModal } from '../gigs/EditGigModal';
 import { DeleteGigModal } from '../gigs/DeleteGigModal';
@@ -19,30 +14,77 @@ import { ViewingGigModal } from '../gigs/ViewingGigModal';
 import { getGigUrl } from '../../utils/slugify';
 import { getAuthToken } from '../../utils/authToken';
 import { getDeviceId } from '../../utils/deviceId';
+import { DEFAULT_AVATAR } from '../../constants';
 
 interface FreelancerActivityViewProps {
   currentUser: UserAccount | null;
   orders: Order[];
   allGigs: Gig[];
   categories: Category[];
+  projects?: Project[];
+  proposals?: Proposal[];
+  users?: UserAccount[];
   navigate: (path: string, e?: React.MouseEvent) => void;
+  onOpenWorkstream?: (order: Order) => void;
   onRefresh?: () => void;
 }
 
-type GigStatusTab = 'all' | 'active' | 'paused' | 'moderation' | 'deleted';
+type MainSectionTab = 'projects' | 'gigs';
+type ProjectSubTab = 'all' | 'pending_proposals' | 'in_progress' | 'completed';
+type GigSubTab = 'all' | 'active' | 'paused' | 'pending' | 'declined' | 'featured';
+
+function formatActivityDate(rawDate?: string): string {
+  if (!rawDate) return 'Recent';
+  const parsed = new Date(rawDate);
+  if (Number.isNaN(parsed.getTime())) {
+    return rawDate;
+  }
+  return parsed.toLocaleDateString('en-GB', {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric'
+  });
+}
+
+function toNumericRef(id?: string, fallbackIndex = 0): string {
+  if (!id) return String(3980000 + fallbackIndex);
+  const digits = id.replace(/\D/g, '');
+  if (digits.length >= 6) return digits.slice(0, 7);
+  let hash = 0;
+  for (let i = 0; i < id.length; i++) {
+    hash = (hash * 31 + id.charCodeAt(i)) % 9000000;
+  }
+  return String(1000000 + Math.abs(hash));
+}
+
+function isOrderCompletedOrActive(order: Order): boolean {
+  return (
+    order.status === 'completed' ||
+    order.status === 'delivered' ||
+    order.status === 'in_progress' ||
+    order.status === 'work_in_progress' ||
+    order.status === 'funded_in_escrow' ||
+    order.status === 'revision'
+  );
+}
 
 export const FreelancerActivityView: React.FC<FreelancerActivityViewProps> = ({
   currentUser,
   orders = [],
   allGigs = [],
   categories = [],
+  projects = [],
+  proposals = [],
+  users = [],
   navigate,
+  onOpenWorkstream,
   onRefresh
 }) => {
   const [myGigs, setMyGigs] = useState<Gig[]>([]);
   const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<GigStatusTab>('all');
-  const [searchQuery, setSearchQuery] = useState('');
+  const [activeSection, setActiveSection] = useState<MainSectionTab>('gigs');
+  const [projectSubTab, setProjectSubTab] = useState<ProjectSubTab>('all');
+  const [gigSubTab, setGigSubTab] = useState<GigSubTab>('all');
   const [activeDropdownId, setActiveDropdownId] = useState<string | null>(null);
 
   // Modals state
@@ -79,15 +121,10 @@ export const FreelancerActivityView: React.FC<FreelancerActivityViewProps> = ({
       console.warn('Failed to fetch /api/my/gigs:', e);
     }
 
-    // Fallback: match from allGigs
     const userGigs = allGigs.filter(g => g.freelancerId === currentUser.id);
     setMyGigs(userGigs);
     setLoading(false);
-  }, [currentUser, credentialsKey(currentUser?.id), allGigs]);
-
-  function credentialsKey(id?: string) {
-    return id || 'anonymous';
-  }
+  }, [currentUser, allGigs]);
 
   useEffect(() => {
     fetchMyGigs();
@@ -100,53 +137,225 @@ export const FreelancerActivityView: React.FC<FreelancerActivityViewProps> = ({
     return () => window.removeEventListener('click', handleOutsideClick);
   }, []);
 
-  // Filtered gigs based on tab & search
-  const filteredGigs = useMemo(() => {
-    return myGigs.filter(g => {
-      if (activeTab !== 'all' && g.status !== activeTab) {
-        return false;
-      }
-      if (searchQuery.trim()) {
-        const q = searchQuery.toLowerCase();
-        const matchTitle = (g.title || '').toLowerCase().includes(q);
-        const matchCategory = (g.category || '').toLowerCase().includes(q);
-        if (!matchTitle && !matchCategory) return false;
-      }
-      return true;
-    });
-  }, [myGigs, activeTab, searchQuery]);
-
-  // Tab counts
-  const counts = useMemo(() => {
-    return {
-      all: myGigs.length,
-      active: myGigs.filter(g => g.status === 'active').length,
-      paused: myGigs.filter(g => g.status === 'paused').length,
-      moderation: myGigs.filter(g => g.status === 'moderation').length,
-      deleted: myGigs.filter(g => g.status === 'deleted').length
-    };
-  }, [myGigs]);
-
-  // Seller metrics
-  const completedSellerOrders = useMemo(() => {
+  // All seller orders belonging to current freelancer
+  const mySellerOrders = useMemo(() => {
     if (!currentUser) return [];
-    return orders.filter(o => o.sellerId === currentUser.id && o.status === 'completed');
+    return orders.filter(o => o.sellerId === currentUser.id && o.status !== 'cancelled');
   }, [orders, currentUser]);
 
-  const totalEarnings = useMemo(() => {
-    return completedSellerOrders.reduce((sum, o) => sum + (Number(o.amount) || 0), 0);
-  }, [completedSellerOrders]);
+  // Identify Gig orders vs Project orders
+  const myGigIds = useMemo(() => new Set(myGigs.map(g => g.id)), [myGigs]);
+
+  const myGigOrders = useMemo(() => {
+    return mySellerOrders.filter(o => {
+      if (o.orderType === 'gig' || o.type === 'gig') return true;
+      if (o.orderType === 'project' || o.type === 'project') return false;
+      if (o.projectId || o.proposalId) return false;
+      return Boolean(o.gigId && myGigIds.has(o.gigId)) || Boolean(o.gigId);
+    });
+  }, [mySellerOrders, myGigIds]);
+
+  const myProjectOrders = useMemo(() => {
+    const explicitProjectOrders = mySellerOrders.filter(
+      o => o.orderType === 'project' || o.type === 'project' || Boolean(o.projectId) || Boolean(o.proposalId) || !o.gigId
+    );
+    if (explicitProjectOrders.length > 0) {
+      return explicitProjectOrders;
+    }
+    return mySellerOrders;
+  }, [mySellerOrders]);
+
+  // Per-gig sold counts and last activity
+  const { gigSoldCounts, lastActivityByGigId } = useMemo(() => {
+    const soldMap: Record<string, number> = {};
+    const activityMap: Record<string, string> = {};
+    for (const gig of myGigs) {
+      soldMap[gig.id] = 0;
+    }
+    for (const order of myGigOrders) {
+      if (order.gigId && isOrderCompletedOrActive(order)) {
+        soldMap[order.gigId] = (soldMap[order.gigId] || 0) + 1;
+        if (order.createdAt && !activityMap[order.gigId]) {
+          activityMap[order.gigId] = formatActivityDate(order.createdAt);
+        }
+      }
+    }
+    return { gigSoldCounts: soldMap, lastActivityByGigId: activityMap };
+  }, [myGigs, myGigOrders]);
+
+  // Non-deleted gigs for normal views, declined shows deleted/rejected
+  const filteredGigs = useMemo(() => {
+    return myGigs.filter(g => {
+      if (gigSubTab === 'all') return g.status !== 'deleted';
+      if (gigSubTab === 'active') return g.status === 'active';
+      if (gigSubTab === 'paused') return g.status === 'paused';
+      if (gigSubTab === 'pending') return g.status === 'moderation';
+      if (gigSubTab === 'declined') return g.status === 'deleted' || g.moderationStatus === 'rejected';
+      if (gigSubTab === 'featured') return Boolean(g.featured) && g.status !== 'deleted';
+      return true;
+    });
+  }, [myGigs, gigSubTab]);
+
+  // Build project activity items combining freelancer's project workstreams and proposals
+  const allProjectItems = useMemo<FreelancerProjectActivityItem[]>(() => {
+    if (!currentUser) return [];
+
+    const items: FreelancerProjectActivityItem[] = [];
+    const coveredProjectIds = new Set<string>();
+    const coveredProposalIds = new Set<string>();
+
+    // 1. Orders / active & completed workstreams
+    myProjectOrders.forEach((order, index) => {
+      if (order.projectId) coveredProjectIds.add(order.projectId);
+      if (order.proposalId) coveredProposalIds.add(order.proposalId);
+
+      const orderTitle = order.title || order.serviceTitle || '';
+      const linkedProject = order.projectId
+        ? projects.find(p => p.id === order.projectId)
+        : projects.find(p => p.title.toLowerCase() === orderTitle.toLowerCase());
+
+      if (linkedProject) {
+        coveredProjectIds.add(linkedProject.id);
+      }
+
+      const linkedProposal = proposals.find(
+        pr =>
+          (order.proposalId && pr.id === order.proposalId) ||
+          (linkedProject && pr.projectId === linkedProject.id && pr.freelancerId === currentUser.id)
+      );
+      if (linkedProposal) {
+        coveredProposalIds.add(linkedProposal.id);
+      }
+
+      const buyer = users.find(u => u.id === order.buyerId);
+      const isCompleted = order.status === 'completed';
+      const orderAmount =
+        Number(order.amount) ||
+        linkedProposal?.bidAmount ||
+        linkedProject?.budget ||
+        linkedProject?.budgetMax ||
+        0;
+
+      items.push({
+        id: `order-${order.id}`,
+        title: linkedProject?.title || order.title || order.serviceTitle || 'Project Workstream',
+        buyerName: buyer?.name || linkedProject?.buyerName || order.buyerUsername || 'Client',
+        buyerAvatar: buyer?.avatar || linkedProject?.buyerAvatar || DEFAULT_AVATAR,
+        awardedDate: formatActivityDate(order.createdAt || linkedProject?.createdAt),
+        proposalAmount: linkedProposal?.bidAmount || orderAmount,
+        earningsAmount: orderAmount,
+        location: linkedProject?.location || 'Remote',
+        refNumber: toNumericRef(order.projectId || order.id, index),
+        statusCategory: isCompleted ? 'completed' : 'in_progress',
+        order,
+        workstreamOrderId: order.id,
+        projectId: linkedProject?.id || order.projectId
+      });
+    });
+
+    // 2. Proposals submitted by this freelancer that don't yet have an order
+    const myProposals = proposals.filter(
+      pr => pr.freelancerId === currentUser.id && !coveredProposalIds.has(pr.id)
+    );
+
+    myProposals.forEach((proposal, idx) => {
+      if (proposal.projectId && coveredProjectIds.has(proposal.projectId)) return;
+      if (proposal.status === 'rejected') return;
+
+      const linkedProject = projects.find(p => p.id === proposal.projectId);
+      const buyer = linkedProject ? users.find(u => u.id === linkedProject.buyerId) : undefined;
+
+      const matchingOrder = mySellerOrders.find(
+        o =>
+          o.id === proposal.workstreamOrderId ||
+          o.projectId === proposal.projectId ||
+          o.proposalId === proposal.id ||
+          (linkedProject && o.buyerId === linkedProject.buyerId)
+      );
+
+      const isAccepted =
+        proposal.status === 'accepted' ||
+        linkedProject?.status === 'in_progress' ||
+        linkedProject?.status === 'in-progress' ||
+        linkedProject?.status === 'completed';
+      const isCompleted =
+        linkedProject?.status === 'completed' || matchingOrder?.status === 'completed';
+
+      const bidAmount = Number(proposal.bidAmount) || linkedProject?.budget || linkedProject?.budgetMax || 0;
+
+      items.push({
+        id: `proposal-${proposal.id}`,
+        title: linkedProject?.title || `Project #${proposal.projectId}`,
+        buyerName: buyer?.name || linkedProject?.buyerName || 'Client',
+        buyerAvatar: buyer?.avatar || linkedProject?.buyerAvatar || DEFAULT_AVATAR,
+        awardedDate: formatActivityDate(proposal.createdAt || linkedProject?.createdAt),
+        proposalAmount: bidAmount,
+        earningsAmount: isCompleted || isAccepted ? Number(matchingOrder?.amount ?? bidAmount) : 0,
+        location: linkedProject?.location || 'Remote',
+        refNumber: toNumericRef(proposal.projectId || proposal.id, idx + 100),
+        statusCategory: isCompleted ? 'completed' : isAccepted ? 'in_progress' : 'pending_proposals',
+        order: matchingOrder,
+        workstreamOrderId: matchingOrder?.id || proposal.workstreamOrderId,
+        projectId: linkedProject?.id || proposal.projectId
+      });
+    });
+
+    return items;
+  }, [currentUser, myProjectOrders, mySellerOrders, projects, proposals, users]);
+
+  const filteredProjectItems = useMemo(() => {
+    return allProjectItems.filter(item => {
+      if (projectSubTab === 'all') return true;
+      return item.statusCategory === projectSubTab;
+    });
+  }, [allProjectItems, projectSubTab]);
+
+  // Separate Earnings & Summary Stats for Gigs vs Projects
+  const gigStats = useMemo(() => {
+    const nonDeletedGigs = myGigs.filter(g => g.status !== 'deleted');
+    const postedCount = nonDeletedGigs.length;
+    const activeCount = nonDeletedGigs.filter(g => g.status === 'active').length;
+    const soldCount = myGigOrders.filter(isOrderCompletedOrActive).length;
+    const earnings = myGigOrders
+      .filter(isOrderCompletedOrActive)
+      .reduce((sum, o) => sum + (Number(o.amount) || 0), 0);
+
+    return {
+      postedCount,
+      activeCount,
+      soldCount,
+      earnings
+    };
+  }, [myGigs, myGigOrders]);
+
+  const projectStats = useMemo(() => {
+    const pendingProposalsCount = allProjectItems.filter(i => i.statusCategory === 'pending_proposals').length;
+    const awardedCount = allProjectItems.filter(
+      i => i.statusCategory === 'in_progress' || i.statusCategory === 'completed'
+    ).length;
+    const inProgressCount = allProjectItems.filter(i => i.statusCategory === 'in_progress').length;
+    const earnings = allProjectItems
+      .filter(i => i.statusCategory === 'completed' || i.statusCategory === 'in_progress')
+      .reduce((sum, i) => sum + (Number(i.earningsAmount) || 0), 0);
+
+    return {
+      pendingProposalsCount,
+      awardedCount,
+      inProgressCount,
+      earnings
+    };
+  }, [allProjectItems]);
 
   if (!currentUser) {
     return (
-      <div className="max-w-4xl mx-auto py-20 text-center">
+      <div className="max-w-4xl mx-auto py-20 text-center font-sans">
         <div className="bg-white p-12 rounded-3xl border border-slate-200 shadow-sm space-y-6">
           <div className="w-20 h-20 bg-emerald-50 rounded-2xl flex items-center justify-center mx-auto text-emerald-600">
             <Briefcase className="w-10 h-10" />
           </div>
-          <h1 className="text-3xl font-black text-slate-900">Freelancer Activity & Gig Management</h1>
+          <h1 className="text-3xl font-bold text-slate-900">My Freelancer Activity</h1>
           <p className="text-slate-500 max-w-md mx-auto">
-            Please log in to your account to view your service offers, pause/resume gigs, manage orders, and track your freelance activity.
+            Please log in to your account to view your projects, manage your gigs, and track your earnings.
           </p>
           <button
             onClick={() => navigate('/login')}
@@ -159,11 +368,51 @@ export const FreelancerActivityView: React.FC<FreelancerActivityViewProps> = ({
     );
   }
 
-  // Action handlers
+  // Workstream navigation handler for Projects "VIEW PROGRESS"
+  const handleOpenProjectWorkstream = (orderId: string, order?: Order, projectId?: string) => {
+    if (order) {
+      if (onOpenWorkstream) {
+        onOpenWorkstream(order);
+      } else {
+        navigate(`/messages/${order.id}`);
+      }
+      return;
+    }
+
+    if (orderId) {
+      const matchedOrder = orders.find(o => o.id === orderId);
+      if (matchedOrder && onOpenWorkstream) {
+        onOpenWorkstream(matchedOrder);
+      } else {
+        navigate(`/messages/${orderId}`);
+      }
+      return;
+    }
+
+    if (projectId) {
+      const matchedProjectOrder = orders.find(
+        o => o.projectId === projectId && o.sellerId === currentUser.id
+      );
+      if (matchedProjectOrder) {
+        if (onOpenWorkstream) {
+          onOpenWorkstream(matchedProjectOrder);
+        } else {
+          navigate(`/messages/${matchedProjectOrder.id}`);
+        }
+        return;
+      }
+      navigate(`/projects/${projectId}`);
+      return;
+    }
+
+    navigate('/messages');
+  };
+
+  // Gig action handlers
   const handlePauseResume = async (gig: Gig) => {
     const nextStatus = gig.status === 'active' ? 'paused' : 'active';
-    // Optimistic update
     setMyGigs(prev => prev.map(g => (g.id === gig.id ? { ...g, status: nextStatus } : g)));
+    setActiveDropdownId(null);
     showToast(`Gig "${gig.title}" is now ${nextStatus === 'active' ? 'Active' : 'Paused'}.`);
 
     try {
@@ -184,8 +433,8 @@ export const FreelancerActivityView: React.FC<FreelancerActivityViewProps> = ({
         const data = await res.json().catch(() => ({}));
         showToast(data.error || 'Failed to update gig status on server.');
         await fetchMyGigs();
-      } else {
-        if (onRefresh) onRefresh();
+      } else if (onRefresh) {
+        onRefresh();
       }
     } catch (e) {
       console.warn('Network error updating gig status:', e);
@@ -217,7 +466,6 @@ export const FreelancerActivityView: React.FC<FreelancerActivityViewProps> = ({
     const description = String(formData.get('description') || '').trim();
     const featured = formData.get('featured') === 'on';
 
-    // Preserving status strictly (do not pass status, so existing status remains unchanged)
     const payload = {
       title,
       category,
@@ -228,7 +476,6 @@ export const FreelancerActivityView: React.FC<FreelancerActivityViewProps> = ({
       featured
     };
 
-    // Optimistic update
     setMyGigs(prev =>
       prev.map(g => (g.id === editingGig.id ? { ...g, ...payload } : g))
     );
@@ -253,8 +500,8 @@ export const FreelancerActivityView: React.FC<FreelancerActivityViewProps> = ({
         const err = await res.json().catch(() => ({}));
         showToast(err.error || 'Failed to save edits on server.');
         await fetchMyGigs();
-      } else {
-        if (onRefresh) onRefresh();
+      } else if (onRefresh) {
+        onRefresh();
       }
     } catch (e) {
       console.warn('Network error updating gig:', e);
@@ -271,13 +518,12 @@ export const FreelancerActivityView: React.FC<FreelancerActivityViewProps> = ({
     if (!gigToDelete) return;
     const targetId = gigToDelete.id;
 
-    // Optimistically update gig status to 'deleted'
     setMyGigs(prev =>
       prev.map(g => (g.id === targetId ? { ...g, status: 'deleted' } : g))
     );
     setGigToDelete(null);
     if (viewingGig?.id === targetId) setViewingGig(null);
-    showToast('Gig has been moved to Deleted history.');
+    showToast('Gig has been moved to Declined / Deleted.');
 
     try {
       const token = getAuthToken();
@@ -295,8 +541,8 @@ export const FreelancerActivityView: React.FC<FreelancerActivityViewProps> = ({
         const err = await res.json().catch(() => ({}));
         showToast(err.error || 'Failed to delete gig on server.');
         await fetchMyGigs();
-      } else {
-        if (onRefresh) onRefresh();
+      } else if (onRefresh) {
+        onRefresh();
       }
     } catch (e) {
       console.warn('Network error deleting gig:', e);
@@ -310,7 +556,7 @@ export const FreelancerActivityView: React.FC<FreelancerActivityViewProps> = ({
     const nextFeatured = !gig.featured;
 
     setMyGigs(prev => prev.map(g => (g.id === gigId ? { ...g, featured: nextFeatured } : g)));
-    showToast(`Gig #${gigId} ${nextFeatured ? 'featured' : 'unfeatured'}.`);
+    showToast(`Gig "${gig.title}" ${nextFeatured ? 'featured' : 'unfeatured'}.`);
 
     try {
       const token = getAuthToken();
@@ -325,175 +571,162 @@ export const FreelancerActivityView: React.FC<FreelancerActivityViewProps> = ({
     }
   };
 
+  const handleViewGigProgress = (gig: Gig) => {
+    setActiveDropdownId(null);
+    const gigOrder = myGigOrders.find(o => o.gigId === gig.id);
+    if (gigOrder) {
+      if (onOpenWorkstream) {
+        onOpenWorkstream(gigOrder);
+      } else {
+        navigate(`/messages/${gigOrder.id}`);
+      }
+      return;
+    }
+    setViewingGig(gig);
+  };
+
+  const projectSubTabs: { id: ProjectSubTab; label: string }[] = [
+    { id: 'all', label: 'All' },
+    { id: 'pending_proposals', label: 'Pending Proposals' },
+    { id: 'in_progress', label: 'In progress' },
+    { id: 'completed', label: 'Completed' }
+  ];
+
+  const gigSubTabs: { id: GigSubTab; label: string }[] = [
+    { id: 'all', label: 'All' },
+    { id: 'active', label: 'Active' },
+    { id: 'paused', label: 'Paused' },
+    { id: 'pending', label: 'Pending' },
+    { id: 'declined', label: 'Declined' },
+    { id: 'featured', label: 'Featured' }
+  ];
+
   return (
-    <div className="space-y-6">
+    <div className="max-w-7xl mx-auto py-4 font-sans">
       {/* Toast Notification */}
       {toastMessage && (
-        <div className="fixed top-6 right-6 z-50 bg-slate-900 text-white px-5 py-3 rounded-2xl shadow-2xl flex items-center gap-3 border border-slate-800 animate-in fade-in slide-in-from-top-4 text-xs font-bold">
+        <div className="fixed top-6 right-6 z-50 bg-slate-900 text-white px-5 py-3 rounded-xl shadow-xl flex items-center gap-3 border border-slate-800 text-xs font-semibold">
           <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
           <span>{toastMessage}</span>
         </div>
       )}
 
-      {/* Top Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-black text-slate-900 tracking-tight flex items-center gap-2">
-            <span>Freelancer Activity & Gig Management</span>
-          </h1>
-          <p className="text-xs text-slate-500 mt-1">
-            Manage your service offerings, monitor live statuses, pause/resume listings, and review order analytics.
-          </p>
-        </div>
-        <button
-          onClick={() => navigate('/create-gig')}
-          className="inline-flex items-center gap-2 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl shadow-xs transition cursor-pointer self-start sm:self-auto"
-        >
-          <PlusCircle className="w-4 h-4" />
-          <span>Post New Gig</span>
-        </button>
-      </div>
+      {/* Main 2-Column Layout with Fiverr-aligned site styling */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+        {/* Left Main Content Area */}
+        <div className="lg:col-span-8 bg-white border border-slate-200/90 rounded-2xl p-6 sm:p-8 shadow-xs">
+          {/* Header Row */}
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6">
+            <div>
+              <h1 className="text-2xl sm:text-[26px] font-bold text-slate-900 tracking-tight leading-tight">
+                My Freelancer Activity
+              </h1>
+              <p className="text-xs text-slate-500 mt-1">
+                Manage your active gigs, project proposals, and escrow workstreams.
+              </p>
+            </div>
 
-      {/* Main Grid: Sidebar & Content */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        {/* Left Column: Summary Sidebar */}
-        <div className="lg:col-span-4 xl:col-span-3 space-y-4">
-          <UserActivitySummarySidebar
-            totalOffers={counts.all - counts.deleted}
-            activeOffersCount={counts.active}
-            completedOrdersCount={completedSellerOrders.length}
-            totalEarnings={totalEarnings}
-          />
-
-          {/* Quick Info Box */}
-          <div className="bg-slate-50 border border-slate-200 rounded-3xl p-5 text-xs text-slate-600 space-y-2.5">
-            <h4 className="font-bold text-slate-900 flex items-center gap-1.5">
-              <ShieldCheck className="w-4 h-4 text-emerald-600" />
-              <span>Status Rules</span>
-            </h4>
-            <ul className="space-y-1.5 text-[11px] text-slate-500">
-              <li><strong className="text-emerald-700">Active:</strong> Visible to all buyers and purchasable.</li>
-              <li><strong className="text-amber-700">Paused:</strong> Visible with paused notice; purchase is blocked.</li>
-              <li><strong className="text-blue-700">Under Moderation:</strong> Private while pending review.</li>
-              <li><strong className="text-slate-600">Deleted:</strong> Soft-deleted history; hidden from public.</li>
-            </ul>
-          </div>
-        </div>
-
-        {/* Right Column: Filters, Tabs & Listings */}
-        <div className="lg:col-span-8 xl:col-span-9 space-y-4">
-          {/* Status Tabs Bar */}
-          <div className="bg-white border border-slate-200 rounded-2xl p-1.5 shadow-2xs flex flex-wrap items-center gap-1">
-            <button
-              onClick={() => setActiveTab('all')}
-              className={`px-3.5 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer ${
-                activeTab === 'all'
-                  ? 'bg-slate-900 text-white shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
-              }`}
-            >
-              <span>All Gigs</span>
-              <span className={`px-1.5 py-0.5 rounded-full text-[10px] ${
-                activeTab === 'all' ? 'bg-slate-800 text-white' : 'bg-slate-100 text-slate-600'
-              }`}>
-                {counts.all}
-              </span>
-            </button>
-
-            <button
-              onClick={() => setActiveTab('active')}
-              className={`px-3.5 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer ${
-                activeTab === 'active'
-                  ? 'bg-emerald-600 text-white shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
-              }`}
-            >
-              <span>Active</span>
-              <span className={`px-1.5 py-0.5 rounded-full text-[10px] ${
-                activeTab === 'active' ? 'bg-emerald-700 text-white' : 'bg-emerald-50 text-emerald-700'
-              }`}>
-                {counts.active}
-              </span>
-            </button>
-
-            <button
-              onClick={() => setActiveTab('paused')}
-              className={`px-3.5 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer ${
-                activeTab === 'paused'
-                  ? 'bg-amber-600 text-white shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
-              }`}
-            >
-              <span>Paused</span>
-              <span className={`px-1.5 py-0.5 rounded-full text-[10px] ${
-                activeTab === 'paused' ? 'bg-amber-700 text-white' : 'bg-amber-50 text-amber-700'
-              }`}>
-                {counts.paused}
-              </span>
-            </button>
-
-            <button
-              onClick={() => setActiveTab('moderation')}
-              className={`px-3.5 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer ${
-                activeTab === 'moderation'
-                  ? 'bg-blue-600 text-white shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
-              }`}
-            >
-              <span>Under Moderation</span>
-              <span className={`px-1.5 py-0.5 rounded-full text-[10px] ${
-                activeTab === 'moderation' ? 'bg-blue-700 text-white' : 'bg-blue-50 text-blue-700'
-              }`}>
-                {counts.moderation}
-              </span>
-            </button>
-
-            <button
-              onClick={() => setActiveTab('deleted')}
-              className={`px-3.5 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer ${
-                activeTab === 'deleted'
-                  ? 'bg-slate-700 text-white shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
-              }`}
-            >
-              <span>Deleted</span>
-              <span className={`px-1.5 py-0.5 rounded-full text-[10px] ${
-                activeTab === 'deleted' ? 'bg-slate-800 text-white' : 'bg-slate-100 text-slate-600'
-              }`}>
-                {counts.deleted}
-              </span>
-            </button>
-          </div>
-
-          {/* Search bar */}
-          <div className="bg-white border border-slate-200 rounded-2xl p-2.5 flex items-center gap-2 shadow-2xs">
-            <Search className="w-4 h-4 text-slate-400 shrink-0 ml-1.5" />
-            <input
-              type="text"
-              placeholder="Search your gigs by title or category..."
-              value={searchQuery}
-              onChange={e => setSearchQuery(e.target.value)}
-              className="w-full bg-transparent text-xs text-slate-800 placeholder-slate-400 focus:outline-none"
-            />
-            {searchQuery && (
+            {activeSection === 'gigs' && (
               <button
-                onClick={() => setSearchQuery('')}
-                className="text-xs text-slate-400 hover:text-slate-600 px-2"
+                onClick={() => navigate('/create-gig')}
+                className="inline-flex items-center gap-2 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs rounded-lg shadow-xs transition-colors cursor-pointer self-start sm:self-auto"
               >
-                Clear
+                <PlusCircle className="w-4 h-4" />
+                <span>Post New Gig</span>
               </button>
             )}
           </div>
 
-          {/* Gigs List */}
-          {loading ? (
-            <div className="p-12 text-center bg-white border border-slate-200 rounded-3xl text-xs text-slate-400">
-              Loading your services...
+          {/* Primary Connected Tabs: PROJECTS | GIGS */}
+          <div className="grid grid-cols-2 mb-6 bg-slate-100/80 p-1 rounded-xl border border-slate-200/80">
+            <button
+              type="button"
+              onClick={() => setActiveSection('projects')}
+              className={`py-2.5 text-center text-xs font-bold uppercase tracking-wider rounded-lg transition-all cursor-pointer ${
+                activeSection === 'projects'
+                  ? 'bg-slate-900 text-white shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
+              }`}
+            >
+              PROJECTS
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveSection('gigs')}
+              className={`py-2.5 text-center text-xs font-bold uppercase tracking-wider rounded-lg transition-all cursor-pointer ${
+                activeSection === 'gigs'
+                  ? 'bg-slate-900 text-white shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
+              }`}
+            >
+              GIGS
+            </button>
+          </div>
+
+          {/* Sub-filter Navigation Bar (Fiverr Tab Bar Style) */}
+          {activeSection === 'projects' ? (
+            <div className="border-b border-slate-200 px-1 flex flex-wrap items-center gap-6 mb-2">
+              {projectSubTabs.map(tab => {
+                const isActive = projectSubTab === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={() => setProjectSubTab(tab.id)}
+                    className={`py-3 text-[13px] transition-colors border-b-2 -mb-px cursor-pointer ${
+                      isActive
+                        ? 'border-emerald-600 text-emerald-600 font-bold'
+                        : 'border-transparent text-slate-500 hover:text-slate-800 font-medium'
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="border-b border-slate-200 px-1 flex flex-wrap items-center gap-6 mb-2">
+              {gigSubTabs.map(tab => {
+                const isActive = gigSubTab === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={() => setGigSubTab(tab.id)}
+                    className={`py-3 text-[13px] transition-colors border-b-2 -mb-px cursor-pointer ${
+                      isActive
+                        ? 'border-emerald-600 text-emerald-600 font-bold'
+                        : 'border-transparent text-slate-500 hover:text-slate-800 font-medium'
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Tab Content */}
+          {activeSection === 'projects' ? (
+            <UserFreelanceProjectsList
+              items={filteredProjectItems}
+              freelanceSubFilter={
+                projectSubTabs.find(t => t.id === projectSubTab)?.label || 'All'
+              }
+              onOpenWorkstream={handleOpenProjectWorkstream}
+            />
+          ) : loading ? (
+            <div className="py-12 text-center text-sm text-slate-400">
+              Loading your gigs...
             </div>
           ) : (
             <UserFreelanceOffersList
               gigs={filteredGigs}
-              freelanceSubFilter={activeTab === 'all' ? 'All' : activeTab === 'active' ? 'Active' : activeTab === 'paused' ? 'Paused' : activeTab === 'moderation' ? 'Under Moderation' : 'Deleted'}
+              freelanceSubFilter={
+                gigSubTabs.find(t => t.id === gigSubTab)?.label || 'All'
+              }
+              soldCountsByGigId={gigSoldCounts}
+              lastActivityByGigId={lastActivityByGigId}
               activeFeatureDropdownGigId={activeDropdownId}
               onToggleDropdown={(id, e) => {
                 e.stopPropagation();
@@ -505,12 +738,27 @@ export const FreelancerActivityView: React.FC<FreelancerActivityViewProps> = ({
                 navigate(url, e);
               }}
               onPauseResumeGig={handlePauseResume}
-              onViewGigProgress={gig => setViewingGig(gig)}
+              onViewGigProgress={handleViewGigProgress}
               onEditGig={handleOpenEdit}
               onDeleteGig={handleOpenDelete}
               getGigUrl={getGigUrl}
             />
           )}
+        </div>
+
+        {/* Right Column: MY ACTIVITY SUMMARY */}
+        <div className="lg:col-span-4">
+          <UserActivitySummarySidebar
+            activeSection={activeSection}
+            totalOffers={gigStats.postedCount}
+            activeOffersCount={gigStats.activeCount}
+            completedOrdersCount={gigStats.soldCount}
+            totalEarnings={gigStats.earnings}
+            pendingProposalsCount={projectStats.pendingProposalsCount}
+            awardedProjectsCount={projectStats.awardedCount}
+            inProgressProjectsCount={projectStats.inProgressCount}
+            projectEarnings={projectStats.earnings}
+          />
         </div>
       </div>
 
