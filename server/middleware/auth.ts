@@ -259,6 +259,9 @@ export function requireRole(allowedRoles: string[]) {
     if (!u) {
       return res.status(401).json({ error: 'User not found.' });
     }
+    if (u.status && u.status !== 'active') {
+      return res.status(403).json({ error: `Forbidden: Account is ${u.status}.` });
+    }
     if (!allowedRoles.includes(u.role)) {
       return res.status(403).json({ error: 'Forbidden: Insufficient privileges.' });
     }
@@ -279,6 +282,9 @@ export async function requireAdmin(req: Request, res: Response, next: NextFuncti
   }
   if (!u || (u.role !== 'super_admin' && u.role !== 'admin')) {
     return res.status(403).json({ error: 'Forbidden: Administrator privileges required.' });
+  }
+  if (u.status && u.status !== 'active') {
+    return res.status(403).json({ error: `Forbidden: Admin account is ${u.status}.` });
   }
   (req as any).authenticatedUserId = u.id;
   (req as any).authenticatedUser = u;

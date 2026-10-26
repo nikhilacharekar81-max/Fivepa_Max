@@ -36,9 +36,7 @@ export class FinanceRepo {
           await client.query(
             `INSERT INTO refunds (id, order_id, buyer_id, amount, reason, status, created_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
-             ON CONFLICT (id) DO UPDATE SET
-               status = EXCLUDED.status,
-               reason = COALESCE(EXCLUDED.reason, refunds.reason)`,
+             ON CONFLICT (id) DO NOTHING`,
             [ref.id, ref.orderId, ref.buyerId, ref.amount, ref.reason || null, ref.status, ref.createdAt]
           );
         }

@@ -392,71 +392,77 @@ const handlePaymentWebhook = async (req: Request, res: Response) => {
 
   const validEvents = ['payment.succeeded', 'checkout.session.completed', 'payment_intent.succeeded', 'payment.captured', 'order.approved'];
   if (validEvents.includes(event) && userId && amount) {
-    const pool = postgresStore.getPool();
     const chkId = checkoutId || sessionId;
     if (!chkId) {
       return res.status(400).json({ error: 'Authoritative checkout session ID is required for webhook payment.' });
     }
 
-    const sessRes = await pool.query(
-      'SELECT * FROM payment_checkout_sessions WHERE id = $1 OR provider_tx_id = $1 FOR UPDATE',
-      [chkId]
-    );
-
-    if (sessRes.rows.length === 0) {
-      return res.status(400).json({ error: 'Checkout session not found.' });
-    }
-
-    const sess = sessRes.rows[0];
-    if (sess.user_id !== userId) {
-      return res.status(400).json({ error: 'Checkout session user mismatch.' });
-    }
-    if (!sess.currency || sess.currency !== 'USD') {
-      return res.status(400).json({ error: 'Checkout session currency mismatch.' });
-    }
-    if (Math.abs(Number(sess.expected_amount) - Number(amount)) > 0.01) {
-      return res.status(400).json({ error: 'Checkout session amount mismatch.' });
-    }
-    if (sess.status === 'completed') {
-      // Idempotent duplicate event handling
-      return res.json({ received: true, replayed: true });
-    }
-    if (sess.status !== 'pending') {
-      return res.status(400).json({ error: `Checkout session already in status ${sess.status}` });
-    }
-
-    // Direct Provider API Object Authenticity Verification
-    const liveVerification = await paymentGatewayManager.verifyPaymentEvent({
-      gateway: sess.gateway || gateway,
-      sessionId: sess.provider_tx_id || chkId,
-      transactionId: txId,
-      expectedAmount: Number(sess.expected_amount),
-      expectedCurrency: 'USD'
-    });
-
-    if (!liveVerification.verified) {
-      return res.status(400).json({ error: `Provider payment verification failed: ${liveVerification.error}` });
-    }
-
-    await pool.query(
-      'UPDATE payment_checkout_sessions SET status = $1, provider_tx_id = $2, completed_at = NOW() WHERE id = $3',
-      ['completed', txId, sess.id]
-    );
-
-    await financialTransactionService.ensureWallet(userId);
     try {
-      await financialTransactionService.creditDeposit({
-        userId,
-        amount: Number(amount),
-        reference: reference || txId || 'WH-DEPOSIT',
-        idempotencyKey: `WH-${userId}-${sess.id}-${txId}`,
-        actor: 'Gateway Webhook',
-        source: 'webhook'
+      const result = await postgresStore.executeInTransaction(async (client) => {
+        const sessRes = await client.query(
+          'SELECT * FROM payment_checkout_sessions WHERE id = $1 OR provider_tx_id = $1 FOR UPDATE',
+          [chkId]
+        );
+
+        if (sessRes.rows.length === 0) {
+          throw { status: 400, message: 'Checkout session not found.' };
+        }
+
+        const sess = sessRes.rows[0];
+        if (sess.user_id !== userId) {
+          throw { status: 400, message: 'Checkout session user mismatch.' };
+        }
+        if (!sess.currency || sess.currency !== 'USD') {
+          throw { status: 400, message: 'Checkout session currency mismatch.' };
+        }
+        if (Math.abs(Number(sess.expected_amount) - Number(amount)) > 0.01) {
+          throw { status: 400, message: 'Checkout session amount mismatch.' };
+        }
+        if (sess.status === 'completed') {
+          // Idempotent duplicate event handling
+          return { received: true, replayed: true };
+        }
+        if (sess.status !== 'pending') {
+          throw { status: 400, message: `Checkout session already in status ${sess.status}` };
+        }
+
+        // Direct Provider API Object Authenticity Verification
+        const liveVerification = await paymentGatewayManager.verifyPaymentEvent({
+          gateway: sess.gateway || gateway,
+          sessionId: sess.provider_tx_id || chkId,
+          transactionId: txId,
+          expectedAmount: Number(sess.expected_amount),
+          expectedCurrency: 'USD'
+        });
+
+        if (!liveVerification.verified) {
+          throw { status: 400, message: `Provider payment verification failed: ${liveVerification.error}` };
+        }
+
+        await financialTransactionService.ensureWallet({ userId, role: 'buyer' }, client);
+
+        await financialTransactionService.creditDeposit({
+          userId,
+          amount: Number(amount),
+          reference: reference || txId || 'WH-DEPOSIT',
+          idempotencyKey: `WH-${userId}-${sess.id}-${txId}`,
+          actor: 'Gateway Webhook',
+          source: 'webhook'
+        }, client);
+
+        await client.query(
+          'UPDATE payment_checkout_sessions SET status = $1, provider_tx_id = $2, completed_at = NOW() WHERE id = $3',
+          ['completed', txId, sess.id]
+        );
+
+        return { received: true };
       });
+
       await syncUserBalances();
-      return res.json({ received: true });
+      return res.json(result);
     } catch (e: any) {
-      return res.status(400).json({ error: e.message });
+      const statusCode = typeof e?.status === 'number' ? e.status : 400;
+      return res.status(statusCode).json({ error: e?.message || e?.error || 'Webhook transaction failed' });
     }
   }
   res.json({ received: true });

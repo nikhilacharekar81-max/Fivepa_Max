@@ -278,7 +278,8 @@ export class PaymentGatewayManager {
             return false;
           }
 
-          const tokenRes = await fetch('https://api-m.paypal.com/v1/oauth2/token', {
+          const paypalHost = env === 'sandbox' ? 'https://api-m.sandbox.paypal.com' : 'https://api-m.paypal.com';
+          const tokenRes = await fetch(`${paypalHost}/v1/oauth2/token`, {
             method: 'POST',
             headers: {
               'Authorization': `Basic ${Buffer.from(`${gw.clientId}:${gw.clientSecret}`).toString('base64')}`,
@@ -290,7 +291,7 @@ export class PaymentGatewayManager {
           if (!tokenRes.ok) return false;
           const tokenData: any = await tokenRes.json();
 
-          const verifyRes = await fetch('https://api-m.paypal.com/v1/notifications/verify-webhook-signature', {
+          const verifyRes = await fetch(`${paypalHost}/v1/notifications/verify-webhook-signature`, {
             method: 'POST',
             headers: {
               'Authorization': `Bearer ${tokenData.access_token}`,
@@ -388,7 +389,8 @@ export class PaymentGatewayManager {
         const idToLookup = params.sessionId || params.transactionId;
         if (!idToLookup) return { verified: false, error: 'Missing order or transaction ID for PayPal verification.' };
 
-        const tokenRes = await fetch('https://api-m.paypal.com/v1/oauth2/token', {
+        const paypalHost = env === 'sandbox' ? 'https://api-m.sandbox.paypal.com' : 'https://api-m.paypal.com';
+        const tokenRes = await fetch(`${paypalHost}/v1/oauth2/token`, {
           method: 'POST',
           headers: {
             'Authorization': `Basic ${Buffer.from(`${gw.clientId}:${gw.clientSecret}`).toString('base64')}`,
@@ -399,7 +401,7 @@ export class PaymentGatewayManager {
         if (!tokenRes.ok) return { verified: false, error: 'PayPal OAuth handshake failed.' };
         const tokenData: any = await tokenRes.json();
 
-        const orderRes = await fetch(`https://api-m.paypal.com/v2/checkout/orders/${idToLookup}`, {
+        const orderRes = await fetch(`${paypalHost}/v2/checkout/orders/${idToLookup}`, {
           headers: { 'Authorization': `Bearer ${tokenData.access_token}` }
         });
         if (!orderRes.ok) return { verified: false, error: `PayPal order lookup failed (${orderRes.status})` };
@@ -493,6 +495,9 @@ export class PaymentGatewayManager {
           throw new Error(`Stripe transfer lookup failed with status ${response.status}`);
         }
         const data: any = await response.json();
+        if (data.reversed || (data.amount_reversed || 0) > 0) {
+          throw new Error(`Stripe transfer ${ref} has been reversed.`);
+        }
         if (data.currency?.toLowerCase() !== 'usd') {
           throw new Error('Payout currency mismatch: expected USD');
         }
@@ -501,7 +506,8 @@ export class PaymentGatewayManager {
         }
         return { verified: true, providerTxId: data.id, status: 'settled' };
       } else if (gwName === 'paypal' && gw && gw.clientId && gw.clientSecret) {
-        const tokenRes = await fetch('https://api-m.paypal.com/v1/oauth2/token', {
+        const paypalHost = env === 'sandbox' ? 'https://api-m.sandbox.paypal.com' : 'https://api-m.paypal.com';
+        const tokenRes = await fetch(`${paypalHost}/v1/oauth2/token`, {
           method: 'POST',
           headers: {
             'Authorization': `Basic ${Buffer.from(`${gw.clientId}:${gw.clientSecret}`).toString('base64')}`,
@@ -511,13 +517,17 @@ export class PaymentGatewayManager {
         });
         if (!tokenRes.ok) throw new Error('PayPal auth handshake failed during payout verification.');
         const tokenData: any = await tokenRes.json();
-        const payoutRes = await fetch(`https://api-m.paypal.com/v1/payments/payouts-item/${ref}`, {
+        const payoutRes = await fetch(`${paypalHost}/v1/payments/payouts-item/${ref}`, {
           headers: { 'Authorization': `Bearer ${tokenData.access_token}` }
         });
         if (!payoutRes.ok) {
           throw new Error(`PayPal payout item lookup failed with status ${payoutRes.status}`);
         }
         const payoutData: any = await payoutRes.json();
+        const pStatus = payoutData.payout_item?.transaction_status;
+        if (pStatus !== 'SUCCESS') {
+          throw new Error(`PayPal payout transaction status is "${pStatus}". Expected terminal status "SUCCESS".`);
+        }
         const pVal = Number(payoutData.payout_item?.amount?.value || 0);
         const pCurr = payoutData.payout_item?.amount?.currency;
         if (pCurr !== 'USD') throw new Error('PayPal payout currency mismatch: expected USD.');
@@ -532,6 +542,9 @@ export class PaymentGatewayManager {
           throw new Error(`Razorpay payout lookup failed with status ${razorRes.status}`);
         }
         const razorData: any = await razorRes.json();
+        if (razorData.status !== 'processed') {
+          throw new Error(`Razorpay payout status is "${razorData.status}". Expected terminal status "processed".`);
+        }
         const rVal = Number(razorData.amount || 0) / 100;
         if (razorData.currency !== 'USD') throw new Error('Razorpay payout currency mismatch: expected USD.');
         if (Math.abs(rVal - params.amount) > 0.01) throw new Error('Razorpay payout amount mismatch.');
@@ -614,7 +627,8 @@ export class PaymentGatewayManager {
           checkoutUrl: data.url || `/checkout/pay?session_id=${params.checkoutId}`
         };
       } else if (params.gateway === 'paypal') {
-        const tokenRes = await fetch('https://api-m.paypal.com/v1/oauth2/token', {
+        const paypalHost = env === 'sandbox' ? 'https://api-m.sandbox.paypal.com' : 'https://api-m.paypal.com';
+        const tokenRes = await fetch(`${paypalHost}/v1/oauth2/token`, {
           method: 'POST',
           headers: {
             'Authorization': `Basic ${Buffer.from(`${gw.clientId}:${gw.clientSecret}`).toString('base64')}`,
@@ -624,7 +638,7 @@ export class PaymentGatewayManager {
         });
         if (!tokenRes.ok) throw new Error('PayPal auth handshake failed.');
         const tokenData: any = await tokenRes.json();
-        const orderRes = await fetch('https://api-m.paypal.com/v2/checkout/orders', {
+        const orderRes = await fetch(`${paypalHost}/v2/checkout/orders`, {
           method: 'POST',
           headers: {
             'Authorization': `Bearer ${tokenData.access_token}`,
@@ -706,7 +720,8 @@ export class PaymentGatewayManager {
         }
         return { success: true, message: `Stripe (${env}) connection verified successfully via live balance handshake.` };
       } else if (gatewayName === 'paypal') {
-        const tokenRes = await fetch('https://api-m.paypal.com/v1/oauth2/token', {
+        const paypalHost = env === 'sandbox' ? 'https://api-m.sandbox.paypal.com' : 'https://api-m.paypal.com';
+        const tokenRes = await fetch(`${paypalHost}/v1/oauth2/token`, {
           method: 'POST',
           headers: {
             'Authorization': `Basic ${Buffer.from(`${gw.clientId}:${gw.clientSecret}`).toString('base64')}`,

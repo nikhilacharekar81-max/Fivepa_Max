@@ -594,6 +594,8 @@ CREATE TABLE IF NOT EXISTS payment_checkout_sessions (
 
 CREATE INDEX IF NOT EXISTS idx_payment_checkout_sessions_user ON payment_checkout_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_payment_checkout_sessions_status ON payment_checkout_sessions(status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_checkout_sessions_provider_tx_id ON payment_checkout_sessions (provider_tx_id) WHERE provider_tx_id IS NOT NULL AND status = 'completed';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_order_reviewer ON reviews (order_id, reviewer_id) WHERE order_id IS NOT NULL AND reviewer_id IS NOT NULL;
 
 -- Referential Integrity Foreign Key Constraints
 DO $$ BEGIN

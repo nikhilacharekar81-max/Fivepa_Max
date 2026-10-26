@@ -250,7 +250,12 @@ export async function handleLogin(req: Request, res: Response) {
             [`login:${key}`, Date.now(), expiresAt]
           );
         }
-      } catch {}
+      } catch (err) {
+        console.error('[Auth] Failed to persist failed login attempt:', err);
+        if (IS_PRODUCTION) {
+          throw new Error('Security verification rate-limiting write failed in production.');
+        }
+      }
     } else {
       for (const key of attemptKeys) {
         const record = loginAttempts.get(key) || { count: 0, resetAt: Date.now() + cooldownMs };
