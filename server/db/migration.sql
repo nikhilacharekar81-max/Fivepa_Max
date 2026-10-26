@@ -57,13 +57,19 @@ CREATE TABLE IF NOT EXISTS gigs (
   cover_image TEXT,
   gallery TEXT[],
   tags TEXT[],
-  status VARCHAR(32) DEFAULT 'published',
+  status VARCHAR(32) DEFAULT 'active',
   featured BOOLEAN DEFAULT FALSE,
   extras JSONB,
   moderation_status VARCHAR(32) DEFAULT 'approved',
   moderation_notes TEXT,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Canonical gig statuses: active, paused, moderation, deleted
+UPDATE gigs SET status = 'active' WHERE status = 'published';
+UPDATE gigs SET status = 'moderation' WHERE status IN ('pending', 'draft') OR (status NOT IN ('active', 'paused', 'deleted') AND moderation_status IN ('pending', 'rejected', 'flagged'));
+UPDATE gigs SET status = 'active' WHERE status NOT IN ('active', 'paused', 'moderation', 'deleted');
+ALTER TABLE gigs ALTER COLUMN status SET DEFAULT 'active';
 
 CREATE TABLE IF NOT EXISTS projects (
   id VARCHAR(64) PRIMARY KEY,
@@ -704,5 +710,22 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
+CREATE TABLE IF NOT EXISTS reconciliation_exceptions (
+  id VARCHAR(64) PRIMARY KEY,
+  type VARCHAR(64) NOT NULL,
+  entity_id VARCHAR(128) NOT NULL,
+  amount NUMERIC(14,2) DEFAULT 0.00 NOT NULL,
+  currency VARCHAR(8) DEFAULT 'USD' NOT NULL,
+  description TEXT NOT NULL,
+  status VARCHAR(32) DEFAULT 'open' NOT NULL,
+  assigned_to VARCHAR(128),
+  investigation_notes TEXT,
+  resolved_by VARCHAR(255),
+  resolved_at VARCHAR(64),
+  detected_at VARCHAR(64) NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
 
-
+CREATE INDEX IF NOT EXISTS idx_reconciliation_exceptions_status ON reconciliation_exceptions(status);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_exceptions_entity ON reconciliation_exceptions(entity_id);

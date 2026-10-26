@@ -95,9 +95,15 @@ export const ViewingGigModal: React.FC<ViewingGigModalProps> = ({
           <div className="flex items-center justify-between">
             <span className="text-xs font-bold uppercase tracking-wider text-fiverr-dark">Live Gig Progress & Analytics</span>
             <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase ${
-              viewingGig.status === 'published' ? 'bg-emerald-100 text-emerald-800 border border-emerald-200' : 'bg-slate-100 text-slate-700 border border-slate-200'
+              viewingGig.status === 'active' ? 'bg-emerald-100 text-emerald-800 border border-emerald-200' :
+              viewingGig.status === 'paused' ? 'bg-amber-100 text-amber-800 border border-amber-200' :
+              viewingGig.status === 'moderation' ? 'bg-blue-100 text-blue-800 border border-blue-200' :
+              'bg-slate-100 text-slate-700 border border-slate-200'
             }`}>
-              {viewingGig.status === 'published' ? 'Active & Published' : 'Paused / Suspended'}
+              {viewingGig.status === 'active' ? 'Active' :
+               viewingGig.status === 'paused' ? 'Paused' :
+               viewingGig.status === 'moderation' ? 'Under Moderation' :
+               viewingGig.status === 'deleted' ? 'Deleted' : viewingGig.status}
             </span>
           </div>
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-center">

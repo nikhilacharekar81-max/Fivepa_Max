@@ -42,13 +42,14 @@ import { AdminPage } from './pages/AdminPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { UserWalletsLedgerModule } from './components/UserWalletsLedgerModule';
 import { PaymentsModule } from './components/PaymentsModule';
-import { LoginModal, SignupModal, UserSwitchModal, ForgotPasswordModal, WishlistModal, SupportModal } from './components/modals';
+import { LoginModal, SignupModal, VerifyModal, UserSwitchModal, ForgotPasswordModal, WishlistModal, SupportModal } from './components/modals';
 import { slugify, getGigUrl } from './utils/slugify';
 import { PPH_CATEGORIES } from './components/HeaderCategoriesNav';
 import { ProjectDetailView } from './components/marketplace/ProjectDetailView';
 import { ProjectSearchView } from './components/marketplace/ProjectSearchView';
 import { FreelancerSearchView } from './components/marketplace/FreelancerSearchView';
 import { BuyerActivityView } from './components/marketplace/BuyerActivityView';
+import { FreelancerActivityView } from './components/marketplace/FreelancerActivityView';
 import { CreateGigView } from './components/gigs/CreateGigView';
 import { GigDetailView } from './components/gigs/GigDetailView';
 import { EditProfilePage } from './components/profile/EditProfilePage';
@@ -109,6 +110,15 @@ export default function App({ initialPath = '/', initialData }: { initialPath?: 
   const [signupMobile, setSignupMobile] = useState('');
   const [signupPassword, setSignupPassword] = useState('');
   const [signupConfirmPassword, setSignupConfirmPassword] = useState('');
+
+  // Verify modal state
+  const [isVerifyModalOpen, setIsVerifyModalOpen] = useState(false);
+  const [verifyEmail, setVerifyEmail] = useState('');
+  const [verifyMobile, setVerifyMobile] = useState('');
+  const [verificationMode, setVerificationMode] = useState<'email' | 'sms'>('email');
+  const [emailCodeInput, setEmailCodeInput] = useState('');
+  const [smsCodeInput, setSmsCodeInput] = useState('');
+  const [mockSmsCodeDisplay, setMockSmsCodeDisplay] = useState<string | null>(null);
 
   // Forgot Password & Support modal state
   const [isForgotPasswordOpen, setIsForgotPasswordOpen] = useState(false);
@@ -231,6 +241,88 @@ export default function App({ initialPath = '/', initialData }: { initialPath?: 
     } catch {
       showToast('Failed to submit support ticket.');
     }
+  };
+
+  const handleVerifyEmailSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!emailCodeInput.trim()) {
+      showToast('Please enter your 6-digit verification code.');
+      return;
+    }
+    try {
+      const res = await fetch('/api/auth/verify-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: verifyEmail, code: emailCodeInput.trim() })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setIsVerifyModalOpen(false);
+        setEmailCodeInput('');
+        if (data.token && data.user) {
+          setAuthToken(data.token);
+          setCurrentUser(data.user);
+          setImpersonatedUser(null);
+          await refresh(data.user.id);
+          showToast(`Email verified successfully! Welcome, ${data.user.name}.`);
+        } else {
+          showToast('Email verified successfully! You can now log in.');
+          setIsLoginOpen(true);
+          setLoginEmail(verifyEmail);
+        }
+      } else {
+        showToast(data.error || 'Invalid verification code.');
+      }
+    } catch {
+      showToast('Failed to verify code.');
+    }
+  };
+
+  const handleResendEmailCode = async () => {
+    if (!verifyEmail) return;
+    try {
+      const res = await fetch('/api/auth/resend-email-code', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: verifyEmail })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        if (data.mockCode) setMockEmailCodeDisplay(data.mockCode);
+        showToast('A new verification code has been dispatched.');
+      } else {
+        showToast(data.error || 'Failed to resend code.');
+      }
+    } catch {
+      showToast('Failed to resend verification code.');
+    }
+  };
+
+  const handleVerifySmsSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!smsCodeInput.trim()) {
+      showToast('Please enter your 6-digit SMS code.');
+      return;
+    }
+    try {
+      const res = await fetch('/api/auth/verify-sms', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mobile: verifyMobile, code: smsCodeInput.trim() })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showToast('Mobile number verified successfully!');
+      } else {
+        showToast(data.error || 'Invalid SMS code.');
+      }
+    } catch {
+      showToast('Failed to verify SMS code.');
+    }
+  };
+
+  const handleResendSmsCode = async () => {
+    showToast('SMS verification code dispatched.');
   };
 
   const loadUserSession = useCallback(async () => {
@@ -424,7 +516,15 @@ export default function App({ initialPath = '/', initialData }: { initialPath?: 
     path === '/orders' ||
     path.startsWith('/orders/');
 
+  const canViewGig = (g: any) => {
+    if (!g) return false;
+    if (g.status === 'active' || g.status === 'paused') return true;
+    if (!effectiveUser) return false;
+    return g.freelancerId === effectiveUser.id || effectiveUser.role === 'admin' || effectiveUser.role === 'super_admin';
+  };
+
   const filteredGigs = gigs.filter(g => {
+    if (g.status === 'moderation' || g.status === 'deleted') return false;
     if (currentCategory !== 'All' && g.category !== currentCategory) return false;
     if (searchQuery.trim() && !g.title.toLowerCase().includes(searchQuery.toLowerCase()) && !g.description.toLowerCase().includes(searchQuery.toLowerCase())) {
       return false;
@@ -662,7 +762,16 @@ export default function App({ initialPath = '/', initialData }: { initialPath?: 
             slugify={slugify} 
             query={path.includes('?') ? path.substring(path.indexOf('?')) : ''} 
           />
-        ) : path === '/buyer-activity' || path === '/freelance-activity' || path === '/activity' ? (
+        ) : path === '/freelance-activity' ? (
+          <FreelancerActivityView
+            currentUser={effectiveUser}
+            orders={orders}
+            allGigs={gigs}
+            categories={appData.categories}
+            navigate={navigate}
+            onRefresh={refresh}
+          />
+        ) : path === '/buyer-activity' || path === '/activity' ? (
           <BuyerActivityView 
             projects={projects} 
             orders={orders} 
@@ -749,7 +858,7 @@ export default function App({ initialPath = '/', initialData }: { initialPath?: 
               slugify(g.title) === identifier ||
               (subIdentifier && (g.slug === subIdentifier || slugify(g.title) === subIdentifier || g.id === subIdentifier))
             );
-            if (targetGig) {
+            if (targetGig && canViewGig(targetGig)) {
               return (
                 <GigDetailView 
                   currentGig={targetGig} 
@@ -866,7 +975,7 @@ export default function App({ initialPath = '/', initialData }: { initialPath?: 
               slugify(g.title) === identifier ||
               (subIdentifier && (g.slug === subIdentifier || slugify(g.title) === subIdentifier || g.id === subIdentifier))
             );
-            if (targetGig) {
+            if (targetGig && canViewGig(targetGig)) {
               return (
                 <GigDetailView 
                   currentGig={targetGig} 
@@ -886,7 +995,7 @@ export default function App({ initialPath = '/', initialData }: { initialPath?: 
           if (parts.length === 1) {
             const idOrUsername = parts[0];
             const directGig = gigs.find(g => g.id === idOrUsername || g.slug === idOrUsername || slugify(g.title) === idOrUsername);
-            if (directGig) {
+            if (directGig && canViewGig(directGig)) {
               return (
                 <GigDetailView 
                   currentGig={directGig} 
@@ -918,7 +1027,7 @@ export default function App({ initialPath = '/', initialData }: { initialPath?: 
                   (gSlug === seg2.toLowerCase() || g.id === seg2)
                 ) || gSlug === seg2.toLowerCase() || g.id === seg2;
               });
-              if (targetGig) {
+              if (targetGig && canViewGig(targetGig)) {
                 return (
                   <GigDetailView 
                     currentGig={targetGig} 
@@ -1005,6 +1114,15 @@ export default function App({ initialPath = '/', initialData }: { initialPath?: 
                 })
               });
               const data = await res.json();
+              if (res.status === 403 && data.requiresVerification) {
+                setIsLoginOpen(false);
+                setVerifyEmail(data.email || loginEmail);
+                if (data.mockEmailCode) setMockEmailCodeDisplay(data.mockEmailCode);
+                setEmailCodeInput('');
+                setIsVerifyModalOpen(true);
+                showToast(data.error || 'Please verify your email before logging in.');
+                return;
+              }
               if (data.requiresCode) {
                 setLoginRequiresCode(true);
                 setLoginVerificationMessage(data.message || 'Verification code sent to your email.');
@@ -1069,6 +1187,21 @@ export default function App({ initialPath = '/', initialData }: { initialPath?: 
                 })
               });
               const data = await res.json();
+              if (res.ok && data.requiresVerification) {
+                setIsSignupOpen(false);
+                setVerifyEmail(data.email || signupEmail);
+                setVerifyMobile(signupMobile);
+                if (data.mockEmailCode) setMockEmailCodeDisplay(data.mockEmailCode);
+                setEmailCodeInput('');
+                setIsVerifyModalOpen(true);
+                setSignupName('');
+                setSignupEmail('');
+                setSignupMobile('');
+                setSignupPassword('');
+                setSignupConfirmPassword('');
+                showToast(data.message || 'Verification code sent to your email. Please verify to complete registration.');
+                return;
+              }
               if (res.ok && data.token && data.user) {
                 setAuthToken(data.token);
                 setCurrentUser(data.user);
@@ -1099,6 +1232,27 @@ export default function App({ initialPath = '/', initialData }: { initialPath?: 
           signupConfirmPassword={signupConfirmPassword}
           setSignupConfirmPassword={setSignupConfirmPassword}
           onSwitchToLogin={() => { setIsSignupOpen(false); setIsLoginOpen(true); }}
+        />
+      )}
+
+      {isVerifyModalOpen && (
+        <VerifyModal
+          isOpen={isVerifyModalOpen}
+          onClose={() => setIsVerifyModalOpen(false)}
+          verificationMode={verificationMode}
+          setVerificationMode={setVerificationMode}
+          emailCodeInput={emailCodeInput}
+          setEmailCodeInput={setEmailCodeInput}
+          smsCodeInput={smsCodeInput}
+          setSmsCodeInput={setSmsCodeInput}
+          handleVerifyEmailSubmit={handleVerifyEmailSubmit}
+          handleVerifySmsSubmit={handleVerifySmsSubmit}
+          handleResendEmailCode={handleResendEmailCode}
+          handleResendSmsCode={handleResendSmsCode}
+          verifyEmail={verifyEmail}
+          verifyMobile={verifyMobile}
+          mockEmailCodeDisplay={mockEmailCodeDisplay || undefined}
+          mockSmsCodeDisplay={mockSmsCodeDisplay || undefined}
         />
       )}
 

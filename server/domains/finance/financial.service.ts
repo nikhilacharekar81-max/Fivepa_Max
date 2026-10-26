@@ -3,7 +3,7 @@ import { diagnosticService } from '../../services/diagnosticService.js';
 import { financeLedger, FinanceLedgerEngine } from './financeLedger.js';
 import { paymentGatewayManager } from './paymentGateways.js';
 import { randomUUID } from 'crypto';
-import type { UserWallet, EscrowRecord, LedgerJournal, FinancialTransaction } from './financeLedger.js';
+import type { UserWallet, EscrowRecord, LedgerJournal, FinancialTransaction, ReconciliationException } from './financeLedger.js';
 import {
   calculateOrderFees,
   calculateDifferentialFees,
@@ -12,6 +12,14 @@ import {
   DEFAULT_FEE_CONFIG,
   toCents
 } from './fees.js';
+
+function assertPostgresAvailable(): void {
+  const customEnabled = typeof (postgresStore as any).isEnabled === 'function' ? (postgresStore as any).isEnabled() : true;
+  if (!isPostgresEnabled() || !customEnabled) {
+    throw new Error('PostgreSQL persistence is required for all financial operations. In-memory ledger fallback is disabled.');
+  }
+}
+
 
 export interface FinancialOverview {
   totalWallets: number;
@@ -186,57 +194,68 @@ export class FinancialRepository {
     };
   }
 
+  public formatReconciliationExceptionRow(r: any): ReconciliationException {
+    return {
+      id: r.id,
+      type: r.type,
+      entityId: r.entity_id,
+      amount: Number(r.amount || 0),
+      currency: (r.currency || 'USD') as 'USD',
+      description: r.description || '',
+      status: r.status || 'open',
+      assignedTo: r.assigned_to || undefined,
+      investigationNotes: r.investigation_notes || undefined,
+      resolvedBy: r.resolved_by || undefined,
+      resolvedAt: r.resolved_at || undefined,
+      detectedAt: r.detected_at || (r.created_at ? new Date(r.created_at).toISOString() : new Date().toISOString())
+    };
+  }
+
   async hydrateFromPostgres() {
     // No-op: Direct live database queries used exclusively.
   }
 
+  async hasWallet(userId: string): Promise<boolean> {
+    assertPostgresAvailable();
+    const res = await postgresStore.getPool().query('SELECT 1 FROM wallets WHERE user_id = $1 LIMIT 1', [userId]);
+    return res.rows.length > 0;
+  }
+
+  async getAuditLogs(): Promise<any[]> {
+    assertPostgresAvailable();
+    return postgresStore.listAuditLogs();
+  }
+
   async getWallet(userId: string): Promise<UserWallet | null> {
-    if (!isPostgresEnabled()) {
-      const w = financeLedger.getWalletById(userId);
-      return w ? w.wallet : null;
-    }
+    assertPostgresAvailable();
     const res = await postgresStore.getPool().query('SELECT * FROM wallets WHERE user_id = $1', [userId]);
     if (res.rows.length === 0) return null;
     return this.formatWalletRow(res.rows[0]);
   }
 
   async getWalletById(userId: string): Promise<{ wallet: UserWallet; movements: any[] } | null> {
+    assertPostgresAvailable();
     const wallet = await this.getWallet(userId);
     if (!wallet) return null;
-    let movements: any[] = [];
-    if (!isPostgresEnabled()) {
-      const res = financeLedger.getWalletById(userId);
-      if (!res) return null;
-      return { wallet: res.wallet, movements: res.transactions || [] };
-    }
-    try {
-      const res = await postgresStore.getPool().query('SELECT * FROM wallet_movements WHERE user_id = $1 ORDER BY created_at DESC', [userId]);
-      movements = res.rows;
-    } catch {}
-    return { wallet, movements };
+    const res = await postgresStore.getPool().query('SELECT * FROM wallet_movements WHERE user_id = $1 ORDER BY created_at DESC', [userId]);
+    return { wallet, movements: res.rows };
   }
 
   async getWalletBalance(userId: string): Promise<number> {
-    if (!isPostgresEnabled()) {
-      return financeLedger.getWalletBalance(userId) || 0;
-    }
+    assertPostgresAvailable();
     const res = await postgresStore.getPool().query('SELECT available_balance FROM wallets WHERE user_id = $1', [userId]);
     if (res.rows.length === 0) return 0;
     return Number(res.rows[0].available_balance);
   }
 
   async getWallets(): Promise<UserWallet[]> {
-    if (!isPostgresEnabled()) {
-      return financeLedger.getWallets();
-    }
+    assertPostgresAvailable();
     const res = await postgresStore.getPool().query('SELECT * FROM wallets ORDER BY user_id ASC');
     return res.rows.map(r => this.formatWalletRow(r));
   }
 
   async getEscrow(orderId: string): Promise<EscrowRecord | null> {
-    if (!isPostgresEnabled()) {
-      return financeLedger.getEscrow(orderId) || null;
-    }
+    assertPostgresAvailable();
     const res = await postgresStore.getPool().query('SELECT * FROM escrows WHERE order_id = $1', [orderId]);
     if (res.rows.length === 0) {
       return null;
@@ -245,15 +264,13 @@ export class FinancialRepository {
   }
 
   async getEscrows(): Promise<EscrowRecord[]> {
-    if (!isPostgresEnabled()) {
-      return financeLedger.getEscrows();
-    }
+    assertPostgresAvailable();
     const res = await postgresStore.getPool().query('SELECT * FROM escrows ORDER BY funded_at DESC');
     return res.rows.map(r => this.formatEscrowRow(r));
   }
 
   async getBuyerHeldEscrowTotal(buyerId: string): Promise<number> {
-    if (!isPostgresEnabled()) return 0;
+    assertPostgresAvailable();
     const res = await postgresStore.getPool().query(
       "SELECT COALESCE(SUM(remaining), 0) AS total FROM escrows WHERE buyer_id = $1 AND status = 'held'",
       [buyerId]
@@ -262,7 +279,7 @@ export class FinancialRepository {
   }
 
   async getFreelancerHeldEscrowTotal(sellerId: string): Promise<number> {
-    if (!isPostgresEnabled()) return 0;
+    assertPostgresAvailable();
     const res = await postgresStore.getPool().query(
       "SELECT COALESCE(SUM(remaining), 0) AS total FROM escrows WHERE seller_id = $1 AND status = 'held'",
       [sellerId]
@@ -271,10 +288,7 @@ export class FinancialRepository {
   }
 
   async getTransactions(userId?: string): Promise<FinancialTransaction[]> {
-    if (!isPostgresEnabled()) {
-      const all = financeLedger.getTransactions();
-      return userId ? all.filter(t => t.userId === userId) : all;
-    }
+    assertPostgresAvailable();
     const pool = postgresStore.getPool();
     let query = `
       SELECT wm.*, w.user_name, w.user_role
@@ -304,9 +318,7 @@ export class FinancialRepository {
   }
 
   async getTransactionById(id: string): Promise<FinancialTransaction | null> {
-    if (!isPostgresEnabled()) {
-      return financeLedger.getTransactionById(id) || null;
-    }
+    assertPostgresAvailable();
     const res = await postgresStore.getPool().query(
       `SELECT wm.*, w.user_name, w.user_role FROM wallet_movements wm LEFT JOIN wallets w ON w.user_id = wm.user_id WHERE wm.id = $1`,
       [id]
@@ -329,10 +341,7 @@ export class FinancialRepository {
   }
 
   async getJournals(orderId?: string): Promise<LedgerJournal[]> {
-    if (!isPostgresEnabled()) {
-      const all = financeLedger.getJournals();
-      return orderId ? all.filter(j => j.entries.some(e => e.orderId === orderId)) : all;
-    }
+    assertPostgresAvailable();
     const pool = postgresStore.getPool();
     let query = `
       SELECT j.*, 
@@ -389,9 +398,7 @@ export class FinancialRepository {
   }
 
   async getJournalById(id: string): Promise<LedgerJournal | null> {
-    if (!isPostgresEnabled()) {
-      return financeLedger.getJournalById(id) || null;
-    }
+    assertPostgresAvailable();
     const jRes = await postgresStore.getPool().query('SELECT * FROM ledger_journals WHERE id = $1', [id]);
     if (jRes.rows.length === 0) return null;
     const j = jRes.rows[0];
@@ -426,9 +433,7 @@ export class FinancialRepository {
   }
 
   async hasOutstandingFunds(userId: string): Promise<boolean> {
-    if (!isPostgresEnabled()) {
-      return financeLedger.hasOutstandingFunds(userId);
-    }
+    assertPostgresAvailable();
     const pool = postgresStore.getPool();
     const [wRes, eRes] = await Promise.all([
       pool.query('SELECT available_balance, funds_on_hold, pending_withdrawals FROM wallets WHERE user_id = $1', [userId]),
@@ -447,6 +452,7 @@ export class FinancialRepository {
   }
 
   async previewAdjustment(params: { userId: string; amount: number; direction: 'credit_user' | 'debit_user'; category: string; reason: string }): Promise<any> {
+    assertPostgresAvailable();
     const curBal = await this.getWalletBalance(params.userId);
     const delta = params.direction === 'credit_user' ? params.amount : -params.amount;
     const projectedBalance = Number((curBal + delta).toFixed(2));
@@ -461,7 +467,8 @@ export class FinancialRepository {
     };
   }
 
-  async generateCsvExport(type: string, query?: any): Promise<{ filename: string; content: string }> {
+  async generateCsvExport(type: string, _query?: any): Promise<{ filename: string; content: string }> {
+    assertPostgresAvailable();
     const escapeCsvCell = (val: any): string => {
       if (val === null || val === undefined) return '""';
       let s = String(val);
@@ -474,9 +481,6 @@ export class FinancialRepository {
       return `"${s}"`;
     };
 
-    if (!isPostgresEnabled()) {
-      return financeLedger.generateCsvExport(type, query);
-    }
     const pool = postgresStore.getPool();
     const now = new Date().toISOString().split('T')[0];
     if (type === 'wallets') {
@@ -523,20 +527,7 @@ export class FinancialRepository {
   }
 
   async getTrialBalance() {
-    if (!isPostgresEnabled()) {
-      const tb = financeLedger.getReconciliationSummary().trialBalance;
-      const accounts: Record<string, { debit: number; credit: number; balance: number }> = {};
-      for (const a of tb.accounts) {
-        accounts[a.code] = { debit: a.totalDebits, credit: a.totalCredits, balance: a.netBalance };
-      }
-      return {
-        balanced: tb.isBalanced,
-        totalDebits: tb.totalDebits,
-        totalCredits: tb.totalCredits,
-        discrepancy: tb.difference,
-        accounts
-      };
-    }
+    assertPostgresAvailable();
     const res = await postgresStore.getPool().query(`
       SELECT account_code, 
              COALESCE(SUM(debit), 0) as total_debit, 
@@ -572,26 +563,7 @@ export class FinancialRepository {
   }
 
   async getFinancialOverview(): Promise<FinancialOverview> {
-    if (!isPostgresEnabled()) {
-      const ov = financeLedger.getFinancialOverview();
-      const wallets = financeLedger.getWallets();
-      const escrows = financeLedger.getEscrows();
-      return {
-        totalWallets: ov.totalWalletsCount,
-        totalAvailable: ov.totalUserWalletLiabilities,
-        totalFundsOnHold: wallets.reduce((s, w) => s + w.fundsOnHold, 0),
-        totalPendingWithdrawals: wallets.reduce((s, w) => s + w.pendingWithdrawals, 0),
-        totalEscrowsHeld: ov.fundsHeldInEscrow,
-        countEscrowsHeld: escrows.filter(e => e.status === 'held').length,
-        totalPlatformRevenue: ov.revenueBreakdown.commission,
-        totalServiceFees: ov.revenueBreakdown.clientServiceFees,
-        totalSmallOrderFees: ov.revenueBreakdown.smallOrderFees,
-        totalEarningsClearing: 0,
-        totalTransactions: financeLedger.getTransactions().length,
-        totalJournals: ov.totalJournalsPosted
-      };
-    }
-
+    assertPostgresAvailable();
     const pool = postgresStore.getPool();
     const [
       walletsRes,
@@ -629,20 +601,45 @@ export class FinancialRepository {
     };
   }
 
+  async getReconciliationExceptions(status?: string): Promise<ReconciliationException[]> {
+    assertPostgresAvailable();
+    const pool = postgresStore.getPool();
+    let query = 'SELECT * FROM reconciliation_exceptions';
+    const params: any[] = [];
+    if (status) {
+      query += ' WHERE status = $1';
+      params.push(status);
+    }
+    query += ' ORDER BY detected_at DESC, created_at DESC';
+    const res = await pool.query(query, params);
+    return res.rows.map(r => this.formatReconciliationExceptionRow(r));
+  }
+
+  async getReconciliationException(id: string): Promise<ReconciliationException | null> {
+    assertPostgresAvailable();
+    const pool = postgresStore.getPool();
+    const res = await pool.query('SELECT * FROM reconciliation_exceptions WHERE id = $1', [id]);
+    if (res.rows.length === 0) return null;
+    return this.formatReconciliationExceptionRow(res.rows[0]);
+  }
+
   async getReconciliationSummary() {
+    assertPostgresAvailable();
     const pool = postgresStore.getPool();
     const [
       walletsRes,
       escrowsRes,
       tbRes,
       clearingRes,
-      payoutsRes
+      payoutsRes,
+      exceptions
     ] = await Promise.all([
       pool.query('SELECT COALESCE(SUM(available_balance), 0) AS available, COALESCE(SUM(funds_on_hold), 0) AS on_hold, COALESCE(SUM(pending_withdrawals), 0) AS pending FROM wallets'),
       pool.query("SELECT COALESCE(SUM(remaining), 0) AS held FROM escrows WHERE status = 'held'"),
       this.getTrialBalance(),
       pool.query("SELECT COALESCE(SUM(amount), 0) AS clearing FROM earnings_clearing WHERE status = 'clearing'"),
-      pool.query("SELECT COALESCE(SUM(amount), 0) AS pending_payouts FROM payouts WHERE status IN ('pending', 'approved')")
+      pool.query("SELECT COALESCE(SUM(amount), 0) AS pending_payouts FROM payouts WHERE status IN ('pending', 'approved')"),
+      this.getReconciliationExceptions()
     ]);
 
     const walletAvailable = Number(walletsRes.rows[0]?.available || 0);
@@ -652,7 +649,6 @@ export class FinancialRepository {
     const clearingAmount = Number(clearingRes.rows[0]?.clearing || 0);
     const pendingPayouts = Number(payoutsRes.rows[0]?.pending_payouts || 0);
 
-    const acct1010 = tbRes.accounts['1010'] ? tbRes.accounts['1010'].balance : 0;
     const acct2030 = tbRes.accounts['2030'] ? Math.abs(tbRes.accounts['2030'].balance) : 0;
     const acct2040 = tbRes.accounts['2040'] ? Math.abs(tbRes.accounts['2040'].balance) : 0;
     const acct2050 = tbRes.accounts['2050'] ? Math.abs(tbRes.accounts['2050'].balance) : 0;
@@ -677,10 +673,14 @@ export class FinancialRepository {
       issues.push(`Trial balance discrepancy: Debits ($${tbRes.totalDebits}) !== Credits ($${tbRes.totalCredits})`);
     }
 
+    const openExceptions = exceptions.filter(e => e.status !== 'resolved');
+
     return {
-      healthy: issues.length === 0,
+      healthy: issues.length === 0 && openExceptions.length === 0,
       timestamp: new Date().toISOString(),
       issues,
+      exceptions,
+      openExceptionsCount: openExceptions.length,
       walletAvailable,
       walletOnHold,
       walletPending,
@@ -752,15 +752,7 @@ export class FinancialTransactionService {
       externalClient = maybeNameOrClient;
     }
 
-    if (!isPostgresEnabled()) {
-      financeLedger.ensureWallet({
-        userId: params.userId,
-        name: params.name || `User ${params.userId}`,
-        email: params.email || `${params.userId}@example.com`,
-        role: (params.role as any) || 'buyer'
-      });
-      return;
-    }
+    assertPostgresAvailable();
     const run = async (client: any) => {
       const existing = await client.query('SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE', [params.userId]);
       if (existing.rows.length === 0) {
@@ -827,16 +819,7 @@ export class FinancialTransactionService {
       throw new Error('Buyer and seller cannot be the same account');
     }
 
-    if (!isPostgresEnabled()) {
-      return financeLedger.fundEscrow({
-        orderId: params.orderId,
-        orderTitle: params.orderTitle,
-        amount: params.amount,
-        buyerId: params.buyerId,
-        sellerId: params.sellerId,
-        actor: params.actor
-      });
-    }
+    assertPostgresAvailable();
 
     const run = async (client: any) => {
       // Order validation & test synthetic auto-provisioning
@@ -1003,19 +986,7 @@ export class FinancialTransactionService {
   }
 
   async releaseOrderFunds(params: { orderId: string; actor: string; reason?: string; idempotencyKey?: string; }, externalClient?: any) {
-    if (!isPostgresEnabled()) {
-      const rel = financeLedger.releaseEscrow({
-        orderId: params.orderId,
-        actor: params.actor,
-        reason: params.reason
-      });
-      return {
-        success: true,
-        freelancerNet: rel.freelancerNet,
-        platformFee: rel.platformFee,
-        gross: rel.freelancerNet + rel.platformFee
-      };
-    }
+    assertPostgresAvailable();
     const run = async (client: any) => {
       const idempKey = params.idempotencyKey || `IDEMP-ORD-REL-${params.orderId}`;
       const payloadFingerprint = {
@@ -1101,16 +1072,6 @@ export class FinancialTransactionService {
       const result = { success: true, freelancerNet, platformFee, gross };
       await recordIdempotencyResult(client, idempKey, 'releaseOrderFunds', result, payloadFingerprint);
 
-      if (process.env.NODE_ENV === 'test') {
-        try {
-          financeLedger.releaseEscrow({
-            orderId: params.orderId,
-            actor: params.actor,
-            reason: params.reason
-          });
-        } catch {}
-      }
-
       diagnosticService.log('INFO', 'FinancialTransactionService', 'releaseOrderFunds', 'postgres', 'release_escrow', 'SUCCESS', { orderId: params.orderId });
       return result;
     };
@@ -1123,20 +1084,7 @@ export class FinancialTransactionService {
       assertValidMoneyAmount(params.amount, 'amount');
     }
 
-    if (!isPostgresEnabled()) {
-      const rel = financeLedger.refundEscrow({
-        orderId: params.orderId,
-        amount: params.amount,
-        actor: params.actor,
-        reason: params.reason
-      });
-      return {
-        success: true,
-        refunded: rel.refunded,
-        remaining: rel.remaining,
-        feesRefunded: rel.feesRefunded || 0
-      };
-    }
+    assertPostgresAvailable();
     const run = async (client: any) => {
       const escRes = await client.query('SELECT * FROM escrows WHERE order_id = $1 FOR UPDATE', [params.orderId]);
       if (escRes.rows.length === 0) {
@@ -1240,17 +1188,6 @@ export class FinancialTransactionService {
       const result = { success: true, refunded: refundAmount, feesRefunded: feesBack, remaining: newRemaining };
       await recordIdempotencyResult(client, idempKey, 'refundOrderFunds', result, payloadFingerprint);
 
-      if (process.env.NODE_ENV === 'test') {
-        try {
-          financeLedger.refundEscrow({
-            orderId: params.orderId,
-            amount: params.amount,
-            reason: params.reason,
-            actor: params.actor
-          });
-        } catch {}
-      }
-
       return result;
     };
     if (externalClient) return run(externalClient);
@@ -1259,17 +1196,7 @@ export class FinancialTransactionService {
 
   async topUpEscrow(params: { orderId: string; orderTitle: string; amount: number; buyerId: string; sellerId: string; actor: string; idempotencyKey?: string; }, externalClient?: any) {
     assertValidMoneyAmount(params.amount, 'topUp amount');
-
-    if (!isPostgresEnabled()) {
-      return financeLedger.topUpEscrow({
-        orderId: params.orderId,
-        orderTitle: params.orderTitle,
-        amount: params.amount,
-        buyerId: params.buyerId,
-        sellerId: params.sellerId,
-        actor: params.actor
-      });
-    }
+    assertPostgresAvailable();
 
     const run = async (client: any) => {
       const escRes = await client.query('SELECT * FROM escrows WHERE order_id = $1 FOR UPDATE', [params.orderId]);
@@ -1392,17 +1319,7 @@ export class FinancialTransactionService {
 
   async creditDeposit(params: { userId: string; amount: number; actor: string; reference?: string; idempotencyKey?: string; source?: string }, externalClient?: any) {
     assertValidMoneyAmount(params.amount, 'deposit amount');
-
-    if (!isPostgresEnabled()) {
-      return financeLedger.creditDeposit({
-        userId: params.userId,
-        amount: params.amount,
-        reference: params.reference || `DEP-${params.idempotencyKey || randomUUID()}`,
-        idempotencyKey: params.idempotencyKey || randomUUID(),
-        actor: params.actor,
-        source: (params.source as any) || 'simulated'
-      });
-    }
+    assertPostgresAvailable();
 
     const run = async (client: any) => {
       const idempotencyKey = params.idempotencyKey || `IDEMP-DEP-${randomUUID()}`;
@@ -1477,10 +1394,8 @@ export class FinancialTransactionService {
     idempotencyKey?: string;
   }, externalClient?: any) {
     assertValidMoneyAmount(params.amount, 'payout amount');
+    assertPostgresAvailable();
 
-    if (!isPostgresEnabled()) {
-      return financeLedger.requestPayout(params);
-    }
     const run = async (client: any) => {
       // In test env: auto-insert user if not exists for synthetic direct service tests
       if (process.env.NODE_ENV === 'test') {
@@ -1762,7 +1677,7 @@ export class FinancialTransactionService {
   }
 
   async settlePayout(params: { payoutId: string; actor: string; providerReference?: string; idempotencyKey?: string }, externalClient?: any) {
-    if (!isPostgresEnabled()) return financeLedger.settlePayout(params);
+    assertPostgresAvailable();
     const run = async (client: any) => {
       const idempKey = params.idempotencyKey || `IDEMP-PAY-SETTLE-${params.payoutId}`;
       const payloadFingerprint = {
@@ -1822,7 +1737,7 @@ export class FinancialTransactionService {
   }
 
   async cancelPayout(params: { payoutId: string; reason: string; actor: string; idempotencyKey?: string }, externalClient?: any) {
-    if (!isPostgresEnabled()) return financeLedger.cancelPayout(params);
+    assertPostgresAvailable();
     const run = async (client: any) => {
       const idempKey = params.idempotencyKey || `IDEMP-PAY-CANCEL-${params.payoutId}`;
       const payloadFingerprint = {
@@ -1873,7 +1788,7 @@ export class FinancialTransactionService {
   }
 
   async failPayout(params: { payoutId: string; reason: string; actor: string; idempotencyKey?: string }, externalClient?: any) {
-    if (!isPostgresEnabled()) return financeLedger.failPayout(params);
+    assertPostgresAvailable();
     const run = async (client: any) => {
       const idempKey = params.idempotencyKey || `IDEMP-PAY-FAIL-${params.payoutId}`;
       const payloadFingerprint = {
@@ -1924,7 +1839,7 @@ export class FinancialTransactionService {
   }
 
   async retryPayout(params: { payoutId: string; actor: string; idempotencyKey?: string }, externalClient?: any) {
-    if (!isPostgresEnabled()) return financeLedger.retryPayout(params);
+    assertPostgresAvailable();
     const run = async (client: any) => {
       const pRes = await client.query('SELECT * FROM payouts WHERE id = $1 FOR UPDATE', [params.payoutId]);
       if (pRes.rows.length === 0) throw new Error('Payout not found');
@@ -2048,8 +1963,8 @@ export class FinancialTransactionService {
     return postgresStore.executeInTransaction(run);
   }
 
-  async freezeWallet(userId: string, reason: string, actor: string) {
-    if (!isPostgresEnabled()) return financeLedger.freezeWallet(userId, reason, actor);
+  async freezeWallet(userId: string, reason: string, _actor: string) {
+    assertPostgresAvailable();
     return postgresStore.executeInTransaction(async (client) => {
       const res = await client.query(
         "UPDATE wallets SET status = 'frozen', restriction_reason = $1 WHERE user_id = $2 RETURNING *",
@@ -2060,8 +1975,8 @@ export class FinancialTransactionService {
     });
   }
 
-  async unfreezeWallet(userId: string, reason: string, actor: string) {
-    if (!isPostgresEnabled()) return financeLedger.unfreezeWallet(userId, reason, actor);
+  async unfreezeWallet(userId: string, _reason: string, _actor: string) {
+    assertPostgresAvailable();
     return postgresStore.executeInTransaction(async (client) => {
       const res = await client.query(
         "UPDATE wallets SET status = 'active', restriction_reason = NULL WHERE user_id = $1 RETURNING *",
@@ -2072,8 +1987,8 @@ export class FinancialTransactionService {
     });
   }
 
-  async restrictWallet(userId: string, reason: string, actor: string) {
-    if (!isPostgresEnabled()) return financeLedger.restrictWallet(userId, reason, actor);
+  async restrictWallet(userId: string, reason: string, _actor: string) {
+    assertPostgresAvailable();
     return postgresStore.executeInTransaction(async (client) => {
       const res = await client.query(
         "UPDATE wallets SET status = 'restricted', restriction_reason = $1 WHERE user_id = $2 RETURNING *",
@@ -2097,19 +2012,7 @@ export class FinancialTransactionService {
     evidenceReference?: string;
   }) {
     assertValidMoneyAmount(params.amount, 'adjustment amount');
-
-    if (!isPostgresEnabled()) {
-      return financeLedger.executeAdministrativeAdjustment({
-        userId: params.userId,
-        direction: params.direction,
-        amount: params.amount,
-        category: params.category as any,
-        reason: params.reason,
-        actor: params.actor,
-        evidenceReference: params.evidenceReference,
-        requestKey: params.idempotencyKey || params.requestKey
-      });
-    }
+    assertPostgresAvailable();
 
     return postgresStore.executeInTransaction(async (client) => {
       const idempKey = params.idempotencyKey || params.requestKey || `IDEMP-ADJ-${params.userId}-${Date.now()}`;
@@ -2196,7 +2099,7 @@ export class FinancialTransactionService {
     const reason = typeof journalIdOrParams === 'string' ? (maybeReason || 'Administrative reversal') : journalIdOrParams.reason;
     const actor = typeof journalIdOrParams === 'string' ? (maybeActor || 'admin') : journalIdOrParams.actor;
 
-    if (!isPostgresEnabled()) return financeLedger.reverseJournal(journalId, reason, actor);
+    assertPostgresAvailable();
     return postgresStore.executeInTransaction(async (client) => {
       const idempKey = (typeof journalIdOrParams !== 'string' && journalIdOrParams.idempotencyKey) || `IDEMP-REV-${journalId}`;
       const payloadFingerprint = { journalId, reason };
@@ -2375,6 +2278,149 @@ export class FinancialTransactionService {
     });
   }
 
+  async createReconciliationException(
+    params: {
+      id?: string;
+      type: ReconciliationException['type'];
+      entityId: string;
+      amount: number;
+      currency?: 'USD';
+      description: string;
+      status?: 'open' | 'investigating' | 'resolved';
+      assignedTo?: string;
+      detectedAt?: string;
+    },
+    externalClient?: any
+  ): Promise<ReconciliationException> {
+    assertPostgresAvailable();
+    assertValidMoneyAmount(params.amount, 'reconciliation exception amount', true);
+
+    const run = async (client: any) => {
+      const id = params.id ? String(params.id).trim() : `REX-${randomUUID().slice(0, 12)}`;
+      const detectedAt = params.detectedAt || new Date().toISOString().replace('T', ' ').substring(0, 19);
+      const status = params.status || 'open';
+      const currency = params.currency || 'USD';
+
+      const res = await client.query(
+        `INSERT INTO reconciliation_exceptions (
+          id, type, entity_id, amount, currency, description, status, assigned_to, detected_at, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+        ON CONFLICT (id) DO UPDATE SET
+          type = EXCLUDED.type,
+          entity_id = EXCLUDED.entity_id,
+          amount = EXCLUDED.amount,
+          description = EXCLUDED.description,
+          updated_at = NOW()
+        RETURNING *`,
+        [id, params.type, params.entityId, params.amount, currency, params.description, status, params.assignedTo || null, detectedAt]
+      );
+      return financialRepository.formatReconciliationExceptionRow(res.rows[0]);
+    };
+
+    if (externalClient) return run(externalClient);
+    return postgresStore.executeInTransaction(run);
+  }
+
+  async resolveReconciliationException(
+    params: {
+      exceptionId: string;
+      notes: string;
+      actor: string;
+      role?: string;
+    },
+    externalClient?: any
+  ): Promise<ReconciliationException> {
+    assertPostgresAvailable();
+
+    const exceptionId = String(params.exceptionId || '').trim();
+    if (!exceptionId) {
+      const err: any = new Error('Reconciliation exception ID is required.');
+      err.status = 400;
+      err.statusCode = 400;
+      throw err;
+    }
+
+    const notes = String(params.notes || '').trim();
+    if (!notes) {
+      const err: any = new Error('Investigation notes are required to resolve an exception.');
+      err.status = 400;
+      err.statusCode = 400;
+      throw err;
+    }
+
+    const actor = String(params.actor || '').trim();
+    if (!actor) {
+      const err: any = new Error('Authenticated admin actor is required to resolve an exception.');
+      err.status = 401;
+      err.statusCode = 401;
+      throw err;
+    }
+
+    const role = String(params.role || 'super_admin').trim();
+
+    const run = async (client: any) => {
+      // Lock the target reconciliation exception row to serialize concurrent resolution attempts
+      const existingRes = await client.query(
+        'SELECT * FROM reconciliation_exceptions WHERE id = $1 FOR UPDATE',
+        [exceptionId]
+      );
+
+      if (existingRes.rows.length === 0) {
+        const err: any = new Error(`Exception ${exceptionId} not found.`);
+        err.status = 404;
+        err.statusCode = 404;
+        throw err;
+      }
+
+      const existing = existingRes.rows[0];
+      if (existing.status === 'resolved') {
+        const err: any = new Error(`Exception ${exceptionId} is already resolved.`);
+        err.status = 409;
+        err.statusCode = 409;
+        throw err;
+      }
+
+      const resolvedAt = new Date().toISOString().replace('T', ' ').substring(0, 19);
+
+      const updateRes = await client.query(
+        `UPDATE reconciliation_exceptions
+         SET status = 'resolved',
+             investigation_notes = $1,
+             resolved_by = $2,
+             resolved_at = $3,
+             updated_at = NOW()
+         WHERE id = $4 AND status <> 'resolved'
+         RETURNING *`,
+        [notes, actor, resolvedAt, exceptionId]
+      );
+
+      if (updateRes.rows.length === 0) {
+        const err: any = new Error(`Exception ${exceptionId} is already resolved.`);
+        err.status = 409;
+        err.statusCode = 409;
+        throw err;
+      }
+
+      await client.query(
+        `INSERT INTO audit_logs (id, actor, role, action, target, details, timestamp)
+         VALUES ($1, $2, $3, 'RECONCILIATION_EXCEPTION_RESOLVED', $4, $5, $6)`,
+        [
+          `FAUD-${randomUUID().slice(0, 12)}`,
+          actor,
+          role,
+          `Exception #${exceptionId}`,
+          notes,
+          resolvedAt
+        ]
+      );
+
+      return financialRepository.formatReconciliationExceptionRow(updateRes.rows[0]);
+    };
+
+    if (externalClient) return run(externalClient);
+    return postgresStore.executeInTransaction(run);
+  }
+
   async runFinancialReconciliation(): Promise<{
     reconciled: boolean;
     timestamp: string;
@@ -2386,21 +2432,9 @@ export class FinancialTransactionService {
       ledgerAccounts: Record<string, number>;
     };
     discrepancies: string[];
+    exceptions: ReconciliationException[];
   }> {
-    if (!isPostgresEnabled()) {
-      return {
-        reconciled: true,
-        timestamp: new Date().toISOString(),
-        summary: {
-          wallets: { totalAvailable: 0, totalHold: 0, totalPendingWithdrawals: 0 },
-          escrows: { totalRemaining: 0, countHeld: 0 },
-          payouts: { totalPending: 0, countPending: 0 },
-          clearing: { totalClearing: 0, countClearing: 0 },
-          ledgerAccounts: {}
-        },
-        discrepancies: []
-      };
-    }
+    assertPostgresAvailable();
 
     return postgresStore.executeInTransaction(async (client) => {
       const wRes = await client.query(
@@ -2481,8 +2515,12 @@ export class FinancialTransactionService {
         discrepancies.push(`Ledger journal equation unbalanced: Total Debits ($${totalDebits.toFixed(2)}) != Total Credits ($${totalCredits.toFixed(2)}).`);
       }
 
+      const exRes = await client.query('SELECT * FROM reconciliation_exceptions ORDER BY detected_at DESC, created_at DESC');
+      const exceptions = exRes.rows.map((r: any) => financialRepository.formatReconciliationExceptionRow(r));
+      const openExceptions = exceptions.filter((e: ReconciliationException) => e.status !== 'resolved');
+
       return {
-        reconciled: discrepancies.length === 0,
+        reconciled: discrepancies.length === 0 && openExceptions.length === 0,
         timestamp: new Date().toISOString(),
         summary: {
           wallets: { totalAvailable: walletTotalAvail, totalHold: walletTotalHold, totalPendingWithdrawals: walletTotalPending },
@@ -2491,10 +2529,12 @@ export class FinancialTransactionService {
           clearing: { totalClearing: clearingTotal, countClearing: clearingCount },
           ledgerAccounts: Object.fromEntries(Object.entries(accts).map(([k, v]) => [k, v.net]))
         },
-        discrepancies
+        discrepancies,
+        exceptions
       };
     });
   }
 }
 
 export const financialTransactionService = new FinancialTransactionService();
+

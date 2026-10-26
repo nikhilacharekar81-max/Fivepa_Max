@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { store } from '../store.js';
+import { isGigPublic } from '../publicData.js';
 import { slugify } from '../../src/utils/slugify.js';
 
 export const rootRouter = Router();
@@ -13,7 +14,8 @@ rootRouter.get('/robots.txt', (_req, res) => {
 rootRouter.get('/sitemap.xml', async (_req, res) => {
   try {
     const baseUrl = 'https://workperhour.com';
-    const gigs = await store.listGigs('published');
+    const rawGigs = await store.listGigs();
+    const gigs = rawGigs.filter(isGigPublic);
     const urls = [
       `${baseUrl}/`,
       `${baseUrl}/gigs`,

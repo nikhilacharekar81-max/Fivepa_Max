@@ -157,11 +157,12 @@ authRouter.post('/signup', rateLimit(20, 3_600_000), async (req: Request, res: R
       type: 'GENERAL'
     });
 
-    const token = signToken({ id: newUser.id, role: newUser.role, email: newUser.email, sessionVersion: newUser.sessionVersion });
-
     res.status(201).json({
       success: true,
-      token,
+      requiresVerification: true,
+      message: 'Account created! Please enter the 6-digit verification code sent to your email to complete registration.',
+      email: normalizedEmail,
+      mockEmailCode: !IS_PRODUCTION ? emailCode : undefined,
       user: safeUser(newUser)
     });
   } catch (err: any) {
@@ -250,12 +251,28 @@ authRouter.post('/verify-email', rateLimit(30, 3_600_000), async (req: Request, 
   }
 
   const user = await store.getUserByEmail(normalizedEmail);
-  if (user) {
-    user.emailVerified = true;
-    user.verified = true;
-    await store.saveUser(user);
+  if (!user) {
+    return res.status(404).json({ error: 'User account not found.' });
   }
-  res.json({ success: true, message: 'Email verified successfully!' });
+
+  user.emailVerified = true;
+  user.verified = true;
+  const sessionVersion = registerNewUserSession(user);
+  await store.saveUser(user);
+
+  const token = signToken({
+    id: user.id,
+    role: user.role,
+    email: user.email,
+    sessionVersion
+  });
+
+  res.json({
+    success: true,
+    message: 'Email verified successfully!',
+    token,
+    user: safeUser(user)
+  });
 });
 
 authRouter.post('/resend-email-code', rateLimit(10, 3_600_000), async (req: Request, res: Response) => {
@@ -320,7 +337,10 @@ authRouter.post('/resend-email-code', rateLimit(10, 3_600_000), async (req: Requ
     type: 'GENERAL'
   });
 
-  res.json(generic);
+  res.json({
+    ...generic,
+    mockCode: !IS_PRODUCTION ? newCode : undefined
+  });
 });
 
 // 3. Mobile / SMS Verification & Resend

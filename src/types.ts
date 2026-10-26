@@ -66,7 +66,7 @@ export interface Gig {
   coverImage?: string;
   gallery?: string[];
   tags?: string[];
-  status: 'published' | 'draft' | 'suspended' | 'paused' | 'pending' | 'declined';
+  status: 'active' | 'paused' | 'moderation' | 'deleted';
   featured: boolean;
   featuredUntil?: string;
   extras?: GigExtra[];

@@ -201,7 +201,7 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
       if (projOwner !== buyerId) {
         return res.status(403).json({ error: 'Only the project owner can create an order for this project.' });
       }
-      let proposalQuery = `SELECT * FROM proposals WHERE project_id = $1 AND freelancer_id = $2 AND status IN ('accepted', 'shortlisted', 'pending')`;
+      let proposalQuery = `SELECT * FROM proposals WHERE project_id = $1 AND freelancer_id = $2 AND status = 'accepted'`;
       const proposalParams: any[] = [req.body.projectId, sellerId];
       if (req.body?.proposalId) {
         proposalQuery += ` AND id = $3`;

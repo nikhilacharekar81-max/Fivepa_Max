@@ -27,7 +27,7 @@ export const gigRouter = Router();
 // Public gigs list
 gigRouter.get('/gigs', async (req: Request, res: Response) => {
   try {
-    const rawGigs = await store.listGigs('published');
+    const rawGigs = await store.listGigs();
     const publicGigs = rawGigs.filter(isGigPublic).map(sanitizePublicGig);
     res.json(publicGigs);
   } catch (err) {
@@ -133,7 +133,7 @@ gigRouter.post('/gigs', requireAuth, requireActiveStatus, async (req: Request, r
     }));
   }
 
-  const initialStatus = activeSettings.marketplace.gigModerationRequired ? 'pending' : 'published';
+  const initialStatus = activeSettings.marketplace.gigModerationRequired ? 'moderation' : 'active';
 
   const newGig: Gig = {
     id: 'gig_' + Date.now() + '_' + randomUUID().slice(0, 8),
@@ -181,6 +181,10 @@ const handleGigUpdate = async (req: Request, res: Response) => {
       return res.status(403).json({ error: 'Forbidden: You can only edit your own gigs.' });
     }
 
+    if (g.status === 'deleted') {
+      return res.status(400).json({ error: 'Deleted gigs cannot be edited or restored.' });
+    }
+
     let title = g.title;
     let category = g.category;
     let subcategory = g.subcategory;
@@ -189,7 +193,7 @@ const handleGigUpdate = async (req: Request, res: Response) => {
     let deliveryDays = g.deliveryDays;
     let extras = g.extras;
     let image = g.image;
-    let status = g.status;
+    let status: Gig['status'] = g.status;
     let moderationStatus = g.moderationStatus;
 
     if (req.body.title !== undefined) title = escapeHtml(req.body.title);
@@ -227,22 +231,31 @@ const handleGigUpdate = async (req: Request, res: Response) => {
 
     if (req.body.status !== undefined) {
       const requestedStatus = String(req.body.status).toLowerCase().trim();
-      if (!['published', 'paused', 'draft'].includes(requestedStatus)) {
-        return res.status(400).json({ error: 'Invalid status. Sellers can only set status to published, paused, or draft.' });
+      if (!['active', 'paused', 'deleted'].includes(requestedStatus)) {
+        return res.status(400).json({ error: 'Invalid status. Sellers can only set status to active, paused, or deleted.' });
       }
 
       const activeSettings = siteSettings.getSettings();
 
-      if (requestedStatus === 'published' && (moderationStatus === 'rejected' || moderationStatus === 'flagged')) {
-        return res.status(400).json({ error: 'This gig has been rejected or flagged by moderators and cannot be published until reviewed and approved by an administrator.' });
-      }
+      if (requestedStatus === 'active') {
+        if (moderationStatus === 'rejected' || moderationStatus === 'flagged') {
+          return res.status(400).json({ error: 'This gig has been rejected or flagged by moderators and cannot be activated until reviewed and approved by an administrator.' });
+        }
 
-      if (requestedStatus === 'published' && activeSettings.marketplace?.gigModerationRequired && moderationStatus !== 'approved') {
-        status = 'pending';
-        moderationStatus = 'pending';
-      } else {
-        status = requestedStatus as any;
+        if (activeSettings.marketplace?.gigModerationRequired && moderationStatus !== 'approved') {
+          status = 'moderation';
+          moderationStatus = 'pending';
+        } else {
+          status = 'active';
+        }
+      } else if (requestedStatus === 'paused') {
+        status = 'paused';
+      } else if (requestedStatus === 'deleted') {
+        status = 'deleted';
       }
+    } else {
+      // Editing details preserves existing status
+      status = g.status;
     }
 
     const updatedGig: Gig = { ...g, title, category, subcategory, description, price, deliveryDays, extras, image, status, moderationStatus };

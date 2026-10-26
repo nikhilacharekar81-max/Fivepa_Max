@@ -59,7 +59,7 @@ export class MarketplaceRepo {
               g.freelancerLevel || null, g.title, g.slug || null, g.category, g.subcategory || null,
               g.description || null, g.price, g.deliveryDays, g.rating ?? 5.0, g.reviewsCount ?? 0,
               g.image || null, g.coverImage || null, g.gallery || [], g.tags || [],
-              g.status || 'published', !!g.featured, JSON.stringify(g.extras || []),
+              g.status || 'active', !!g.featured, JSON.stringify(g.extras || []),
               g.moderationStatus || 'approved', g.moderationNotes || null
             ]
           );
@@ -90,7 +90,7 @@ export class MarketplaceRepo {
 
   async deleteGig(id: string): Promise<void> {
     return this.ctx.withLock('gigs', async () => {
-      await this.ctx.getPool().query('DELETE FROM gigs WHERE id = $1', [id]);
+      await this.ctx.getPool().query("UPDATE gigs SET status = 'deleted' WHERE id = $1", [id]);
     });
   }
 

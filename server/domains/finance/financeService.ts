@@ -1,76 +1,89 @@
 import { financeLedger, FinanceLedgerEngine, EscrowRecord, UserWallet, LedgerJournal } from './financeLedger.js';
+import { financialTransactionService, financialRepository } from './financial.service.js';
 
 /**
- * Authoritative Finance Service Layer for WorkPerHour.
- * Acts as the single entry point for all financial operations, escrows, wallet movements, and ledger postings.
+ * Finance Service Layer for WorkPerHour.
+ * Fee policy configuration and pure fee quotes remain synchronous;
+ * all financial persistence and state mutations execute exclusively against PostgreSQL.
  */
 class FinanceService {
-  public ensureWallet(params: { userId: string; name: string; email: string; role: 'buyer' | 'freelancer' }): void {
-    financeLedger.ensureWallet(params);
+  public async ensureWallet(params: { userId: string; name: string; email: string; role: 'buyer' | 'freelancer' }) {
+    return financialTransactionService.ensureWallet(params);
   }
 
-  public getWalletBalance(userId: string): number | null {
-    return financeLedger.getWalletBalance(userId);
+  public async getWalletBalance(userId: string): Promise<number | null> {
+    return financialRepository.getWalletBalance(userId);
   }
 
-  public getWalletById(userId: string) {
-    return financeLedger.getWalletById(userId);
+  public async getWalletById(userId: string) {
+    return financialRepository.getWallet(userId);
   }
 
-  public getWallets() {
-    return financeLedger.getWallets();
+  public async getWallets() {
+    return financialRepository.getWallets();
   }
 
-  public hasWallet(userId: string): boolean {
-    return financeLedger.hasWallet(userId);
+  public async hasWallet(userId: string): Promise<boolean> {
+    return financialRepository.hasWallet(userId);
   }
 
-  public creditDeposit(params: { userId: string; amount: number; reference: string; idempotencyKey: string; actor: string; source?: string }) {
-    return financeLedger.creditDeposit(params);
+  public async creditDeposit(params: { userId: string; amount: number; reference: string; idempotencyKey: string; actor: string; source?: string }) {
+    return financialTransactionService.creditDeposit(params);
   }
 
-  public fundEscrow(params: { orderId: string; orderTitle: string; amount: number; buyerId: string; sellerId: string; actor: string; timestamp?: string; skipMinimum?: boolean }) {
-    return financeLedger.fundEscrow(params);
+  public async fundEscrow(params: { orderId: string; orderTitle: string; amount: number; buyerId: string; sellerId: string; actor: string; timestamp?: string; skipMinimum?: boolean }) {
+    return financialTransactionService.fundEscrow(params);
   }
 
-  public topUpEscrow(params: { orderId: string; orderTitle: string; amount: number; buyerId: string; sellerId: string; actor: string; timestamp?: string; skipMinimum?: boolean }) {
-    return financeLedger.topUpEscrow(params);
+  public async topUpEscrow(params: { orderId: string; orderTitle: string; amount: number; buyerId: string; sellerId: string; actor: string; timestamp?: string; skipMinimum?: boolean }) {
+    return financialTransactionService.topUpEscrow(params);
   }
 
-  public releaseEscrow(params: { orderId: string; actor: string; reason?: string; requestKey?: string }) {
-    return financeLedger.releaseEscrow(params);
+  public async releaseEscrow(params: { orderId: string; actor: string; reason?: string; requestKey?: string }) {
+    return financialTransactionService.releaseOrderFunds({
+      orderId: params.orderId,
+      actor: params.actor,
+      reason: params.reason,
+      idempotencyKey: params.requestKey
+    });
   }
 
-  public refundEscrow(params: { orderId: string; amount?: number; reason: string; actor: string; requestKey?: string }) {
-    return financeLedger.refundEscrow(params);
+  public async refundEscrow(params: { orderId: string; amount?: number; reason: string; actor: string; requestKey?: string }) {
+    return financialTransactionService.refundOrderFunds({
+      orderId: params.orderId,
+      amount: params.amount,
+      reason: params.reason,
+      actor: params.actor,
+      idempotencyKey: params.requestKey
+    });
   }
 
-  public resolveEscrowSplit(params: { orderId: string; refundAmount: number; reason: string; actor: string }) {
-    return financeLedger.resolveEscrowSplit(params);
+  public async resolveEscrowSplit(params: { orderId: string; refundAmount: number; reason: string; actor: string }) {
+    return financialTransactionService.resolveEscrowSplit(params);
   }
 
-  public requestPayout(params: { payoutId: string; freelancerId: string; amount: number; method: string; accountDetails: string; actor: string }) {
-    return financeLedger.requestPayout(params);
+  public async requestPayout(params: { payoutId: string; freelancerId: string; amount: number; method: string; accountDetails: string; actor: string }) {
+    return financialTransactionService.requestPayout(params);
   }
 
-  public cancelPayout(params: { payoutId: string; reason: string; actor: string }) {
-    return financeLedger.cancelPayout(params);
+  public async cancelPayout(params: { payoutId: string; reason: string; actor: string }) {
+    return financialTransactionService.cancelPayout(params);
   }
 
-  public getEscrow(orderId: string): EscrowRecord | undefined {
-    return financeLedger.getEscrow(orderId);
+  public async getEscrow(orderId: string) {
+    return financialRepository.getEscrow(orderId);
   }
 
-  public getEscrows(): EscrowRecord[] {
-    return financeLedger.getEscrows();
+  public async getEscrows() {
+    return financialRepository.getEscrows();
   }
 
-  public getTransactions() {
-    return financeLedger.getTransactions();
+  public async getTransactions() {
+    return financialRepository.getTransactions();
   }
 
-  public getAuditLogs() {
-    return financeLedger.getAuditLogs();
+  public async getAuditLogs() {
+    return financialRepository.getAuditLogs();
   }
 
   public getFeeConfig() {
@@ -89,13 +102,15 @@ class FinanceService {
     financeLedger.setPlatformCommissionRate(rate);
   }
 
-  public replay<T>(requestKey: string | undefined): T | undefined {
-    return financeLedger.replay<T>(requestKey);
+  public replay<T>(_requestKey: string | undefined): T | undefined {
+    return undefined;
   }
 
   public async persistState(): Promise<void> {
-    await financeLedger.persistToPostgres();
+    // No-op: PostgreSQL normalized financial tables are the sole source of truth.
+    return Promise.resolve();
   }
 }
 
 export const financeService = new FinanceService();
+

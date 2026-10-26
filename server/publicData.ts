@@ -53,7 +53,10 @@ export function sanitizePublicUser(user: any) {
 }
 
 export function isGigPublic(g: Gig): boolean {
-  return g.status === 'published' && (!g.moderationStatus || g.moderationStatus === 'approved');
+  if (!g) return false;
+  const status = (g.status || '').toLowerCase();
+  if (status !== 'active' && status !== 'paused') return false;
+  return !g.moderationStatus || g.moderationStatus === 'approved';
 }
 
 export function sanitizePublicGig(g: Gig) {

@@ -308,7 +308,15 @@ export function mapGigRow(r: any): Gig {
     coverImage: r.cover_image || undefined,
     gallery: typeof r.gallery === 'string' ? JSON.parse(r.gallery) : (r.gallery || []),
     tags: typeof r.tags === 'string' ? JSON.parse(r.tags) : (r.tags || []),
-    status: r.status,
+    status: (() => {
+      const st = (r.status || 'active').toLowerCase().trim();
+      if (st === 'published') return 'active';
+      if (st === 'pending' || st === 'draft') return 'moderation';
+      if (st === 'deleted') return 'deleted';
+      if (st === 'paused') return 'paused';
+      if (st === 'moderation') return 'moderation';
+      return 'active';
+    })(),
     featured: Boolean(r.featured),
     featuredUntil: r.featured_until || undefined,
     extras: typeof r.extras === 'string' ? JSON.parse(r.extras) : (r.extras || []),
@@ -672,14 +680,14 @@ export class PostgresAsyncStore implements StoreInterface {
       [
         g.id, g.freelancerId, g.freelancerName, g.freelancerUsername || null, g.freelancerAvatar || null, g.freelancerLevel || null,
         g.title, slug, g.category, g.subcategory || null, g.description || '', g.price, g.deliveryDays, g.rating ?? 5.0, g.reviewsCount ?? 0,
-        g.image || null, g.coverImage || null, g.gallery || [], g.tags || [], g.status || 'published', Boolean(g.featured),
+        g.image || null, g.coverImage || null, g.gallery || [], g.tags || [], g.status || 'active', Boolean(g.featured),
         JSON.stringify(g.extras || []), g.moderationStatus || 'approved', g.moderationNotes || null
       ]
     );
   }
 
   async deleteGig(id: string): Promise<boolean> {
-    const res = await postgresStore.getPool().query('DELETE FROM gigs WHERE id = $1', [id]);
+    const res = await postgresStore.getPool().query("UPDATE gigs SET status = 'deleted' WHERE id = $1", [id]);
     return res.rowCount !== null && res.rowCount > 0;
   }
 
@@ -1310,15 +1318,10 @@ export async function hydrateStoreFromPostgres() {
         const { setCategories } = await import('./routes/adminRoutes.js');
         setCategories(persistedCategories);
       }
-
-      const persistedLedger = await postgresStore.loadLedgerState();
-      if (persistedLedger) {
-        const { financeLedger } = await import('./domains/finance/financeLedger.js');
-        financeLedger.loadFromState(persistedLedger);
-      }
     } catch (settErr) {
-      console.warn('[Store] Notice: Failed to hydrate site settings/gateways/categories/ledger:', settErr);
+      console.warn('[Store] Notice: Failed to hydrate site settings/gateways/categories:', settErr);
     }
+
 
     const isProduction = process.env.NODE_ENV === 'production' && process.env.SEED_DEMO_DATA !== 'true';
     const pool = postgresStore.getPool();
@@ -1466,7 +1469,7 @@ export async function hydrateStoreFromPostgres() {
           tags: ['React', 'PostgreSQL', 'Node.js', 'TypeScript'],
           image: 'https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&auto=format&fit=crop&q=80',
           coverImage: 'https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&auto=format&fit=crop&q=80',
-          status: 'published',
+          status: 'active',
           createdAt: nowIso
         },
         {
@@ -1488,7 +1491,7 @@ export async function hydrateStoreFromPostgres() {
           tags: ['AI Agents', 'LLM', 'TypeScript', 'Python'],
           image: 'https://images.unsplash.com/photo-1677442136019-21780ecad995?w=800&auto=format&fit=crop&q=80',
           coverImage: 'https://images.unsplash.com/photo-1677442136019-21780ecad995?w=800&auto=format&fit=crop&q=80',
-          status: 'published',
+          status: 'active',
           createdAt: nowIso
         }
       ];

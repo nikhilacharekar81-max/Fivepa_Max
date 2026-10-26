@@ -21,7 +21,7 @@ export const RelatedGigsSection: React.FC<RelatedGigsSectionProps> = ({
   title = "Related & Similar Services",
   maxItems = 4
 }) => {
-  const dataset = allGigs || [];
+  const dataset = (allGigs || []).filter(g => g.status !== 'moderation' && g.status !== 'deleted');
 
   // Find related gigs by category or subcategory
   let related = dataset.filter(g => 

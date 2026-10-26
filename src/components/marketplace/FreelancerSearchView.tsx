@@ -178,7 +178,7 @@ export const FreelancerSearchView: React.FC<FreelancerSearchViewProps> = ({
 
   // Top trending active offers across platform
   const topTrendingOffers = useMemo(() => {
-    return gigs.filter(g => g.status === 'published').slice(0, 8);
+    return gigs.filter(g => g.status === 'active').slice(0, 8);
   }, [gigs]);
 
   // Unique locations from users

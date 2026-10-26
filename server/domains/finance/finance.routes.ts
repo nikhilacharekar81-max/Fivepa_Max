@@ -1338,30 +1338,43 @@ router.get('/admin/finance/reconciliation', requireAdmin, async (req: Request, r
   }
 });
 
-router.post('/admin/finance/reconciliation/resolve/:id', requireAdmin, (req: Request, res: Response) => {
+router.post('/admin/finance/reconciliation/resolve/:id', requireAdmin, async (req: Request, res: Response) => {
   try {
-    const { notes } = req.body;
-    if (!notes) return res.status(400).json({ error: 'Investigation notes required to mark exception resolved' });
-    const resolved = financeLedger.resolveException(req.params.id, notes, adminActor(req));
+    const notes = typeof req.body?.notes === 'string' ? req.body.notes.trim() : '';
+    if (!notes) {
+      return res.status(400).json({ error: 'Investigation notes required to mark exception resolved' });
+    }
+    const actor = adminActor(req);
+    const role = (req as any).authenticatedUser?.role || 'super_admin';
+    const resolved = await financialTransactionService.resolveReconciliationException({
+      exceptionId: req.params.id,
+      notes,
+      actor,
+      role
+    });
     res.json(resolved);
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    const statusCode = typeof err?.statusCode === 'number' ? err.statusCode : (typeof err?.status === 'number' ? err.status : 400);
+    res.status(statusCode).json({ error: err.message });
   }
 });
 
 router.get('/admin/finance/audit', requireAdmin, async (req: Request, res: Response) => {
   try {
-    const logs = isPostgresEnabled() ? await postgresStore.listAuditLogs() : financeLedger.getAuditLogs();
+    if (!isPostgresEnabled()) {
+      return res.status(503).json({ error: 'PostgreSQL persistence is required for financial audit logs.' });
+    }
+    const logs = await postgresStore.listAuditLogs();
     res.json(logs);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-router.post('/admin/finance/adjustments/preview', requireAdmin, (req: Request, res: Response) => {
+router.post('/admin/finance/adjustments/preview', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { userId, amount, direction, category, reason } = req.body;
-    const preview = financialRepository.previewAdjustment({ userId, amount: Number(amount), direction, category, reason });
+    const preview = await financialRepository.previewAdjustment({ userId, amount: Number(amount), direction, category, reason });
     res.json(preview);
   } catch (err: any) {
     res.status(400).json({ error: err.message });

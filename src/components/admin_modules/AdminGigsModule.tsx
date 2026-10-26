@@ -3,7 +3,7 @@ import {
   Layers, Search, Filter, Star, Eye, Edit2, Trash2, CheckCircle2,
   AlertTriangle, Clock, X, Check, RefreshCw, ChevronLeft, ChevronRight,
   TrendingUp, DollarSign, Sparkles, Ban, Settings, ShieldCheck, ExternalLink,
-  PlusCircle, Download, CheckSquare, Square, ChevronDown
+  PlusCircle, Download, CheckSquare, Square, ChevronDown, Play, Pause
 } from 'lucide-react';
 import { Gig, UserAccount } from '../../types';
 import { DEFAULT_AVATAR, DEFAULT_GIG_IMAGE } from '../../constants';
@@ -51,7 +51,7 @@ export const AdminGigsModule: React.FC<AdminGigsModuleProps> = ({
   // Filters & Search
   const [searchQuery, setSearchQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('all');
-  const [statusFilter, setStatusFilter] = useState<'all' | 'published' | 'draft' | 'suspended'>('all');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'paused' | 'moderation' | 'deleted'>('all');
   const [featuredFilter, setFeaturedFilter] = useState<'all' | 'featured' | 'standard'>('all');
   const [sortBy, setSortBy] = useState<'newest' | 'price_desc' | 'rating_desc'>('newest');
 
@@ -75,7 +75,7 @@ export const AdminGigsModule: React.FC<AdminGigsModuleProps> = ({
     description: '',
     price: 0,
     deliveryDays: 1,
-    status: 'published' as Gig['status'],
+    status: 'active' as Gig['status'],
     featured: false
   });
   const [moderatingGig, setModeratingGig] = useState<Gig | null>(null);
@@ -101,10 +101,11 @@ export const AdminGigsModule: React.FC<AdminGigsModuleProps> = ({
   // Metrics
   const metrics = useMemo(() => {
     const totalGigs = gigs.length;
-    const publishedGigs = gigs.filter(g => g.status === 'published').length;
-    const featuredGigs = gigs.filter(g => g.featured).length;
-    const suspendedGigs = gigs.filter(g => g.status === 'suspended').length;
-    return { totalGigs, publishedGigs, featuredGigs, suspendedGigs };
+    const activeGigs = gigs.filter(g => g.status === 'active').length;
+    const pausedGigs = gigs.filter(g => g.status === 'paused').length;
+    const moderationGigs = gigs.filter(g => g.status === 'moderation').length;
+    const deletedGigs = gigs.filter(g => g.status === 'deleted').length;
+    return { totalGigs, activeGigs, pausedGigs, moderationGigs, deletedGigs };
   }, [gigs]);
 
   const uniqueCategories = useMemo(() => {
@@ -158,7 +159,7 @@ export const AdminGigsModule: React.FC<AdminGigsModuleProps> = ({
   };
 
   const handleStatusToggle = async (gig: Gig) => {
-    const nextStatus = gig.status === 'suspended' ? 'published' : 'suspended';
+    const nextStatus = gig.status === 'paused' ? 'active' : 'paused';
     setGigs(prev => prev.map(g => g.id === gig.id ? { ...g, status: nextStatus } : g));
     if (onUpdateGigStatus) onUpdateGigStatus(gig.id, nextStatus);
     showToast(`Gig #${gig.id} status changed to ${nextStatus.toUpperCase()}.`);
@@ -202,10 +203,10 @@ export const AdminGigsModule: React.FC<AdminGigsModuleProps> = ({
     setSelectedGigIds([]);
   };
 
-  const handleBulkSuspend = () => {
+  const handleBulkPause = () => {
     if (selectedGigIds.length === 0) return;
-    setGigs(prev => prev.map(g => selectedGigIds.includes(g.id) ? { ...g, status: 'suspended' } : g));
-    showToast(`Successfully suspended ${selectedGigIds.length} gigs.`);
+    setGigs(prev => prev.map(g => selectedGigIds.includes(g.id) ? { ...g, status: 'paused' } : g));
+    showToast(`Successfully paused ${selectedGigIds.length} gigs.`);
     setSelectedGigIds([]);
   };
 
@@ -272,7 +273,7 @@ export const AdminGigsModule: React.FC<AdminGigsModuleProps> = ({
       description: g.description || '',
       price: g.price || 0,
       deliveryDays: g.deliveryDays || 1,
-      status: g.status || 'published',
+      status: g.status || 'active',
       featured: !!g.featured
     });
   };
@@ -338,7 +339,7 @@ export const AdminGigsModule: React.FC<AdminGigsModuleProps> = ({
       rating: 5.0,
       reviewsCount: 0,
       image: 'https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=800&h=500&fit=crop',
-      status: 'published' as const,
+      status: 'active' as const,
       featured: false,
       moderationStatus: 'approved' as const
     };
@@ -410,16 +411,20 @@ export const AdminGigsModule: React.FC<AdminGigsModuleProps> = ({
           <div className="text-2xl font-bold text-slate-900 mt-1">{metrics.totalGigs}</div>
         </div>
         <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">
-          <span className="text-[10px] uppercase font-bold text-emerald-600 tracking-wider">Published Active</span>
-          <div className="text-2xl font-bold text-emerald-700 mt-1">{metrics.publishedGigs}</div>
+          <span className="text-[10px] uppercase font-bold text-emerald-600 tracking-wider">Active Gigs</span>
+          <div className="text-2xl font-bold text-emerald-700 mt-1">{metrics.activeGigs}</div>
         </div>
         <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">
-          <span className="text-[10px] uppercase font-bold text-amber-600 tracking-wider">Featured Gigs</span>
-          <div className="text-2xl font-bold text-amber-700 mt-1">{metrics.featuredGigs}</div>
+          <span className="text-[10px] uppercase font-bold text-amber-600 tracking-wider">Paused Gigs</span>
+          <div className="text-2xl font-bold text-amber-700 mt-1">{metrics.pausedGigs}</div>
         </div>
         <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">
-          <span className="text-[10px] uppercase font-bold text-rose-600 tracking-wider">Suspended / Flagged</span>
-          <div className="text-2xl font-bold text-rose-700 mt-1">{metrics.suspendedGigs}</div>
+          <span className="text-[10px] uppercase font-bold text-blue-600 tracking-wider">Under Moderation</span>
+          <div className="text-2xl font-bold text-blue-700 mt-1">{metrics.moderationGigs}</div>
+        </div>
+        <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">
+          <span className="text-[10px] uppercase font-bold text-rose-600 tracking-wider">Deleted</span>
+          <div className="text-2xl font-bold text-rose-700 mt-1">{metrics.deletedGigs}</div>
         </div>
       </div>
 
@@ -454,9 +459,10 @@ export const AdminGigsModule: React.FC<AdminGigsModuleProps> = ({
             className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-700 cursor-pointer"
           >
             <option value="all">All Statuses</option>
-            <option value="published">Published</option>
-            <option value="draft">Draft</option>
-            <option value="suspended">Suspended</option>
+            <option value="active">Active</option>
+            <option value="paused">Paused</option>
+            <option value="moderation">Under Moderation</option>
+            <option value="deleted">Deleted</option>
           </select>
 
           <select
@@ -493,7 +499,7 @@ export const AdminGigsModule: React.FC<AdminGigsModuleProps> = ({
           </div>
           <div className="flex items-center gap-2">
             <button type="button" onClick={handleBulkFeature} className="px-3 py-1.5 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-lg cursor-pointer">Pin as Featured</button>
-            <button type="button" onClick={handleBulkSuspend} className="px-3 py-1.5 bg-amber-700 hover:bg-amber-800 text-white font-bold rounded-lg cursor-pointer">Suspend Selected</button>
+            <button type="button" onClick={handleBulkPause} className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-bold rounded-lg cursor-pointer">Pause Selected</button>
             <button type="button" onClick={() => setIsBulkDeleteModalOpen(true)} className="px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white font-bold rounded-lg cursor-pointer">Delete Selected</button>
             <button type="button" onClick={() => setSelectedGigIds([])} className="px-2 py-1 text-slate-500 hover:underline">Clear</button>
           </div>
@@ -613,19 +619,24 @@ export const AdminGigsModule: React.FC<AdminGigsModuleProps> = ({
                       {/* Status & Featured Badge */}
                       <td className="py-3.5 px-4">
                         <div className="space-y-1">
-                          {g.status === 'published' && (
+                          {g.status === 'active' && (
                             <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 inline-block">
-                              Published
+                              Active
                             </span>
                           )}
-                          {g.status === 'draft' && (
-                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 text-slate-600 border border-slate-200 inline-block">
-                              Draft
+                          {g.status === 'paused' && (
+                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-50 text-amber-700 border border-amber-200 inline-block">
+                              Paused
                             </span>
                           )}
-                          {g.status === 'suspended' && (
+                          {g.status === 'moderation' && (
+                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-50 text-blue-700 border border-blue-200 inline-block">
+                              Under Moderation
+                            </span>
+                          )}
+                          {g.status === 'deleted' && (
                             <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-50 text-rose-700 border border-rose-200 inline-block">
-                              Suspended
+                              Deleted
                             </span>
                           )}
 
@@ -695,8 +706,8 @@ export const AdminGigsModule: React.FC<AdminGigsModuleProps> = ({
                                 onClick={() => { handleStatusToggle(g); setOpenDropdownId(null); }}
                                 className="w-full text-left px-3 py-2 hover:bg-slate-50 text-slate-700 font-semibold rounded-xl flex items-center gap-2 cursor-pointer"
                               >
-                                {g.status === 'suspended' ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" /> : <Ban className="w-3.5 h-3.5 text-rose-600" />}
-                                <span>{g.status === 'suspended' ? 'Restore Gig' : 'Suspend Gig'}</span>
+                                {g.status === 'paused' ? <Play className="w-3.5 h-3.5 text-emerald-600" /> : <Pause className="w-3.5 h-3.5 text-amber-600" />}
+                                <span>{g.status === 'paused' ? 'Resume Gig (Active)' : 'Pause Gig'}</span>
                               </button>
                             </div>
                             <div className="py-1 px-1">

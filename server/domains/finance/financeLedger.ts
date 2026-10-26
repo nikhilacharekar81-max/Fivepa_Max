@@ -142,14 +142,15 @@ export interface FinancialAuditLog {
 
 export interface ReconciliationException {
   id: string;
-  type: 'gateway_mismatch' | 'unbalanced_journal' | 'wallet_ledger_drift' | 'orphan_payout' | 'duplicate_provider_ref';
+  type: 'gateway_mismatch' | 'unbalanced_journal' | 'wallet_ledger_drift' | 'orphan_payout' | 'duplicate_provider_ref' | string;
   entityId: string;
   amount: number;
   currency: string;
   description: string;
-  status: 'unresolved' | 'investigating' | 'resolved';
+  status: 'open' | 'unresolved' | 'investigating' | 'resolved';
   assignedTo?: string;
   investigationNotes?: string;
+  resolvedBy?: string;
   resolvedAt?: string;
   detectedAt: string;
 }
@@ -627,9 +628,7 @@ export class FinanceLedgerEngine {
   }
 
   private ensureOperational() {
-    if (this.loadFailed) {
-      throw new Error('Ledger operational fault: Initial disk load failed. Financial operations are locked to prevent data inconsistency.');
-    }
+    // Authoritative persistence is managed in PostgreSQL
   }
 
   // ----- deposits ----------------------------------------------------------
@@ -1169,14 +1168,8 @@ export class FinanceLedgerEngine {
     };
   }
 
-  public resolveException(exceptionId: string, notes: string, actor: string) {
-    const ex = this.exceptions.find(e => e.id === exceptionId);
-    if (!ex) throw new Error('Exception record not found');
-    ex.status = 'resolved';
-    ex.investigationNotes = notes;
-    ex.resolvedAt = nowStr();
-    this.audit({ actor, action: 'RECONCILIATION_EXCEPTION_RESOLVED', target: `Exception #${ex.id}`, reason: notes });
-    return ex;
+  public resolveException(_exceptionId: string, _notes: string, _actor: string): never {
+    throw new Error('Legacy in-memory reconciliation exception resolution is disabled. Use financialTransactionService.resolveReconciliationException against PostgreSQL.');
   }
 
   public getJournals() { return this.journals; }
@@ -1225,34 +1218,22 @@ export class FinanceLedgerEngine {
     }
   }
 
-  // ----- persistence ------------------------------------------------------
-  private loadFailed = false;
-
+  // ----- persistence (DEPRECATED: Normalized PostgreSQL tables are sole source of truth) -----
   private saveToDisk() {
-    if (this.loadFailed) {
-      console.warn('Skipping ledger save to disk because initial load failed (preventing file overwrite).');
-      return;
-    }
-    try {
-      this.persistToPostgres().catch(err => {
-        console.error('[FinanceLedger] saveToDisk async error:', err);
-      });
-    } catch (err) {
-      console.error('Failed to save financial ledger:', err);
-    }
+    // No-op: Legacy snapshot persistence is disabled to prevent overwriting PostgreSQL financial records.
   }
 
   public getSerializableState() {
     return {
-      journals: this.journals,
-      transactions: this.transactions,
-      wallets: Array.from(this.wallets.entries()),
-      auditLogs: this.auditLogs,
-      exceptions: this.exceptions,
-      idempotencyKeys: Array.from(this.idempotencyKeys),
-      escrows: Array.from(this.escrows.entries()),
-      payouts: Array.from(this.payouts.entries()),
-      opResults: Array.from(this.opResults.entries()),
+      journals: [],
+      transactions: [],
+      wallets: [],
+      auditLogs: [],
+      exceptions: [],
+      idempotencyKeys: [],
+      escrows: [],
+      payouts: [],
+      opResults: [],
       config: {
         platformCommissionRate: this.platformCommissionRate,
         buyerFeePercent: this.buyerFeePercent,
@@ -1271,28 +1252,13 @@ export class FinanceLedgerEngine {
   }
 
   public async persistToPostgres(): Promise<void> {
-    try {
-      const state = this.getSerializableState();
-      const { postgresStore } = await import('../../db/postgresStore.js');
-      if (!postgresStore.isHydrated) return;
-      await postgresStore.saveLedgerState(state);
-    } catch (err) {
-      console.error('[FinanceLedger] Failed to persist state to PostgreSQL:', err);
-    }
+    // No-op: Legacy snapshot persistence to financial_ledger_state is disabled.
+    return Promise.resolve();
   }
 
   public loadFromState(data: any) {
     if (!data || typeof data !== 'object') return;
-    if (data.journals && Array.isArray(data.journals)) this.journals = data.journals;
-    if (data.transactions && Array.isArray(data.transactions)) this.transactions = data.transactions;
-    if (data.wallets && Array.isArray(data.wallets)) this.wallets = new Map(data.wallets);
-    if (data.auditLogs && Array.isArray(data.auditLogs)) this.auditLogs = data.auditLogs;
-    if (data.exceptions && Array.isArray(data.exceptions)) this.exceptions = data.exceptions;
-    if (data.idempotencyKeys && Array.isArray(data.idempotencyKeys)) this.idempotencyKeys = new Set(data.idempotencyKeys);
-    if (data.escrows && Array.isArray(data.escrows)) this.escrows = new Map(data.escrows);
-    if (data.payouts && Array.isArray(data.payouts)) this.payouts = new Map(data.payouts);
-    if (data.opResults && Array.isArray(data.opResults)) this.opResults = new Map(data.opResults);
-
+    // Only fee calculation parameters may be updated; financial records are never hydrated from snapshots.
     if (data.config) {
       this.platformCommissionRate = data.config.platformCommissionRate ?? this.platformCommissionRate;
       this.buyerFeePercent = data.config.buyerFeePercent ?? this.buyerFeePercent;
@@ -1306,7 +1272,7 @@ export class FinanceLedgerEngine {
   }
 
   public loadFromDisk() {
-    // Deprecated: Ledger state is now loaded from PostgreSQL via hydrateStoreFromPostgres()
+    // No-op: PostgreSQL normalized financial tables are the sole authoritative source of truth.
   }
 
   public resetToCleanState() {
@@ -1319,9 +1285,9 @@ export class FinanceLedgerEngine {
     this.payouts.clear();
     this.opResults.clear();
     this.wallets.clear();
-    this.saveToDisk();
   }
 }
 
-// Global Singleton Instance for the application session
+// Global Singleton Instance for fee configuration and pure quote calculations
 export const financeLedger = new FinanceLedgerEngine();
+

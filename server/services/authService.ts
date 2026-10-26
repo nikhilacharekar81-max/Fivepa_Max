@@ -295,6 +295,40 @@ export async function handleLogin(req: Request, res: Response) {
     return res.status(403).json({ error: `Account is ${user.status}.` });
   }
 
+  if (!user.emailVerified) {
+    const userEmailKey = (user.email || lookupEmail || user.id).toLowerCase();
+    const newCode = generate6DigitCode();
+    const expiresAtMs = Date.now() + 30 * 60 * 1000;
+    if (isPostgresEnabled()) {
+      try {
+        await postgresStore.getPool().query(
+          `INSERT INTO auth_verification_codes (email, code, type, attempts, last_resend_at, expires_at, created_at)
+           VALUES ($1, $2, 'verify', 0, $3, $4, NOW())
+           ON CONFLICT (email, type) DO UPDATE SET code = $2, attempts = 0, last_resend_at = $3, expires_at = $4, created_at = NOW()`,
+          [userEmailKey, newCode, Date.now(), new Date(expiresAtMs)]
+        );
+      } catch (err) {
+        console.error('[Auth] Failed to persist login verification code for unverified account:', err);
+      }
+    } else {
+      emailVerificationCodes.set(userEmailKey, {
+        code: newCode,
+        expiresAt: expiresAtMs,
+        lastResendAt: Date.now(),
+        attempts: 0
+      });
+    }
+
+    deliverSecurityCode(user.email, 'SIGNUP_EMAIL', newCode);
+
+    return res.status(403).json({
+      error: 'Email address has not been verified. Please verify your email before logging in.',
+      requiresVerification: true,
+      email: user.email,
+      mockEmailCode: !IS_PRODUCTION ? newCode : undefined
+    });
+  }
+
   const rawDeviceId = req.body?.deviceId || req.headers['x-device-id'];
   const deviceId = rawDeviceId ? String(rawDeviceId).trim() : 'dev_default_session';
 

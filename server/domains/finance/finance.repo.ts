@@ -311,19 +311,15 @@ export class FinanceRepo {
     return res.rows.length > 0 ? res.rows[0].value : null;
   }
 
-  // --- FINANCIAL LEDGER STATE ---
-  async saveLedgerState(state: any): Promise<void> {
-    return this.ctx.withLock('financial_ledger_state', async () => {
-      const query = `INSERT INTO financial_ledger_state (key, value, updated_at)
-         VALUES ('primary', $1, NOW())
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`;
-      const params = [JSON.stringify(state)];
-      await this.ctx.getPool().query(query, params);
-    });
+  // --- FINANCIAL LEDGER STATE (DEPRECATED: Normalized PostgreSQL tables are sole source of truth) ---
+  async saveLedgerState(_state: any): Promise<void> {
+    // No-op: Legacy in-memory ledger snapshot persistence is disabled to prevent overwriting normalized PostgreSQL financial tables.
+    return Promise.resolve();
   }
 
   async loadLedgerState(): Promise<any | null> {
-    const res = await this.ctx.getPool().query("SELECT value FROM financial_ledger_state WHERE key = 'primary'");
-    return res.rows.length > 0 ? res.rows[0].value : null;
+    // No-op: Legacy in-memory ledger snapshot hydration is disabled; PostgreSQL normalized tables are authoritative.
+    return null;
   }
 }
+

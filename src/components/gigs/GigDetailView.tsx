@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Star, Sparkles, Clock, RefreshCw, ShieldCheck, Lock, MessageSquare } from 'lucide-react';
+import { Star, Sparkles, Clock, RefreshCw, ShieldCheck, Lock, MessageSquare, AlertCircle } from 'lucide-react';
 import { Gig, Review, UserAccount, Order } from '../../types';
 import { RelatedGigsSection } from './RelatedGigsSection';
 import { Reviews } from '../gig_reviews';
@@ -362,19 +362,29 @@ export const GigDetailView: React.FC<GigDetailViewProps> = ({
                     <span>100% Escrow Protection. Funds are safely held until work is delivered and approved.</span>
                   </div>
 
-                  <button 
-                    onClick={() => handleCreateOrder(
-                      `${currentGig.title}${selectedExtrasObjects.length > 0 ? ` (with ${selectedExtrasObjects.length} extra add-ons)` : ''}`, 
-                      totalUSD, 
-                      currentGig.freelancerId,
-                      currentGig.id,
-                      selectedExtras
-                    )}
-                    className="w-full py-4 bg-emerald-500 text-slate-950 font-bold rounded-2xl hover:bg-emerald-400 transition-colors shadow-md text-xs flex items-center justify-center gap-2 cursor-pointer"
-                  >
-                    <Lock className="w-4 h-4" />
-                    <span>Fund in Escrow & Order Now</span>
-                  </button>
+                  {currentGig.status === 'paused' ? (
+                    <div className="p-4 bg-amber-50 border border-amber-300 rounded-2xl text-center space-y-1">
+                      <div className="flex items-center justify-center gap-2 text-amber-900 font-bold text-xs">
+                        <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+                        <span>This gig has been paused and cannot be purchased</span>
+                      </div>
+                      <p className="text-[11px] text-amber-700">The seller has temporarily paused orders for this service.</p>
+                    </div>
+                  ) : (
+                    <button 
+                      onClick={() => handleCreateOrder(
+                        `${currentGig.title}${selectedExtrasObjects.length > 0 ? ` (with ${selectedExtrasObjects.length} extra add-ons)` : ''}`, 
+                        totalUSD, 
+                        currentGig.freelancerId,
+                        currentGig.id,
+                        selectedExtras
+                      )}
+                      className="w-full py-4 bg-emerald-500 text-slate-950 font-bold rounded-2xl hover:bg-emerald-400 transition-colors shadow-md text-xs flex items-center justify-center gap-2 cursor-pointer"
+                    >
+                      <Lock className="w-4 h-4" />
+                      <span>Fund in Escrow & Order Now</span>
+                    </button>
+                  )}
                 </>
               );
             })()}
