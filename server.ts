@@ -109,6 +109,19 @@ app.use((req, res, next) => {
   if (IS_PRODUCTION) res.setHeader('Strict-Transport-Security', 'max-age=15552000');
   (req as any).requestId = randomUUID();
   res.setHeader('X-Request-ID', (req as any).requestId);
+
+  // Production error sanitizer: intercept 500 responses to sanitize error messages
+  const originalJson = res.json.bind(res);
+  res.json = function (body: any) {
+    if (process.env.NODE_ENV === 'production' && res.statusCode >= 500) {
+      if (body && typeof body === 'object') {
+        return originalJson({ ...body, error: 'Internal server error' });
+      }
+      return originalJson({ error: 'Internal server error' });
+    }
+    return originalJson(body);
+  };
+
   next();
 });
 
@@ -125,6 +138,16 @@ app.use('/api', apiRouter);
 
 // Register root routes (robots.txt, sitemap.xml)
 app.use('/', rootRouter);
+
+// Global Error Handler
+app.use((err: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  const status = Number(err?.status || err?.statusCode || 500);
+  console.error(`[Error] ${req.method} ${req.path}:`, err);
+  if (process.env.NODE_ENV === 'production' && status >= 500) {
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+  return res.status(status).json({ error: err?.message || 'Internal server error' });
+});
 
 
 export const server = createServer(app);

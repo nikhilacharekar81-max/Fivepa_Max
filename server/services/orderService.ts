@@ -139,6 +139,11 @@ export async function resolveGigOrderPrice(gigId: string, extraIds: unknown): Pr
     throw err;
   }
   const r = res.rows[0];
+  if (r.status && r.status !== 'active') {
+    const err: any = new Error('This gig is not active for purchase.');
+    err.status = 400;
+    throw err;
+  }
   const basePrice = Number(r.price || 0);
   const extras = Array.isArray(r.extras) ? r.extras : [];
   const requestedIds = Array.isArray(extraIds) ? extraIds.map(String) : [];
@@ -157,6 +162,7 @@ export async function resolveGigOrderPrice(gigId: string, extraIds: unknown): Pr
       title: r.title,
       price: basePrice,
       freelancerId: r.freelancer_id,
+      freelancer_id: r.freelancer_id,
       deliveryDays: Number(r.delivery_days || 7),
       extras
     },

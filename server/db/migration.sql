@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS users (
 ALTER TABLE users ADD COLUMN IF NOT EXISTS notification_preferences JSONB;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;
 UPDATE users SET password_hash = password WHERE password_hash IS NULL AND password IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower ON users (LOWER(email));
 
 CREATE TABLE IF NOT EXISTS gigs (
   id VARCHAR(64) PRIMARY KEY,

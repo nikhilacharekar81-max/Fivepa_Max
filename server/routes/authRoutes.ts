@@ -95,7 +95,7 @@ authRouter.post('/signup', rateLimit(20, 3_600_000), async (req: Request, res: R
       skills: ['General'],
       status: 'active',
       verified: false,
-      emailVerified: true,
+      emailVerified: false,
       mobileVerified: false,
       walletBalance: 0,
       createdAt: new Date().toISOString().substring(0, 10),

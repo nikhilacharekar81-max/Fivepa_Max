@@ -238,12 +238,20 @@ projectRouter.post('/projects', requireAuth, requireActiveStatus, async (req: Re
     const caller = (req as any).authenticatedUser;
     if (caller.status === 'restricted') return res.status(403).json({ error: 'Restricted: You cannot post new projects while your account is restricted.' });
 
+    const budgetMin = Number(req.body.budgetMin !== undefined ? req.body.budgetMin : req.body.minBudget);
+    const budgetMax = Number(req.body.budgetMax !== undefined ? req.body.budgetMax : (req.body.maxBudget !== undefined ? req.body.maxBudget : budgetMin));
+    if (!Number.isFinite(budgetMin) || budgetMin < 1) {
+      return res.status(400).json({ error: 'Minimum project budget must be at least $1.00.' });
+    }
+    if (!Number.isFinite(budgetMax) || budgetMax < budgetMin) {
+      return res.status(400).json({ error: 'Maximum budget must be greater than or equal to minimum budget.' });
+    }
+
     const activeSettings = siteSettings.getSettings();
-    const minBudget = activeSettings.marketplace.minimumProjectBudget ?? 1;
-    const budgetMin = Number(req.body.budgetMin);
-    if (minBudget > 0 && budgetMin < minBudget) {
+    const platformMinBudget = activeSettings.marketplace.minimumProjectBudget ?? 1;
+    if (platformMinBudget > 0 && budgetMin < platformMinBudget) {
       return res.status(400).json({
-        error: `Project budget ($${budgetMin}) is below the platform minimum requirement of $${minBudget}.`
+        error: `Project budget ($${budgetMin}) is below the platform minimum requirement of $${platformMinBudget}.`
       });
     }
 
@@ -252,7 +260,6 @@ projectRouter.post('/projects', requireAuth, requireActiveStatus, async (req: Re
     const category = req.body.category || 'Development & IT';
     const subcategory = req.body.subcategory || 'General';
     const description = escapeHtml(req.body.description || '');
-    const budgetMax = Number(req.body.budgetMax || budgetMin);
     const deadlineDays = 14;
     const createdAt = new Date().toISOString().split('T')[0];
 
@@ -281,6 +288,47 @@ projectRouter.post('/projects', requireAuth, requireActiveStatus, async (req: Re
   }
 });
 
+// Update Project (PUT)
+projectRouter.put('/projects/:id', requireAuth, requireActiveStatus, async (req: Request, res: Response) => {
+  try {
+    const caller = (req as any).authenticatedUser;
+    const project = await store.getProject(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    if (project.buyerId !== caller.id && !isStaffUser(caller)) {
+      return res.status(403).json({ error: 'Forbidden: You can only edit your own projects.' });
+    }
+
+    const budgetMin = Number(req.body.budgetMin !== undefined ? req.body.budgetMin : (req.body.minBudget !== undefined ? req.body.minBudget : project.budgetMin));
+    const budgetMax = Number(req.body.budgetMax !== undefined ? req.body.budgetMax : (req.body.maxBudget !== undefined ? req.body.maxBudget : project.budgetMax));
+    if (!Number.isFinite(budgetMin) || budgetMin < 1) {
+      return res.status(400).json({ error: 'Minimum project budget must be at least $1.00.' });
+    }
+    if (!Number.isFinite(budgetMax) || budgetMax < budgetMin) {
+      return res.status(400).json({ error: 'Maximum budget must be greater than or equal to minimum budget.' });
+    }
+
+    if (req.body.title !== undefined) project.title = escapeHtml(String(req.body.title));
+    if (req.body.category !== undefined && typeof req.body.category === 'string') project.category = req.body.category.trim().slice(0, 100);
+    if (req.body.subcategory !== undefined && typeof req.body.subcategory === 'string') project.subcategory = req.body.subcategory.trim().slice(0, 100);
+    if (req.body.description !== undefined) project.description = escapeHtml(String(req.body.description));
+    project.budgetMin = budgetMin;
+    project.budgetMax = budgetMax;
+    if (req.body.deadlineDays !== undefined) project.deadlineDays = Math.max(1, Math.min(365, Number(req.body.deadlineDays) || 14));
+    if (req.body.status !== undefined) {
+      const allowedStatuses = ['open', 'in_progress', 'completed', 'cancelled', 'closed'];
+      if (!allowedStatuses.includes(req.body.status)) {
+        return res.status(400).json({ error: 'Invalid project status.' });
+      }
+      project.status = req.body.status;
+    }
+
+    await store.saveProject(project);
+    res.json(project);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to update project' });
+  }
+});
+
 // Update Project Status
 projectRouter.patch('/projects/:id/status', requireAuth, requireActiveStatus, async (req: Request, res: Response) => {
   try {
@@ -296,8 +344,8 @@ projectRouter.patch('/projects/:id/status', requireAuth, requireActiveStatus, as
     }
 
     const requestedStatus = typeof req.body?.status === 'string' ? req.body.status.trim().toLowerCase() : 'completed';
-    const allowedStatuses: Project['status'][] = ['open', 'published', 'in_progress', 'completed', 'unpublished'];
-    if (!allowedStatuses.includes(requestedStatus as Project['status'])) {
+    const allowedStatuses = ['open', 'in_progress', 'completed', 'cancelled', 'closed'];
+    if (!allowedStatuses.includes(requestedStatus)) {
       return res.status(400).json({ error: 'Invalid project status.' });
     }
 
@@ -378,10 +426,24 @@ projectRouter.patch('/admin/projects/:id', requireAdmin, async (req: Request, re
     if (req.body.category !== undefined && typeof req.body.category === 'string') project.category = req.body.category.trim().slice(0, 100);
     if (req.body.subcategory !== undefined && typeof req.body.subcategory === 'string') project.subcategory = req.body.subcategory.trim().slice(0, 100);
     if (req.body.description !== undefined) project.description = escapeHtml(String(req.body.description));
-    if (req.body.budgetMin !== undefined) project.budgetMin = Number(req.body.budgetMin);
-    if (req.body.budgetMax !== undefined) project.budgetMax = Number(req.body.budgetMax);
+    if (req.body.budgetMin !== undefined || req.body.budgetMax !== undefined) {
+      const bMin = req.body.budgetMin !== undefined ? Number(req.body.budgetMin) : project.budgetMin;
+      const bMax = req.body.budgetMax !== undefined ? Number(req.body.budgetMax) : project.budgetMax;
+      if (bMin < 1 || bMax < bMin) {
+        return res.status(400).json({ error: 'Invalid budget: minBudget must be >= 1 and maxBudget >= minBudget' });
+      }
+      project.budgetMin = bMin;
+      project.budgetMax = bMax;
+    }
     if (req.body.deadlineDays !== undefined) project.deadlineDays = Math.max(1, Math.min(365, Number(req.body.deadlineDays) || 14));
-    if (req.body.status !== undefined) project.status = req.body.status;
+    const ALLOWED_PROJECT_STATUSES = ['open', 'in_progress', 'completed', 'cancelled', 'closed'];
+    if (req.body.status !== undefined) {
+      const normalizedStatus = req.body.status === 'in-progress' ? 'in_progress' : req.body.status;
+      if (!ALLOWED_PROJECT_STATUSES.includes(normalizedStatus)) {
+        return res.status(400).json({ error: `Invalid status. Must be one of: ${ALLOWED_PROJECT_STATUSES.join(', ')}` });
+      }
+      project.status = normalizedStatus;
+    }
     if (req.body.moderationStatus !== undefined) project.moderationStatus = req.body.moderationStatus;
     if (req.body.moderationNotes !== undefined) project.moderationNotes = req.body.moderationNotes;
     if (req.body.featured !== undefined) project.featured = Boolean(req.body.featured);
@@ -399,8 +461,14 @@ projectRouter.patch('/admin/projects/:id/status', requireAdmin, async (req: Requ
     const p = await store.getProject(req.params.id);
     if (!p) return res.status(404).json({ error: 'Project not found' });
 
+    const ALLOWED_PROJECT_STATUSES = ['open', 'in_progress', 'completed', 'cancelled', 'closed'];
+    const rawStatus = req.body.status;
+    const newStatus = rawStatus === 'in-progress' ? 'in_progress' : rawStatus;
+    if (!ALLOWED_PROJECT_STATUSES.includes(newStatus)) {
+      return res.status(400).json({ error: `Invalid status. Must be one of: ${ALLOWED_PROJECT_STATUSES.join(', ')}` });
+    }
+
     const oldStatus = p.status;
-    const newStatus = req.body.status;
     p.status = newStatus;
     await store.saveProject(p);
 

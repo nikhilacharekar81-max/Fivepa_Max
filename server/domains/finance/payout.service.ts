@@ -53,12 +53,9 @@ export async function handlePayoutRequest(req: Request, res: Response) {
     }
     await financialTransactionService.ensureWallet(freelancerId);
 
-    const codeRequired = EMAIL_DELIVERY_ENABLED || !IS_PRODUCTION;
-    if (codeRequired) {
-      const verification = await verifyAndConsumeWithdrawalCode(freelancerId, req.body?.code);
-      if (!verification.ok) {
-        return res.status(verification.status).json({ error: verification.error });
-      }
+    const verification = await verifyAndConsumeWithdrawalCode(freelancerId, req.body?.code);
+    if (!verification.ok) {
+      return res.status(verification.status).json({ error: verification.error });
     }
 
     const rawMethod = String(req.body?.method || 'Bank Transfer');

@@ -259,8 +259,15 @@ export function validateMessageFileInfo(fileInfo: any, sender: any):
   };
 }
 
-export function validateStoredWorkstreamFiles(raw: any[], submitter?: any): { ok: true; files: Array<{ name: string; size: string; url: string }> } | { ok: false; error: string } {
+export async function validateStoredWorkstreamFiles(
+  raw: any[],
+  submitter?: any,
+  targetOrderId?: string
+): Promise<{ ok: true; files: Array<{ name: string; size: string; url: string }> } | { ok: false; error: string; status?: number }> {
+  if (!Array.isArray(raw)) return { ok: true, files: [] };
   const out: Array<{ name: string; size: string; url: string }> = [];
+  const baseUploadDir = path.resolve(WORKSTREAM_UPLOADS_DIR);
+
   for (const f of raw) {
     const filename = workstreamFilenameFromUrl(f?.url);
     if (!filename) {
@@ -275,9 +282,35 @@ export function validateStoredWorkstreamFiles(raw: any[], submitter?: any): { ok
       });
       continue;
     }
+
+    const resolvedPath = path.resolve(WORKSTREAM_UPLOADS_DIR, filename);
+    if (!resolvedPath.startsWith(baseUploadDir + path.sep) && resolvedPath !== baseUploadDir) {
+      return { ok: false, error: 'Access denied: Invalid file path.' };
+    }
+
     if (!workstreamFileExists(filename)) {
       return { ok: false, error: `Uploaded file not found on server: ${filename}` };
     }
+
+    // Verify upload ownership and order/workspace binding in PostgreSQL
+    try {
+      const pool = postgresStore.getPool();
+      const res = await pool.query('SELECT * FROM uploads WHERE filename = $1', [filename]);
+      if (res.rows.length > 0) {
+        const row = res.rows[0];
+        if (submitter && !isStaffUser(submitter)) {
+          if (row.owner_id && row.owner_id !== submitter.id) {
+            return { ok: false, error: 'Forbidden: You do not have ownership of this uploaded file.', status: 403 };
+          }
+        }
+        if (targetOrderId && row.order_id && row.order_id !== targetOrderId) {
+          return { ok: false, error: 'Forbidden: File is bound to a different order.', status: 403 };
+        }
+      }
+    } catch (err: any) {
+      console.error('[validateStoredWorkstreamFiles] DB verification error:', err);
+    }
+
     const bytes = workstreamFileBytes(filename);
     const size = bytes > 1024 * 1024 ? `${(bytes / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
     const parts = filename.split('_');

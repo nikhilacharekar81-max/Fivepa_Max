@@ -179,6 +179,10 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
       return res.status(403).json({ error: 'Both accounts must be active to place an order.' });
     }
 
+    if (req.body?.gigId && req.body?.projectId) {
+      return res.status(400).json({ error: 'Order cannot specify both gigId and projectId.' });
+    }
+
     const id = 'ord_' + randomUUID().slice(0, 12);
     const today = new Date().toISOString().split('T')[0];
     let rawAmount = Number(req.body?.amount);
@@ -190,6 +194,32 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
         return res.status(400).json({ error: 'This gig does not belong to the selected seller.' });
       }
       rawAmount = gigPrice;
+    } else if (!isInquiry && req.body?.projectId) {
+      const proj = await store.getProject(req.body.projectId);
+      if (!proj) return res.status(404).json({ error: 'Project not found.' });
+      const projOwner = (proj as any).clientId || proj.buyerId;
+      if (projOwner !== buyerId) {
+        return res.status(403).json({ error: 'Only the project owner can create an order for this project.' });
+      }
+      let proposalQuery = `SELECT * FROM proposals WHERE project_id = $1 AND freelancer_id = $2 AND status IN ('accepted', 'shortlisted', 'pending')`;
+      const proposalParams: any[] = [req.body.projectId, sellerId];
+      if (req.body?.proposalId) {
+        proposalQuery += ` AND id = $3`;
+        proposalParams.push(req.body.proposalId);
+      }
+      proposalQuery += ` ORDER BY created_at DESC LIMIT 1`;
+      const propRes = await postgresStore.getPool().query(proposalQuery, proposalParams);
+      if (propRes.rows.length === 0) {
+        return res.status(400).json({ error: 'No valid proposal found for this freelancer on the specified project.' });
+      }
+      const proposal = propRes.rows[0];
+      rawAmount = Number(proposal.bid_amount);
+    }
+
+    if (!isInquiry) {
+      if (!Number.isFinite(rawAmount) || rawAmount < 1.00) {
+        return res.status(400).json({ error: 'Minimum order amount is $1.00.' });
+      }
     }
 
     const requirements = typeof req.body?.requirements === 'string' ? escapeHtml(req.body.requirements.trim()).slice(0, 2000) : '';
@@ -608,9 +638,9 @@ router.post('/orders/:id/deliverable', requireAuth, requireActiveStatus, async (
 
     let validatedFiles: Array<{ name: string; size: string; url: string }> = [];
     if (rawFiles.length > 0) {
-      const validation = validateStoredWorkstreamFiles(rawFiles, caller);
+      const validation = await validateStoredWorkstreamFiles(rawFiles, caller, order.id);
       if (!validation.ok) {
-        return res.status(400).json({ error: (validation as any).error });
+        return res.status((validation as any).status || 400).json({ error: (validation as any).error });
       }
       validatedFiles = validation.files;
     }

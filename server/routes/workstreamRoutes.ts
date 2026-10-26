@@ -179,6 +179,33 @@ router.post(
         return res.status(413).json({ error: 'File is too large (25 MB maximum).' });
       }
 
+      // Magic byte validation (.pdf `%PDF`, .png `\x89PNG`, .jpg/.jpeg `\xFF\xD8\xFF`, .gif `GIF8`, .webp `RIFF`, .zip `PK\x03\x04`)
+      if (ext === '.pdf') {
+        if (buffer.length < 4 || buffer.toString('utf8', 0, 4) !== '%PDF') {
+          return res.status(400).json({ error: 'Invalid file signature: PDF files must start with %PDF.' });
+        }
+      } else if (ext === '.png') {
+        if (buffer.length < 4 || buffer[0] !== 0x89 || buffer[1] !== 0x50 || buffer[2] !== 0x4e || buffer[3] !== 0x47) {
+          return res.status(400).json({ error: 'Invalid file signature: PNG files must start with \\x89PNG.' });
+        }
+      } else if (ext === '.jpg' || ext === '.jpeg') {
+        if (buffer.length < 3 || buffer[0] !== 0xff || buffer[1] !== 0xd8 || buffer[2] !== 0xff) {
+          return res.status(400).json({ error: 'Invalid file signature: JPEG files must start with \\xFF\\xD8\\xFF.' });
+        }
+      } else if (ext === '.gif') {
+        if (buffer.length < 4 || buffer.toString('utf8', 0, 4) !== 'GIF8') {
+          return res.status(400).json({ error: 'Invalid file signature: GIF files must start with GIF8.' });
+        }
+      } else if (ext === '.webp') {
+        if (buffer.length < 12 || buffer.toString('utf8', 0, 4) !== 'RIFF' || buffer.toString('utf8', 8, 12) !== 'WEBP') {
+          return res.status(400).json({ error: 'Invalid file signature: WebP files must start with RIFF...WEBP.' });
+        }
+      } else if (ext === '.zip') {
+        if (buffer.length < 4 || buffer[0] !== 0x50 || buffer[1] !== 0x4b || buffer[2] !== 0x03 || buffer[3] !== 0x04) {
+          return res.status(400).json({ error: 'Invalid file signature: ZIP files must start with PK\\x03\\x04.' });
+        }
+      }
+
       const orderId = typeof req.query.orderId === 'string' ? req.query.orderId : (typeof req.body?.orderId === 'string' ? req.body.orderId : (req.headers['x-order-id'] as string || undefined));
       const workspaceId = typeof req.query.workspaceId === 'string' ? req.query.workspaceId : (typeof req.body?.workspaceId === 'string' ? req.body.workspaceId : (req.headers['x-workspace-id'] as string || undefined));
 
@@ -558,9 +585,9 @@ router.post('/orders/:id/offers', requireAuth, requireActiveStatus, rateLimit(20
 
     let uploadedFiles: Array<{ id: string; name: string; size: string; url: string; uploadedAt: string; type: string }> = [];
     if (kind === 'invoice' && Array.isArray(req.body?.files) && req.body.files.length > 0) {
-      const validation = validateStoredWorkstreamFiles(req.body.files, caller);
+      const validation = await validateStoredWorkstreamFiles(req.body.files, caller, order.id);
       if (!validation.ok) {
-        return res.status(400).json({ error: (validation as any).error });
+        return res.status((validation as any).status || 400).json({ error: (validation as any).error });
       }
       uploadedFiles = validation.files.map((f: any, idx: number) => ({
         id: 'deliv_' + Date.now() + '_' + idx,

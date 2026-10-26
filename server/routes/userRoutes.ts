@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import { store } from '../store.js';
-import { postgresStore } from '../db/postgresStore.js';
+import { postgresStore, isPostgresEnabled } from '../db/postgresStore.js';
 import { isUserPublic, sanitizePublicUser } from '../publicData.js';
 import {
   requireAuth,
@@ -13,6 +13,9 @@ import {
 } from '../middleware/auth.js';
 import { siteSettings } from '../../src/server/siteSettings.js';
 import { registerAuditLog } from '../services/orderService.js';
+import { disconnectUserSockets } from '../websocket.js';
+import { deliverSecurityCode } from '../services/notificationService.js';
+import { generate6DigitCode, emailVerificationCodes } from '../services/authService.js';
 
 export const userRouter = Router();
 
@@ -110,7 +113,7 @@ userRouter.patch('/users/email', requireAuth, async (req: Request, res: Response
     const user = await store.getUser(authUserId);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    const { email } = req.body || {};
+    const { email, currentPassword } = req.body || {};
     if (typeof email !== 'string' || !email.trim()) {
       return res.status(400).json({ error: 'Email is required.' });
     }
@@ -119,13 +122,49 @@ userRouter.patch('/users/email', requireAuth, async (req: Request, res: Response
       return res.json({ success: true, user: safeUser(user) });
     }
 
+    if (user.password) {
+      if (!currentPassword || typeof currentPassword !== 'string') {
+        return res.status(401).json({ error: 'Current password is required to change email.' });
+      }
+      const match = await bcrypt.compare(String(currentPassword), user.password);
+      if (!match) {
+        return res.status(401).json({ error: 'Current password does not match.' });
+      }
+    }
+
     const existing = await store.getUserByEmail(normalizedEmail);
     if (existing && existing.id !== user.id) {
       return res.status(409).json({ error: 'An account with this email already exists.' });
     }
 
     user.email = normalizedEmail;
+    user.emailVerified = false;
+    user.sessionVersion = (user.sessionVersion || 1) + 1;
+    user.activeSessionVersions = [user.sessionVersion];
     await store.saveUser(user);
+
+    disconnectUserSockets(user.id);
+
+    const verificationCode = generate6DigitCode();
+    const expiresAtMs = Date.now() + 30 * 60 * 1000;
+    if (isPostgresEnabled()) {
+      await postgresStore.getPool().query(
+        `INSERT INTO auth_verification_codes (email, code, type, attempts, last_resend_at, expires_at, created_at)
+         VALUES ($1, $2, 'verify', 0, $3, $4, NOW())
+         ON CONFLICT (email, type) DO UPDATE SET code = $2, attempts = 0, last_resend_at = $3, expires_at = $4, created_at = NOW()`,
+        [normalizedEmail, verificationCode, Date.now(), new Date(expiresAtMs)]
+      );
+    } else {
+      emailVerificationCodes.set(normalizedEmail, {
+        code: verificationCode,
+        expiresAt: expiresAtMs,
+        lastResendAt: Date.now(),
+        attempts: 0
+      });
+    }
+
+    deliverSecurityCode(normalizedEmail, 'EMAIL_VERIFICATION', verificationCode);
+
     res.json({ success: true, user: safeUser(user) });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to update email' });
@@ -216,14 +255,21 @@ const handleUserUpdate = async (req: Request, res: Response) => {
 
     const authUserId = (req as any).authenticatedUserId;
     const caller = (req as any).authenticatedUser || (await store.getUser(authUserId));
-    const isAdmin = isStaffUser(caller);
+    const isFullAdmin = caller?.role === 'admin' || caller?.role === 'super_admin';
 
-    if (!isAdmin && caller.id !== targetUser.id) {
+    if (caller.id !== targetUser.id && !isFullAdmin) {
       return res.status(403).json({ error: 'Forbidden: You can only edit your own account.' });
     }
 
+    if (req.body.role && targetUser.role !== req.body.role) {
+      if (!isFullAdmin) {
+        return res.status(403).json({ error: 'Forbidden: Only administrators can modify roles.' });
+      }
+      targetUser.role = req.body.role;
+    }
+
     if (req.body.password) {
-      if (!isAdmin) {
+      if (caller.id === targetUser.id && !isFullAdmin) {
         const currentPassword = req.body.currentPassword;
         if (!currentPassword) {
           return res.status(400).json({ error: 'Current password is required to change password' });

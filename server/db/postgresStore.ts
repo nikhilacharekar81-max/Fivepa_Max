@@ -58,8 +58,10 @@ export function getDatabaseName(): string {
 
 export function createPgPool(databaseName?: string): pkg.Pool {
   const connectionString = process.env.DATABASE_URL;
+  const isSslEnabled = process.env.PGSSL === 'true' || process.env.PGSSLMODE === 'require';
+  const rejectUnauthorized = process.env.NODE_ENV === 'production' ? (process.env.PGSSLREJECTUNAUTHORIZED !== 'false') : false;
+  const sslMode = isSslEnabled ? { rejectUnauthorized } : false;
   if (connectionString) {
-    const sslMode = process.env.PGSSL === 'true' || process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false;
     return new Pool({
       connectionString,
       ssl: sslMode,
@@ -69,7 +71,6 @@ export function createPgPool(databaseName?: string): pkg.Pool {
     });
   }
   const db = databaseName || getDatabaseName();
-  const sslMode = process.env.PGSSL === 'true' || process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false;
   return new Pool({
     host: process.env.SQL_HOST || process.env.PGHOST || 'localhost',
     port: Number(process.env.SQL_PORT || process.env.PGPORT || 5432),
@@ -85,8 +86,10 @@ export function createPgPool(databaseName?: string): pkg.Pool {
 
 export function createAdminPgPool(databaseName?: string): pkg.Pool {
   const connectionString = process.env.DATABASE_URL;
+  const isSslEnabled = process.env.PGSSL === 'true' || process.env.PGSSLMODE === 'require';
+  const rejectUnauthorized = process.env.NODE_ENV === 'production' ? (process.env.PGSSLREJECTUNAUTHORIZED !== 'false') : false;
+  const sslMode = isSslEnabled ? { rejectUnauthorized } : false;
   if (connectionString) {
-    const sslMode = process.env.PGSSL === 'true' || process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false;
     return new Pool({
       connectionString,
       ssl: sslMode,
@@ -95,7 +98,6 @@ export function createAdminPgPool(databaseName?: string): pkg.Pool {
     });
   }
   const db = databaseName || getDatabaseName();
-  const sslMode = process.env.PGSSL === 'true' || process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false;
   return new Pool({
     host: process.env.SQL_HOST || process.env.PGHOST || 'localhost',
     port: Number(process.env.SQL_PORT || process.env.PGPORT || 5432),
@@ -134,18 +136,7 @@ class PGlitePool {
       this.pglite = new PGlite();
     }
     this.isReadyPromise = this.init().catch(async (err) => {
-      console.warn('WARNING: PGlite waitReady failed, resetting dataDir and recreating PGlite:', err);
-      if (dataDir) {
-        try {
-          fs.rmSync(dataDir, { recursive: true, force: true });
-          fs.mkdirSync(dataDir, { recursive: true });
-          this.pglite = new PGlite(dataDir);
-          await this.pglite.waitReady;
-          return;
-        } catch (retryErr) {
-          console.warn('WARNING: PGlite retry with fresh dataDir failed, falling back to in-memory PGlite:', retryErr);
-        }
-      }
+      console.warn('WARNING: PGlite waitReady failed, falling back to in-memory PGlite:', err);
       this.pglite = new PGlite();
       await this.pglite.waitReady;
     });

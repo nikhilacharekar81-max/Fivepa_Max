@@ -400,7 +400,7 @@ const handlePaymentWebhook = async (req: Request, res: Response) => {
     try {
       const result = await postgresStore.executeInTransaction(async (client) => {
         const sessRes = await client.query(
-          'SELECT * FROM payment_checkout_sessions WHERE id = $1 OR provider_tx_id = $1 FOR UPDATE',
+          'SELECT * FROM payment_checkout_sessions WHERE id = $1 FOR UPDATE',
           [chkId]
         );
 
@@ -415,7 +415,7 @@ const handlePaymentWebhook = async (req: Request, res: Response) => {
         if (!sess.currency || sess.currency !== 'USD') {
           throw { status: 400, message: 'Checkout session currency mismatch.' };
         }
-        if (Math.abs(Number(sess.expected_amount) - Number(amount)) > 0.01) {
+        if (Math.round(Number(sess.expected_amount) * 100) !== Math.round(Number(amount) * 100)) {
           throw { status: 400, message: 'Checkout session amount mismatch.' };
         }
         if (sess.status === 'completed') {
@@ -935,7 +935,7 @@ router.delete('/payments/methods/:id', requireAuth, async (req: Request, res: Re
     const pool = postgresStore.getPool();
     const callerRes = await pool.query('SELECT role FROM users WHERE id = $1', [authUserId]);
     const caller = callerRes.rows[0];
-    const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin' || caller?.role === 'support';
+    const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin';
 
     const method = await store.getPaymentMethodById(req.params.id);
     if (!method) return res.status(404).json({ error: 'Payment method not found' });
@@ -957,7 +957,7 @@ router.patch('/payments/methods/:id/default', requireAuth, async (req: Request, 
     const pool = postgresStore.getPool();
     const callerRes = await pool.query('SELECT role FROM users WHERE id = $1', [authUserId]);
     const caller = callerRes.rows[0];
-    const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin' || caller?.role === 'support';
+    const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin';
 
     const method = await store.getPaymentMethodById(req.params.id);
     if (!method) return res.status(404).json({ error: 'Payment method not found' });

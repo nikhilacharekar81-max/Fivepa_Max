@@ -14,6 +14,15 @@ export class IdentityRepo {
         for (const u of users) {
           if (!u?.id || seen.has(u.id)) continue;
           seen.add(u.id);
+          if (u.email) {
+            const conflictCheck = await client.query(
+              'SELECT id FROM users WHERE LOWER(email) = LOWER($1) AND id <> $2 LIMIT 1',
+              [u.email, u.id]
+            );
+            if (conflictCheck.rows.length > 0) {
+              throw new Error('Email address is already registered to another user');
+            }
+          }
           await client.query(
             `INSERT INTO users (
               id, name, username, email, mobile, role, avatar, title, rating, reviews_count, 
