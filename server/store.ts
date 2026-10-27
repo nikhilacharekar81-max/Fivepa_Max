@@ -863,13 +863,13 @@ export class PostgresAsyncStore implements StoreInterface {
         seller_id = EXCLUDED.seller_id,
         amount = EXCLUDED.amount,
         status = CASE
-          WHEN orders.status IN ('completed', 'cancelled') AND EXCLUDED.status NOT IN ('completed', 'cancelled') THEN orders.status
+          WHEN orders.status IN ('completed', 'cancelled') THEN orders.status
           ELSE EXCLUDED.status
         END,
         created_at = EXCLUDED.created_at,
         due_date = EXCLUDED.due_date,
         completed_at = CASE
-          WHEN orders.status IN ('completed', 'cancelled') AND EXCLUDED.status NOT IN ('completed', 'cancelled') THEN orders.completed_at
+          WHEN orders.status IN ('completed', 'cancelled') THEN orders.completed_at
           ELSE COALESCE(EXCLUDED.completed_at, orders.completed_at)
         END,
         requirements = EXCLUDED.requirements,
@@ -894,7 +894,7 @@ export class PostgresAsyncStore implements StoreInterface {
         delivery_notes = EXCLUDED.delivery_notes,
         delivery_reference = EXCLUDED.delivery_reference,
         accepted_version = CASE
-          WHEN orders.status IN ('completed', 'cancelled') AND EXCLUDED.status NOT IN ('completed', 'cancelled') THEN orders.accepted_version
+          WHEN orders.status IN ('completed', 'cancelled') THEN orders.accepted_version
           ELSE COALESCE(EXCLUDED.accepted_version, orders.accepted_version)
         END,
         review_window_days = EXCLUDED.review_window_days,
@@ -912,7 +912,7 @@ export class PostgresAsyncStore implements StoreInterface {
         cancellation_request = EXCLUDED.cancellation_request,
         cancellation_history = EXCLUDED.cancellation_history,
         cancellation_type = CASE
-          WHEN orders.status IN ('completed', 'cancelled') AND EXCLUDED.status NOT IN ('completed', 'cancelled') THEN orders.cancellation_type
+          WHEN orders.status IN ('completed', 'cancelled') THEN orders.cancellation_type
           ELSE COALESCE(EXCLUDED.cancellation_type, orders.cancellation_type)
         END,
         review_window_restarted_at = EXCLUDED.review_window_restarted_at,
