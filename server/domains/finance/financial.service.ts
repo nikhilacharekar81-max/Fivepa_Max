@@ -958,7 +958,7 @@ export class FinancialTransactionService {
       };
 
       await client.query(
-        'UPDATE orders SET status = $1, fee_breakdown = $2, service_fee = $3, small_order_fee = $4 WHERE id = $5',
+        'UPDATE orders SET status = $1, fee_breakdown = $2, service_fee = $3, small_order_fee = $4 WHERE id = $5 AND status NOT IN (\'completed\', \'cancelled\')',
         ['funded_in_escrow', JSON.stringify(feeSnapshot), serviceFee, smallOrderFee, params.orderId]
       );
 
@@ -1046,7 +1046,7 @@ export class FinancialTransactionService {
       await client.query('UPDATE wallets SET funds_on_hold = funds_on_hold - $1 WHERE user_id = $2', [gross, escrow.buyer_id]);
       
       // Update Order
-      await client.query('UPDATE orders SET status = $1, completed_at = COALESCE(completed_at, NOW()::text) WHERE id = $2', ['completed', params.orderId]);
+      await client.query('UPDATE orders SET status = $1, completed_at = COALESCE(completed_at, NOW()::text) WHERE id = $2 AND status NOT IN (\'completed\', \'cancelled\')', ['completed', params.orderId]);
 
       // 14-day Earnings Clearing Entry in Authoritative Table
       const clearingId = 'clr_' + params.orderId;
@@ -1173,7 +1173,7 @@ export class FinancialTransactionService {
       );
 
       if (newRemaining === 0) {
-        await client.query('UPDATE orders SET status = $1 WHERE id = $2', ['cancelled', params.orderId]);
+        await client.query('UPDATE orders SET status = $1 WHERE id = $2 AND status NOT IN (\'completed\', \'cancelled\')', ['cancelled', params.orderId]);
       }
 
       // Record refund in authoritative refunds table inside the same transaction (immutable INSERT)

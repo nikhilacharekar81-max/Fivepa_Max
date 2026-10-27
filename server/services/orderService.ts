@@ -240,7 +240,7 @@ export async function releaseOrderFunds(order: Order, actor: string, reason: str
 
   await syncUserBalances();
   await postgresStore.getPool().query(
-    'UPDATE orders SET status = $1, completed_at = COALESCE(completed_at, $2), accepted_version = COALESCE($3, accepted_version) WHERE id = $4',
+    'UPDATE orders SET status = $1, completed_at = COALESCE(completed_at, $2), accepted_version = COALESCE($3, accepted_version) WHERE id = $4 AND status NOT IN (\'completed\', \'cancelled\')',
     ['completed', order.completedAt, order.acceptedVersion ?? null, order.id]
   );
 
@@ -277,7 +277,7 @@ export async function refundOrderFunds(order: Order, amount: number | undefined,
 
   await syncUserBalances();
   await postgresStore.getPool().query(
-    'UPDATE orders SET status = $1, cancellation_type = COALESCE($2, cancellation_type) WHERE id = $3',
+    'UPDATE orders SET status = $1, cancellation_type = COALESCE($2, cancellation_type) WHERE id = $3 AND status NOT IN (\'completed\', \'cancelled\')',
     [order.status, order.cancellationType || null, order.id]
   );
 
@@ -299,7 +299,7 @@ export async function splitOrderFunds(order: Order, refundAmount: number, actor:
 
   await syncUserBalances();
   await postgresStore.getPool().query(
-    'UPDATE orders SET status = $1, completed_at = COALESCE(completed_at, $2) WHERE id = $3',
+    'UPDATE orders SET status = $1, completed_at = COALESCE(completed_at, $2) WHERE id = $3 AND status NOT IN (\'completed\', \'cancelled\')',
     ['completed', order.completedAt, order.id]
   );
 
