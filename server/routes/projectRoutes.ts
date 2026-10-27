@@ -98,18 +98,30 @@ projectRouter.get('/projects/:id', async (req: Request, res: Response) => {
 
     const authUserId = resolveAuthenticatedUserId(req);
     const callerUser = authUserId ? await store.getUser(authUserId) : null;
-    const callerRole = callerUser?.role;
-    const isAdmin = callerRole === 'admin' || callerRole === 'super_admin';
+    const isStaff = callerUser ? isStaffUser(callerUser) : false;
     const isOwner = Boolean(authUserId && project.buyerId === authUserId);
 
-    const stats = await getBuyerStats(project.buyerId);
+    let hasProposalOrOrder = false;
+    if (authUserId) {
+      const pool = postgresStore.getPool();
+      const [propRes, ordRes] = await Promise.all([
+        pool.query('SELECT 1 FROM proposals WHERE project_id = $1 AND freelancer_id = $2 LIMIT 1', [project.id, authUserId]),
+        pool.query('SELECT 1 FROM orders WHERE project_id = $1 AND (seller_id = $2 OR buyer_id = $2) LIMIT 1', [project.id, authUserId])
+      ]);
+      hasProposalOrOrder = propRes.rows.length > 0 || ordRes.rows.length > 0;
+    }
 
-    if (isProjectPublic(project)) {
-      if (isAdmin || isOwner) return res.json({ ...project, ...stats });
+    const stats = await getBuyerStats(project.buyerId);
+    const isPublic = isProjectPublic(project) && (project as any).isPublished !== false && project.status !== 'suspended' && project.status !== 'unpublished';
+
+    if (isPublic) {
+      if (isStaff || isOwner || hasProposalOrOrder) {
+        return res.json({ ...project, ...stats });
+      }
       return res.json(sanitizePublicProject({ ...project, ...stats }));
     }
 
-    if (isAdmin || isOwner) {
+    if (isStaff || isOwner || hasProposalOrOrder) {
       return res.json({ ...project, ...stats });
     }
     return res.status(404).json({ error: 'Project not found or unavailable' });

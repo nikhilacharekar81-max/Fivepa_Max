@@ -24,6 +24,7 @@ import { paymentGatewayManager } from './paymentGateways.js';
 import {
   requireAuth,
   requireActiveStatus,
+  requireFinancialActiveStatus,
   requireRole,
   requireAdmin,
   adminActor,
@@ -41,14 +42,17 @@ import {
   releaseOrderFunds,
   refundOrderFunds,
   fundOrderEscrowWithEvent,
+  topUpOrderEscrowWithEvent,
+  recordOrder,
   syncUserBalances,
   ensureWallet,
   LATE_ORDER_PROTECTION_HOURS,
   registerAuditLog,
   validateOrderReleasePreconditions
 } from '../../services/orderService.js';
+import { siteSettings } from '../../../src/server/siteSettings.js';
 import { broadcastMessage } from '../../websocket.js';
-import { recordMessage } from '../../services/messagingService.js';
+import { recordMessage, emitSystemEvent } from '../../services/messagingService.js';
 import { closeActiveDispute } from '../../services/disputeService.js';
 import {
   handlePayoutRequest,
@@ -180,7 +184,7 @@ router.get('/payouts', requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-router.post('/payouts', requireAuth, requireActiveStatus, rateLimit(10, 60_000), handlePayoutRequest);
+router.post('/payouts', requireAuth, requireFinancialActiveStatus, rateLimit(10, 60_000), handlePayoutRequest);
 
 // ==========================================
 // USER PAYMENTS SNAPSHOT & ESCROW APIS
@@ -208,6 +212,8 @@ router.get('/payments/user/:userId', requireAuth, async (req: Request, res: Resp
     
     const activeEscrowStatuses = ['funded_in_escrow', 'in_progress', 'delivered', 'revision', 'disputed', 'draft_review', 'work_in_progress'];
     const userOrders = await store.listOrdersForUser(userId);
+    const allUsers = await store.listUsers();
+    const userMap = new Map(allUsers.map(usr => [usr.id, usr]));
 
     const buyerEscrowOrders = userOrders.filter(o => o.buyerId === userId && activeEscrowStatuses.includes(o.status));
     const buyerEscrowAmount = await financialRepository.getBuyerHeldEscrowTotal(userId);
@@ -215,7 +221,47 @@ router.get('/payments/user/:userId', requireAuth, async (req: Request, res: Resp
     const freelancerEscrowOrders = userOrders.filter(o => o.sellerId === userId && activeEscrowStatuses.includes(o.status));
     const freelancerEscrowAmount = await financialRepository.getFreelancerHeldEscrowTotal(userId);
 
+    const enrichOrderFinancialRow = async (o: Order) => {
+      const esc = await financialRepository.getEscrow(o.id);
+      const offers = await store.listOffersForOrder(o.id);
+      const inEscrow = esc
+        ? Number(esc.remaining || 0)
+        : (activeEscrowStatuses.includes(o.status) ? Number(o.amount || 0) : 0);
+      const escrowFunded = esc ? Number(esc.amount || 0) : ((o.status as string) !== 'payment_pending' && (o.status as string) !== 'pending' ? Number(o.amount || 0) : 0);
+      const depositRequests = offers.filter(off => (off.kind === 'deposit' || off.kind === 'proposal') && off.status === 'pending');
+      const pendingInvoices = offers.filter(off => off.kind === 'invoice' && off.status === 'pending');
+      const paidInvoiceOffers = offers.filter(off => off.kind === 'invoice' && (off.status === 'paid' || off.status === 'accepted'));
+      const paidOffersSum = paidInvoiceOffers.reduce((s, off) => s + Number(off.amount || 0), 0);
+      const releasedAmount = esc ? Number(esc.releasedGross || 0) : (o.status === 'completed' ? Number(o.amount || 0) : 0);
+      const paidInvoiceAmount = Math.max(paidOffersSum, releasedAmount, o.status === 'completed' ? Number(o.amount || 0) : 0);
+      const hasPaidInvoice = o.status === 'completed' || paidInvoiceOffers.length > 0 || releasedAmount > 0;
+      const buyerUser = userMap.get(o.buyerId);
+      const sellerUser = userMap.get(o.sellerId);
+
+      return {
+        ...enrichOrderWithServiceInfo(o),
+        buyerName: buyerUser?.name || (o as any).buyerName || o.buyerUsername || 'Buyer',
+        sellerName: sellerUser?.name || (o as any).sellerName || o.sellerUsername || 'Freelancer',
+        inEscrow,
+        escrowFunded,
+        depositRequests,
+        pendingInvoices,
+        paidInvoiceAmount,
+        hasPaidInvoice
+      };
+    };
+
+    const buyerAllOrders = userOrders.filter(o => o.buyerId === userId && o.status !== 'cancelled');
+    const freelancerAllOrders = userOrders.filter(o => o.sellerId === userId && o.status !== 'cancelled');
+
+    const [buyerOrdersSummary, freelancerOrdersSummary] = await Promise.all([
+      Promise.all(buyerAllOrders.map(enrichOrderFinancialRow)),
+      Promise.all(freelancerAllOrders.map(enrichOrderFinancialRow))
+    ]);
+
     const currentYearMonth = new Date().toISOString().slice(0, 7);
+    const twoMonthsAgoDate = new Date(Date.now() - 60 * 86400000).toISOString().slice(0, 10);
+
     const userPaidOrders = userOrders.filter(o => o.buyerId === userId && ['funded_in_escrow', 'in_progress', 'delivered', 'revision', 'disputed', 'completed'].includes(o.status));
     const paidToDate = userPaidOrders.reduce((sum, o) => sum + (o.amount || 0), 0);
     const paidThisMonth = userPaidOrders.filter(o => (o.createdAt || '').startsWith(currentYearMonth)).reduce((sum, o) => sum + (o.amount || 0), 0);
@@ -223,11 +269,17 @@ router.get('/payments/user/:userId', requireAuth, async (req: Request, res: Resp
     const userEarnedOrders = userOrders.filter(o => o.sellerId === userId && o.status === 'completed');
     const earnedToDate = Number(u?.earned || 0) || userEarnedOrders.reduce((sum, o) => sum + financeLedger.quoteOrder(o.amount).freelancerNet, 0);
     const earnedThisMonth = userEarnedOrders.filter(o => (o.createdAt || '').startsWith(currentYearMonth)).reduce((sum, o) => sum + financeLedger.quoteOrder(o.amount).freelancerNet, 0);
+    const earnedPastTwoMonths = userEarnedOrders
+      .filter(o => (o.completedAt || o.createdAt || '') >= twoMonthsAgoDate)
+      .reduce((sum, o) => sum + financeLedger.quoteOrder(o.amount).freelancerNet, 0);
 
     let userMethods: PaymentMethodRecord[] = [];
     try {
       userMethods = await store.listPaymentMethodsForUser(userId);
     } catch {}
+
+    const commSettings = siteSettings.getSettings()?.commission;
+    const clearingPeriodDays = Number(commSettings?.escrowProtectionDays) || 14;
 
     res.json({
       userId,
@@ -236,12 +288,14 @@ router.get('/payments/user/:userId', requireAuth, async (req: Request, res: Resp
       freelancerEscrowAmount,
       buyerEscrowOrders,
       freelancerEscrowOrders,
+      buyerOrdersSummary,
+      freelancerOrdersSummary,
       paidToDate,
       paidThisMonth,
       earnedToDate,
       earnedThisMonth,
-      earnedPastTwoMonths: earnedThisMonth,
-      clearingPeriodDays: 14,
+      earnedPastTwoMonths,
+      clearingPeriodDays,
       paymentMethods: userMethods,
       walletStatus: wallet?.status || 'active'
     });
@@ -250,9 +304,157 @@ router.get('/payments/user/:userId', requireAuth, async (req: Request, res: Resp
   }
 });
 
-router.post('/payments/withdraw', requireAuth, requireActiveStatus, rateLimit(10, 60_000), handlePayoutRequest);
+router.post('/payments/escrow/deposit', requireAuth, requireFinancialActiveStatus, rateLimit(15, 60_000), async (req: Request, res: Response) => {
+  const { orderId, amount: rawAmount, title: rawTitle, fundSource = 'wallet', idempotencyKey: rawKey } = req.body || {};
+  if (!orderId || typeof orderId !== 'string') {
+    return res.status(400).json({ error: 'Order ID is required to fund escrow.' });
+  }
+  if (!tryAcquireOrderLock(orderId, res)) return;
+  try {
+    const authUserId = (req as any).authenticatedUserId;
+    const caller = await store.getUser(authUserId);
+    if (!caller) return res.status(401).json({ error: 'Unauthorized' });
 
-router.post('/payments/deposit', requireAuth, requireActiveStatus, rateLimit(10, 60_000), async (req: Request, res: Response) => {
+    const order = await store.getOrder(orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found.' });
+
+    const isAdmin = caller.role === 'admin' || caller.role === 'super_admin';
+    if (!isAdmin && order.buyerId !== authUserId) {
+      return res.status(403).json({ error: 'Forbidden: Only the buyer of this order can deposit into its escrow.' });
+    }
+
+    const amount = Math.round(Number(rawAmount) * 100) / 100;
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'Please enter a valid escrow deposit amount greater than $0.00.' });
+    }
+    if (amount > 100000) {
+      return res.status(400).json({ error: 'Amount exceeds maximum limit ($100,000.00).' });
+    }
+
+    await ensureWallet(order.buyerId);
+    await ensureWallet(order.sellerId);
+
+    const idempotencyKey = String(rawKey || `escrow-dep-${order.id}-${Date.now()}`);
+    const walletBal = await financialRepository.getWalletBalance(order.buyerId);
+
+    // If buyer selected instant card/gateway deposit or needs wallet top-up when simulated deposits are enabled
+    if (fundSource === 'instant_deposit' || (walletBal < amount && req.body?.autoDeposit === true)) {
+      if (!areSimulatedDepositsAllowed()) {
+        return res.status(400).json({ error: 'Insufficient wallet balance. Please deposit funds first.' });
+      }
+      const shortfall = fundSource === 'instant_deposit' ? amount : Math.max(0, Number((amount - walletBal).toFixed(2)));
+      if (shortfall > 0) {
+        if (shortfall > 5000) {
+          return res.status(400).json({ error: 'Simulated instant deposits are limited to $5,000.00 per transaction.' });
+        }
+        await financialTransactionService.creditDeposit({
+          userId: order.buyerId,
+          amount: shortfall,
+          actor: `${caller.name} (Escrow Instant Deposit)`,
+          idempotencyKey: `SIM-ESC-${order.buyerId}-${idempotencyKey}`
+        });
+      }
+    }
+
+    const existingEscrow = await financialRepository.getEscrow(order.id);
+    const today = new Date().toISOString().split('T')[0];
+    const protectionDays = siteSettings.getSettings()?.commission?.escrowProtectionDays || 14;
+    const protectionEnd = new Date(Date.now() + protectionDays * 86400000).toISOString().split('T')[0];
+    const depositTitle = (typeof rawTitle === 'string' && rawTitle.trim()) ? rawTitle.trim() : `Escrow deposit for ${order.title}`;
+
+    let targetOrder = order;
+
+    if (!existingEscrow && ['payment_pending', 'pending', 'in_progress'].includes(order.status)) {
+      await fundOrderEscrowWithEvent({
+        orderId: order.id,
+        orderTitle: order.title,
+        amount,
+        buyerId: order.buyerId,
+        sellerId: order.sellerId,
+        actor: `user:${order.buyerId}`,
+        idempotencyKey
+      });
+      order.amount = amount;
+      order.status = 'funded_in_escrow';
+      order.escrowProtectionStartDate = today;
+      order.escrowProtectionEndDate = protectionEnd;
+      await store.saveOrder(order);
+      await emitSystemEvent(order.id, 'escrow_funded', `🔒 $${amount.toFixed(2)} USD funded into escrow by ${caller.name}.`, { amount });
+    } else if ((order.status as string) === 'completed' || (order.status as string) === 'cancelled' || (existingEscrow && existingEscrow.remaining === 0 && (order.status as string) === 'completed')) {
+      const newOrderId = 'ord_' + randomUUID().slice(0, 12);
+      const isGigOrder = order.orderType === 'gig' || (Boolean(order.gigId) && !order.projectId);
+      const orderType: 'gig' | 'project' = isGigOrder ? 'gig' : 'project';
+      const newOrder: Order = {
+        id: newOrderId,
+        workspaceId: order.workspaceId,
+        orderType,
+        ...(orderType === 'gig' ? { gigOrderId: newOrderId } : { projectOrderId: newOrderId }),
+        title: depositTitle,
+        buyerId: order.buyerId,
+        sellerId: order.sellerId,
+        amount,
+        status: 'payment_pending',
+        createdAt: today,
+        dueDate: new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0],
+        escrowProtectionStartDate: today,
+        escrowProtectionEndDate: protectionEnd,
+        feeBreakdown: calculateOrderFees(amount),
+        projectId: order.projectId,
+        gigId: order.gigId
+      };
+      const enrichedNew = enrichOrderWithServiceInfo(newOrder);
+      await recordOrder(enrichedNew);
+      await store.saveOrder(enrichedNew);
+
+      await fundOrderEscrowWithEvent({
+        orderId: newOrder.id,
+        orderTitle: newOrder.title,
+        amount,
+        buyerId: newOrder.buyerId,
+        sellerId: newOrder.sellerId,
+        actor: `user:${newOrder.buyerId}`,
+        idempotencyKey
+      });
+      enrichedNew.status = 'funded_in_escrow';
+      await store.saveOrder(enrichedNew);
+      await emitSystemEvent(newOrder.id, 'order_created', `Follow-on Escrow Deposit placed: ${newOrder.title} ($${amount.toFixed(2)} USD held in escrow).`);
+      targetOrder = enrichedNew;
+    } else {
+      await topUpOrderEscrowWithEvent({
+        orderId: order.id,
+        orderTitle: depositTitle,
+        amount,
+        buyerId: order.buyerId,
+        sellerId: order.sellerId,
+        actor: `user:${order.buyerId}`,
+        idempotencyKey
+      });
+      order.amount = Math.round((Number(order.amount || 0) + amount) * 100) / 100;
+      await store.saveOrder(order);
+    }
+
+    // Mark any matching pending deposit offer as accepted
+    const orderOffers = await store.listOffersForOrder(order.id);
+    const pendingDep = orderOffers.find(o => o.kind === 'deposit' && o.status === 'pending');
+    if (pendingDep) {
+      await postgresStore.getPool().query(
+        "UPDATE workstream_offers SET status = 'accepted', resolved_at = $1, resolved_by = $2 WHERE id = $3",
+        [new Date().toISOString(), caller.id, pendingDep.id]
+      );
+    }
+
+    await syncUserBalances([order.buyerId, order.sellerId]);
+    res.json({ success: true, order: enrichOrderWithServiceInfo(targetOrder), amount });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message || 'Failed to deposit into escrow.' });
+  } finally {
+    releaseOrderLock(orderId);
+  }
+});
+
+router.post('/payments/withdraw', requireAuth, requireFinancialActiveStatus, rateLimit(10, 60_000), handlePayoutRequest);
+
+router.post('/payments/deposit', requireAuth, requireFinancialActiveStatus, rateLimit(10, 60_000), async (req: Request, res: Response) => {
   try {
     if (!areSimulatedDepositsAllowed()) {
       return res.status(501).json({ error: 'Deposits require a connected payment gateway in production.' });
@@ -322,41 +524,102 @@ router.post('/payments/gateway/checkout', requireAuth, rateLimit(10, 60_000), as
     const callerRes = await pool.query('SELECT id, name FROM users WHERE id = $1', [authUserId]);
     const caller = callerRes.rows[0];
     if (!caller) return res.status(401).json({ error: 'Unauthorized' });
-    const amt = Number(amount);
-    if (!Number.isFinite(amt) || amt < 1.00) {
-      return res.status(400).json({ error: 'Valid amount of at least $1.00 USD is required.' });
-    }
 
     if (currency !== 'USD') {
       return res.status(400).json({ error: 'Only USD currency is supported.' });
+    }
+
+    const normalizedGateway = String(gateway || 'stripe').trim().toLowerCase();
+    if (!['stripe', 'paypal', 'razorpay'].includes(normalizedGateway)) {
+      return res.status(400).json({ error: `Unsupported payment gateway "${gateway}".` });
+    }
+
+    const requestedPurpose = String(purpose || 'deposit').trim().toLowerCase();
+    if (!['deposit', 'order_payment', 'order'].includes(requestedPurpose)) {
+      return res.status(400).json({ error: `Invalid checkout purpose "${purpose}".` });
+    }
+
+    const normalizedOrderId = orderId !== undefined && orderId !== null && String(orderId).trim() !== ''
+      ? String(orderId).trim()
+      : null;
+
+    if ((requestedPurpose === 'order_payment' || requestedPurpose === 'order') && !normalizedOrderId) {
+      return res.status(400).json({ error: 'orderId is required when checkout purpose is order payment.' });
+    }
+
+    let authoritativeAmount: number;
+    let resolvedPurpose = requestedPurpose;
+
+    if (normalizedOrderId) {
+      resolvedPurpose = 'order_payment';
+      const ordRes = await pool.query('SELECT * FROM orders WHERE id = $1', [normalizedOrderId]);
+      if (ordRes.rows.length === 0) {
+        return res.status(404).json({ error: 'Order not found.' });
+      }
+      const orderRow = ordRes.rows[0];
+      if (orderRow.buyer_id !== authUserId) {
+        return res.status(403).json({ error: 'Forbidden: You can only create a payment checkout session for your own order.' });
+      }
+      if (!['payment_pending', 'pending'].includes(orderRow.status)) {
+        return res.status(400).json({ error: `Order is in status "${orderRow.status}" and is not awaiting payment.` });
+      }
+      const existingEscRes = await pool.query('SELECT status FROM escrows WHERE order_id = $1', [normalizedOrderId]);
+      if (existingEscRes.rows.length > 0) {
+        return res.status(400).json({ error: 'Order escrow is already funded.' });
+      }
+
+      const parsedBreakdown = typeof orderRow.fee_breakdown === 'string'
+        ? JSON.parse(orderRow.fee_breakdown)
+        : orderRow.fee_breakdown;
+      const liveQuote = await quoteOrderWithLiveSettings(Number(orderRow.amount));
+      authoritativeAmount = Number(
+        (parsedBreakdown?.clientTotal ?? liveQuote.clientTotal).toFixed(2)
+      );
+
+      if (amount !== undefined && amount !== null && amount !== '') {
+        const callerAmount = Number(amount);
+        if (!Number.isFinite(callerAmount) || Math.round(callerAmount * 100) !== Math.round(authoritativeAmount * 100)) {
+          return res.status(400).json({
+            error: `Checkout amount ($${Number.isFinite(callerAmount) ? callerAmount.toFixed(2) : 'invalid'}) does not match the authoritative order total ($${authoritativeAmount.toFixed(2)}).`
+          });
+        }
+      }
+    } else {
+      const callerAmount = Number(amount);
+      if (!Number.isFinite(callerAmount) || callerAmount < 1.00 || Math.abs(Math.round(callerAmount * 100) - callerAmount * 100) > 1e-6) {
+        return res.status(400).json({ error: 'Valid amount of at least $1.00 USD (up to 2 decimal places) is required.' });
+      }
+      authoritativeAmount = Number(callerAmount.toFixed(2));
     }
 
     await ensureWallet(authUserId);
     const checkoutId = 'chk_' + randomUUID();
 
     const providerSession = await paymentGatewayManager.createCheckoutSession({
-      gateway: gateway as any,
-      amount: amt,
+      gateway: normalizedGateway as any,
+      amount: authoritativeAmount,
       currency: 'USD',
       userId: authUserId,
-      orderId: orderId || undefined,
-      purpose: purpose || 'deposit',
+      orderId: normalizedOrderId || undefined,
+      purpose: resolvedPurpose,
       checkoutId
     });
 
     await pool.query(
       `INSERT INTO payment_checkout_sessions (id, user_id, order_id, gateway, expected_amount, currency, purpose, status, provider_tx_id, created_at)
        VALUES ($1, $2, $3, $4, $5, 'USD', $6, 'pending', $7, NOW())`,
-      [checkoutId, authUserId, orderId || null, gateway, amt, purpose, providerSession.providerSessionId]
+      [checkoutId, authUserId, normalizedOrderId, normalizedGateway, authoritativeAmount, resolvedPurpose, providerSession.providerSessionId]
     );
 
     res.json({
       success: true,
       checkoutId,
-      gateway,
-      amount: amt,
+      gateway: normalizedGateway,
+      orderId: normalizedOrderId || undefined,
+      purpose: resolvedPurpose,
+      amount: authoritativeAmount,
       currency: 'USD',
-      redirectUrl: providerSession.checkoutUrl || `/checkout/success?session_id=${checkoutId}&amount=${amt}`
+      redirectUrl: providerSession.checkoutUrl || `/checkout/success?session_id=${checkoutId}&amount=${authoritativeAmount}`
     });
   } catch (err: any) {
     res.status(500).json(formatApiError(err));
@@ -365,7 +628,7 @@ router.post('/payments/gateway/checkout', requireAuth, rateLimit(10, 60_000), as
 
 const handlePaymentWebhook = async (req: Request, res: Response) => {
   const rawBody = req.body;
-  const gateway = (req.headers['x-gateway-provider'] || req.query.gateway || 'stripe') as string;
+  const gateway = String(req.headers['x-gateway-provider'] || req.query.gateway || 'stripe').trim().toLowerCase();
   const isVerified = await paymentGatewayManager.verifyWebhookSignature({
     gateway,
     headers: req.headers,
@@ -385,7 +648,7 @@ const handlePaymentWebhook = async (req: Request, res: Response) => {
 
   const { event, userId, amount, reference, transactionId, eventId, currency, checkoutId, sessionId } = payload || {};
   const txId = transactionId || eventId;
-  if (!txId) {
+  if (!txId || typeof txId !== 'string' || !txId.trim()) {
     return res.status(400).json({ error: 'Missing required transactionId or eventId' });
   }
   if (!currency || currency !== 'USD') {
@@ -393,114 +656,217 @@ const handlePaymentWebhook = async (req: Request, res: Response) => {
   }
 
   const validEvents = ['payment.succeeded', 'checkout.session.completed', 'payment_intent.succeeded', 'payment.captured', 'order.approved'];
-  if (validEvents.includes(event) && userId && amount) {
-    const chkId = checkoutId || sessionId;
-    if (!chkId) {
-      return res.status(400).json({ error: 'Authoritative checkout session ID is required for webhook payment.' });
-    }
+  if (!validEvents.includes(event)) {
+    return res.json({ received: true });
+  }
 
-    try {
-      const result = await postgresStore.executeInTransaction(async (client) => {
-        // 1. Durably check if provider transaction ID was already processed in completed checkout sessions
-        const existingTx = await client.query(
-          "SELECT * FROM payment_checkout_sessions WHERE provider_tx_id = $1 AND status = 'completed'",
+  const lookupSessionKey = (checkoutId || sessionId) ? String(checkoutId || sessionId).trim() : null;
+  const lookupOrderKey = payload?.orderId ? String(payload.orderId).trim() : null;
+
+  try {
+    const result = await postgresStore.executeInTransaction(async (client) => {
+      // 1. Durably check if provider transaction ID was already processed in completed checkout sessions
+      const existingTx = await client.query(
+        "SELECT * FROM payment_checkout_sessions WHERE provider_tx_id = $1 AND status = 'completed'",
+        [txId]
+      );
+      if (existingTx.rows.length > 0) {
+        return { received: true, replayed: true };
+      }
+
+      // 2. Locate and lock the authoritative stored checkout session (FAIL CLOSED if no stored session matches)
+      let sess: any = null;
+      if (lookupSessionKey) {
+        const sessRes = await client.query(
+          'SELECT * FROM payment_checkout_sessions WHERE id = $1 OR provider_tx_id = $1 FOR UPDATE',
+          [lookupSessionKey]
+        );
+        if (sessRes.rows.length > 0) {
+          sess = sessRes.rows[0];
+        }
+      }
+      if (!sess) {
+        const byTxRes = await client.query(
+          'SELECT * FROM payment_checkout_sessions WHERE provider_tx_id = $1 FOR UPDATE',
           [txId]
         );
-        if (existingTx.rows.length > 0) {
-          return { received: true, replayed: true };
+        if (byTxRes.rows.length > 0) {
+          sess = byTxRes.rows[0];
         }
-
-        // 2. PostgreSQL-level durable idempotency lock via financial_idempotency table (protects against concurrent deliveries)
-        const providerTxKey = `WH-PROVIDER-TX-${gateway}-${txId}`;
-        const payloadFingerprint = { gateway, txId, userId, amount: Number(amount), checkoutId: chkId };
-        const idempCheck = await checkOrRecordIdempotency(
-          client,
-          providerTxKey,
-          'paymentWebhook',
-          payloadFingerprint
+      }
+      if (!sess && !lookupSessionKey && lookupOrderKey) {
+        const byOrderRes = await client.query(
+          "SELECT * FROM payment_checkout_sessions WHERE order_id = $1 AND status = 'pending' ORDER BY created_at DESC LIMIT 1 FOR UPDATE",
+          [lookupOrderKey]
         );
-        if (idempCheck.replayed) {
-          return { received: true, replayed: true };
+        if (byOrderRes.rows.length > 0) {
+          sess = byOrderRes.rows[0];
         }
+      }
 
-        // 3. Lock checkout session row
-        const sessRes = await client.query(
-          'SELECT * FROM payment_checkout_sessions WHERE id = $1 FOR UPDATE',
-          [chkId]
-        );
+      if (!sess) {
+        throw { status: 400, message: 'Cannot process payment webhook: no matching stored checkout session found.' };
+      }
 
-        if (sessRes.rows.length === 0) {
-          throw { status: 400, message: 'Checkout session not found.' };
-        }
+      const authoritativeUserId = String(sess.user_id);
+      const authoritativeAmount = Number(sess.expected_amount);
+      const authoritativeOrderId = sess.order_id ? String(sess.order_id) : null;
+      const authoritativePurpose = String(sess.purpose || (authoritativeOrderId ? 'order_payment' : 'deposit'));
 
-        const sess = sessRes.rows[0];
-        if (sess.user_id !== userId) {
-          throw { status: 400, message: 'Checkout session user mismatch.' };
-        }
-        if (!sess.currency || sess.currency !== 'USD') {
-          throw { status: 400, message: 'Checkout session currency mismatch.' };
-        }
-        if (Math.round(Number(sess.expected_amount) * 100) !== Math.round(Number(amount) * 100)) {
+      if (!authoritativeUserId || !Number.isFinite(authoritativeAmount) || authoritativeAmount <= 0) {
+        throw { status: 400, message: 'Stored checkout session has invalid user or expected amount.' };
+      }
+      if (!sess.currency || sess.currency !== 'USD') {
+        throw { status: 400, message: 'Checkout session currency mismatch: must be USD.' };
+      }
+      if (sess.gateway && String(sess.gateway).toLowerCase() !== gateway) {
+        throw { status: 400, message: 'Checkout session gateway mismatch.' };
+      }
+
+      // Cross-validate any caller/payload-supplied fields against the stored checkout session
+      if (userId !== undefined && userId !== null && String(userId) !== '' && String(userId) !== authoritativeUserId) {
+        throw { status: 400, message: 'Checkout session user mismatch.' };
+      }
+      if (amount !== undefined && amount !== null && amount !== '') {
+        const payloadAmount = Number(amount);
+        if (!Number.isFinite(payloadAmount) || Math.round(payloadAmount * 100) !== Math.round(authoritativeAmount * 100)) {
           throw { status: 400, message: 'Checkout session amount mismatch.' };
         }
-        if (sess.status === 'completed') {
-          // Idempotent duplicate event handling
-          await recordIdempotencyResult(client, providerTxKey, 'paymentWebhook', { received: true, replayed: true }, payloadFingerprint);
-          return { received: true, replayed: true };
-        }
-        if (sess.status !== 'pending') {
-          throw { status: 400, message: `Checkout session already in status ${sess.status}` };
-        }
+      }
+      if (lookupOrderKey && authoritativeOrderId && lookupOrderKey !== authoritativeOrderId) {
+        throw { status: 400, message: 'Checkout session order mismatch.' };
+      }
+      if (lookupOrderKey && !authoritativeOrderId) {
+        throw { status: 400, message: 'Checkout session is not linked to an order.' };
+      }
+      if (payload?.purpose && ['order_payment', 'order'].includes(String(payload.purpose)) && !authoritativeOrderId) {
+        throw { status: 400, message: 'Checkout session is not an order payment session.' };
+      }
 
-        // Direct Provider API Object Authenticity Verification
-        const liveVerification = await paymentGatewayManager.verifyPaymentEvent({
-          gateway: sess.gateway || gateway,
-          sessionId: sess.provider_tx_id || chkId,
-          transactionId: txId,
-          expectedAmount: Number(sess.expected_amount),
-          expectedCurrency: 'USD'
-        });
+      // 3. PostgreSQL-level durable idempotency lock via financial_idempotency table
+      const providerTxKey = `WH-PROVIDER-TX-${gateway}-${txId}`;
+      const payloadFingerprint = {
+        gateway,
+        txId,
+        userId: authoritativeUserId,
+        amount: authoritativeAmount,
+        checkoutId: sess.id,
+        orderId: authoritativeOrderId
+      };
+      const idempCheck = await checkOrRecordIdempotency(
+        client,
+        providerTxKey,
+        'paymentWebhook',
+        payloadFingerprint
+      );
+      if (idempCheck.replayed) {
+        return { received: true, replayed: true };
+      }
 
-        if (!liveVerification.verified) {
-          throw { status: 400, message: `Provider payment verification failed: ${liveVerification.error}` };
-        }
+      if (sess.status === 'completed') {
+        await recordIdempotencyResult(client, providerTxKey, 'paymentWebhook', { received: true, replayed: true }, payloadFingerprint);
+        return { received: true, replayed: true };
+      }
+      if (sess.status !== 'pending') {
+        throw { status: 400, message: `Checkout session already in status ${sess.status}` };
+      }
 
-        await financialTransactionService.ensureWallet({ userId, role: 'buyer' }, client);
-
-        await financialTransactionService.creditDeposit({
-          userId,
-          amount: Number(amount),
-          reference: reference || txId || 'WH-DEPOSIT',
-          idempotencyKey: providerTxKey,
-          actor: 'Gateway Webhook',
-          source: 'webhook'
-        }, client);
-
-        await client.query(
-          'UPDATE payment_checkout_sessions SET status = $1, provider_tx_id = $2, completed_at = NOW() WHERE id = $3',
-          ['completed', txId, sess.id]
-        );
-
-        const resObj = { received: true };
-        await recordIdempotencyResult(client, providerTxKey, 'paymentWebhook', resObj, payloadFingerprint);
-
-        return resObj;
+      // 4. Direct Provider API Object Authenticity Verification
+      const liveVerification = await paymentGatewayManager.verifyPaymentEvent({
+        gateway: sess.gateway || gateway,
+        sessionId: sess.provider_tx_id || sess.id,
+        transactionId: txId,
+        expectedAmount: authoritativeAmount,
+        expectedCurrency: 'USD'
       });
 
-      await syncUserBalances();
-      return res.json(result);
-    } catch (e: any) {
-      const statusCode = typeof e?.status === 'number' ? e.status : 400;
-      return res.status(statusCode).json({ error: e?.message || e?.error || 'Webhook transaction failed' });
-    }
+      if (!liveVerification.verified) {
+        throw { status: 400, message: `Provider payment verification failed: ${liveVerification.error}` };
+      }
+
+      // 5. If linked to an Order, validate Order ownership, status, and authoritative total BEFORE crediting/settling
+      let lockedOrder: any = null;
+      const isOrderPayment = Boolean(authoritativeOrderId) || authoritativePurpose === 'order_payment' || authoritativePurpose === 'order';
+      if (isOrderPayment) {
+        if (!authoritativeOrderId) {
+          throw { status: 400, message: 'Order payment checkout session is missing order_id.' };
+        }
+        const ordRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [authoritativeOrderId]);
+        if (ordRes.rows.length === 0) {
+          throw { status: 404, message: `Order ${authoritativeOrderId} not found.` };
+        }
+        lockedOrder = ordRes.rows[0];
+        if (lockedOrder.buyer_id !== authoritativeUserId) {
+          throw { status: 403, message: 'Order buyer mismatch with checkout session owner.' };
+        }
+        if (!['payment_pending', 'pending'].includes(lockedOrder.status)) {
+          throw { status: 400, message: `Order ${lockedOrder.id} is in status "${lockedOrder.status}" and cannot be settled.` };
+        }
+        const parsedBreakdown = typeof lockedOrder.fee_breakdown === 'string'
+          ? JSON.parse(lockedOrder.fee_breakdown)
+          : lockedOrder.fee_breakdown;
+        const liveQuote = await quoteOrderWithLiveSettings(Number(lockedOrder.amount));
+        const expectedOrderTotal = Number(
+          (parsedBreakdown?.clientTotal ?? liveQuote.clientTotal).toFixed(2)
+        );
+        if (Math.round(authoritativeAmount * 100) !== Math.round(expectedOrderTotal * 100)) {
+          throw {
+            status: 400,
+            message: `Checkout session amount ($${authoritativeAmount.toFixed(2)}) does not match authoritative order total ($${expectedOrderTotal.toFixed(2)}).`
+          };
+        }
+      }
+
+      await financialTransactionService.ensureWallet({ userId: authoritativeUserId, role: 'buyer' }, client);
+
+      const depositIdempotencyKey = `${providerTxKey}:creditDeposit`;
+      await financialTransactionService.creditDeposit({
+        userId: authoritativeUserId,
+        amount: authoritativeAmount,
+        reference: reference || txId || 'WH-DEPOSIT',
+        idempotencyKey: depositIdempotencyKey,
+        actor: 'Gateway Webhook',
+        source: 'webhook'
+      }, client);
+
+      // 6. Atomically fund Order escrow if this session is an order payment (fail closed on any escrow error)
+      if (isOrderPayment && lockedOrder) {
+        const fundIdempKey = `${providerTxKey}:fundEscrow`;
+        await financialTransactionService.fundEscrow({
+          orderId: lockedOrder.id,
+          orderTitle: lockedOrder.title,
+          amount: Number(lockedOrder.amount),
+          buyerId: lockedOrder.buyer_id,
+          sellerId: lockedOrder.seller_id,
+          actor: `user:${authoritativeUserId}`,
+          idempotencyKey: fundIdempKey
+        }, client);
+        await client.query("UPDATE orders SET status = 'funded_in_escrow' WHERE id = $1", [lockedOrder.id]);
+      }
+
+      await client.query(
+        'UPDATE payment_checkout_sessions SET status = $1, provider_tx_id = $2, completed_at = NOW() WHERE id = $3',
+        ['completed', txId, sess.id]
+      );
+
+      const resObj = { received: true };
+      await recordIdempotencyResult(client, providerTxKey, 'paymentWebhook', resObj, payloadFingerprint);
+
+      return resObj;
+    });
+
+    await syncUserBalances();
+    return res.json(result);
+  } catch (e: any) {
+    const statusCode = typeof e?.status === 'number' ? e.status : 400;
+    return res.status(statusCode).json({ error: e?.message || e?.error || 'Webhook transaction failed' });
   }
-  res.json({ received: true });
 };
 
 router.post('/payments/webhook', express.raw({ type: 'application/json' }), handlePaymentWebhook);
 router.post('/webhooks/payment', express.raw({ type: 'application/json' }), handlePaymentWebhook);
 
-router.post('/payments/escrow/release', requireAuth, requireActiveStatus, async (req: Request, res: Response) => {
+router.post('/payments/escrow/release', requireAuth, requireFinancialActiveStatus, async (req: Request, res: Response) => {
   const { orderId } = req.body;
   if (!orderId) return res.status(400).json({ error: 'Order ID is required' });
   if (!tryAcquireOrderLock(orderId, res)) return;
@@ -655,7 +1021,7 @@ router.post('/payments/escrow/refund', requireAuth, async (req: Request, res: Re
     if (buyer) await ensureWallet(buyer.id);
 
     const actorName = isAdmin ? adminActor(req) : (caller?.name || (isSeller ? 'Seller' : 'Buyer'));
-    const requestKey = req.body?.requestKey || req.body?.idempotencyKey;
+    const requestKey = req.body?.requestKey || req.body?.idempotencyKey || `REFUND-FULL-${order.id}-${order.amount}`;
     const result = await refundOrderFunds(order, undefined, actorName, reason || (isSeller ? 'Seller cancelled order' : 'Escrow cancellation'), requestKey);
 
     registerAuditLog({
@@ -748,10 +1114,11 @@ router.get('/payments/invoices/:userId', requireAuth, async (req: Request, res: 
     const userId = targetUserId;
     const userOrders = await store.listOrdersForUser(userId);
 
+    const currentUser = await store.getUser(userId);
     const orderInvoices = await Promise.all(userOrders.map(async o => {
       const isBuyer = o.buyerId === userId;
       const otherUser = await store.getUser(isBuyer ? o.sellerId : o.buyerId);
-      const currentUser = await store.getUser(userId);
+      const quote = financeLedger.quoteOrder(o.amount);
       return {
         id: `inv_ord_${o.id}`,
         invoiceNumber: `INV-${o.id.replace('ord_', '').toUpperCase()}`,
@@ -769,11 +1136,11 @@ router.get('/payments/invoices/:userId', requireAuth, async (req: Request, res: 
           { description: o.title, quantity: 1, unitPrice: o.amount, amount: o.amount }
         ],
         subtotal: o.amount,
-        serviceFee: o.feeBreakdown?.serviceFee ?? financeLedger.quoteOrder(o.amount).serviceFee,
-        smallOrderFee: o.feeBreakdown?.smallOrderFee ?? financeLedger.quoteOrder(o.amount).smallOrderFee,
-        platformFee: o.feeBreakdown?.platformCommission ?? financeLedger.quoteOrder(o.amount).platformCommission,
+        serviceFee: o.feeBreakdown?.serviceFee ?? quote.serviceFee,
+        smallOrderFee: o.feeBreakdown?.smallOrderFee ?? quote.smallOrderFee,
+        platformFee: o.feeBreakdown?.platformCommission ?? quote.platformCommission,
         tax: 0,
-        total: o.feeBreakdown?.clientTotal ?? financeLedger.quoteOrder(o.amount).clientTotal,
+        total: o.feeBreakdown?.clientTotal ?? quote.clientTotal,
         notes: `WorkPerHour 14-Day Escrow Protection Order #${o.id}. 100% Protected.`,
         relatedOrderId: o.id
       };
@@ -782,21 +1149,27 @@ router.get('/payments/invoices/:userId', requireAuth, async (req: Request, res: 
     let userCustom: any[] = [];
     try {
       const customInvoices = await store.listCustomInvoicesForUser(userId);
-      userCustom = customInvoices.map(r => ({
+      userCustom = customInvoices.map((r: any) => ({
         id: r.id,
         invoiceNumber: r.invoiceNumber,
-        userId: r.buyerId,
-        recipientName: 'Client',
-        recipientEmail: 'client@example.com',
+        userId: userId,
+        buyerId: r.buyerId,
+        sellerId: r.sellerId,
+        type: r.buyerId === userId ? 'received' : 'sent',
+        recipientName: r.recipientName || 'Client',
+        recipientEmail: r.recipientEmail || 'client@example.com',
         title: r.description || `Invoice ${r.invoiceNumber}`,
         issueDate: r.createdAt ? r.createdAt.slice(0, 10) : new Date().toISOString().slice(0, 10),
-        dueDate: r.paidAt || new Date().toISOString().slice(0, 10),
+        dueDate: r.dueDate || r.paidAt || new Date().toISOString().slice(0, 10),
         status: r.status,
-        items: [{ description: r.description || 'Service', quantity: 1, unitPrice: Number(r.amount), amount: Number(r.amount) }],
+        items: Array.isArray(r.items) && r.items.length > 0
+          ? r.items
+          : [{ description: r.description || 'Service', quantity: 1, unitPrice: Number(r.amount), amount: Number(r.amount) }],
         subtotal: Number(r.amount),
         platformFee: 0,
         tax: 0,
         total: Number(r.amount),
+        notes: r.notes || 'Standard WorkPerHour Invoice',
         relatedOrderId: r.relatedOrderId || undefined
       }));
     } catch {}
@@ -810,10 +1183,145 @@ router.get('/payments/invoices/:userId', requireAuth, async (req: Request, res: 
 router.post('/payments/invoices', requireAuth, async (req: Request, res: Response) => {
   try {
     const authenticatedUserId = (req as any).authenticatedUserId;
-    const { recipientName, recipientEmail, title, dueDate, items, notes } = req.body;
-    if (!title || !recipientName) {
+    const {
+      recipientName,
+      recipientEmail,
+      title,
+      dueDate,
+      items,
+      notes,
+      orderId,
+      relatedOrderId,
+      buyerId: reqBuyerId,
+      sellerId: reqSellerId,
+      recipientId
+    } = req.body || {};
+
+    const pool = postgresStore.getPool();
+    const callerRes = await pool.query('SELECT * FROM users WHERE id = $1', [authenticatedUserId]);
+    const caller = callerRes.rows[0];
+    if (!caller) {
+      return res.status(401).json({ error: 'Unauthorized: Authenticated user not found.' });
+    }
+    const isAdmin = caller.role === 'admin' || caller.role === 'super_admin';
+
+    const linkedOrderId = (orderId || relatedOrderId) ? String(orderId || relatedOrderId).trim() : null;
+    let resolvedBuyerId: string | null = null;
+    let resolvedSellerId: string | null = null;
+    let resolvedOrderId: string | null = null;
+    let resolvedRecipientName = recipientName ? String(recipientName).trim() : '';
+    let resolvedRecipientEmail = recipientEmail ? String(recipientEmail).trim() : '';
+
+    if (linkedOrderId) {
+      const ordRes = await pool.query('SELECT * FROM orders WHERE id = $1', [linkedOrderId]);
+      if (ordRes.rows.length === 0) {
+        return res.status(404).json({ error: 'Related order not found.' });
+      }
+      const ord = ordRes.rows[0];
+      if (!isAdmin && ord.seller_id !== authenticatedUserId && ord.buyer_id !== authenticatedUserId) {
+        return res.status(403).json({ error: 'Forbidden: You are not an authorized participant on this order.' });
+      }
+      if (reqBuyerId && String(reqBuyerId).trim() !== ord.buyer_id) {
+        return res.status(400).json({ error: 'Specified buyerId does not match the linked order buyer.' });
+      }
+      if (reqSellerId && String(reqSellerId).trim() !== ord.seller_id) {
+        return res.status(400).json({ error: 'Specified sellerId does not match the linked order seller.' });
+      }
+      resolvedBuyerId = ord.buyer_id;
+      resolvedSellerId = ord.seller_id;
+      resolvedOrderId = ord.id;
+    } else {
+      // Resolve distinct buyer and seller from explicit party IDs, recipientEmail, or authorized order context
+      const candidateBuyerId = (reqBuyerId || recipientId) ? String(reqBuyerId || recipientId).trim() : null;
+      const candidateSellerId = reqSellerId ? String(reqSellerId).trim() : null;
+
+      if (isAdmin && candidateBuyerId && candidateSellerId) {
+        resolvedBuyerId = candidateBuyerId;
+        resolvedSellerId = candidateSellerId;
+      } else if (candidateBuyerId && candidateBuyerId !== authenticatedUserId) {
+        resolvedSellerId = candidateSellerId || authenticatedUserId;
+        resolvedBuyerId = candidateBuyerId;
+      } else if (candidateSellerId && candidateSellerId !== authenticatedUserId) {
+        resolvedBuyerId = candidateBuyerId || authenticatedUserId;
+        resolvedSellerId = candidateSellerId;
+      } else if (resolvedRecipientEmail) {
+        const byEmailRes = await pool.query('SELECT id, name, email FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1', [resolvedRecipientEmail]);
+        if (byEmailRes.rows.length > 0 && byEmailRes.rows[0].id !== authenticatedUserId) {
+          resolvedSellerId = authenticatedUserId;
+          resolvedBuyerId = byEmailRes.rows[0].id;
+        }
+      }
+
+      // If still unresolved, check if the authenticated seller has an order with a buyer matching recipientName
+      if (!resolvedBuyerId && resolvedRecipientName) {
+        const ordMatchRes = await pool.query(
+          `SELECT o.id, o.buyer_id, o.seller_id, u.name, u.email
+           FROM orders o
+           JOIN users u ON u.id = o.buyer_id
+           WHERE o.seller_id = $1 AND (LOWER(u.name) = LOWER($2) OR LOWER(o.buyer_username) = LOWER($2))
+           ORDER BY o.created_at DESC LIMIT 1`,
+          [authenticatedUserId, resolvedRecipientName]
+        );
+        if (ordMatchRes.rows.length > 0) {
+          resolvedBuyerId = ordMatchRes.rows[0].buyer_id;
+          resolvedSellerId = ordMatchRes.rows[0].seller_id;
+          resolvedOrderId = ordMatchRes.rows[0].id;
+        }
+      }
+
+      if (!resolvedBuyerId || !resolvedSellerId) {
+        return res.status(400).json({
+          error: 'A valid related order (orderId/relatedOrderId) or distinct counterparty (buyerId or registered recipientEmail) is required to create an invoice.'
+        });
+      }
+
+      if (!isAdmin && resolvedSellerId !== authenticatedUserId && resolvedBuyerId !== authenticatedUserId) {
+        return res.status(403).json({ error: 'Forbidden: You must be an authorized participant on the invoice.' });
+      }
+    }
+
+    if (resolvedBuyerId === resolvedSellerId) {
+      return res.status(400).json({ error: 'Invalid invoice participants: buyerId and sellerId must be distinct users.' });
+    }
+
+    const partiesRes = await pool.query('SELECT id, name, email FROM users WHERE id IN ($1, $2)', [resolvedBuyerId, resolvedSellerId]);
+    const buyerUser = partiesRes.rows.find((u: any) => u.id === resolvedBuyerId);
+    const sellerUser = partiesRes.rows.find((u: any) => u.id === resolvedSellerId);
+    if (!buyerUser || !sellerUser) {
+      return res.status(404).json({ error: 'Invoice buyer or seller user account not found.' });
+    }
+
+    if (!resolvedOrderId) {
+      const relOrderRes = await pool.query(
+        'SELECT id FROM orders WHERE buyer_id = $1 AND seller_id = $2 ORDER BY created_at DESC LIMIT 1',
+        [resolvedBuyerId, resolvedSellerId]
+      );
+      if (relOrderRes.rows.length > 0) {
+        resolvedOrderId = relOrderRes.rows[0].id;
+      } else if (!isAdmin) {
+        const relWsRes = await pool.query(
+          'SELECT workspace_id FROM workspaces WHERE buyer_id = $1 AND seller_id = $2 LIMIT 1',
+          [resolvedBuyerId, resolvedSellerId]
+        );
+        if (relWsRes.rows.length === 0) {
+          return res.status(403).json({
+            error: 'Forbidden: Custom invoices require an existing order or workspace relationship between buyer and seller.'
+          });
+        }
+      }
+    }
+
+    if (!resolvedRecipientName) {
+      resolvedRecipientName = buyerUser.name;
+    }
+    if (!resolvedRecipientEmail) {
+      resolvedRecipientEmail = buyerUser.email;
+    }
+
+    if (!title || !resolvedRecipientName) {
       return res.status(400).json({ error: 'Title and recipient name are required' });
     }
+
     const rawItems = (items && Array.isArray(items) && items.length > 0)
       ? items
       : [{ description: title, quantity: 1, unitPrice: 100 }];
@@ -839,6 +1347,9 @@ router.post('/payments/invoices', requireAuth, async (req: Request, res: Respons
       });
     }
     const subtotal = Number((subtotalCents / 100).toFixed(2));
+    if (subtotal <= 0) {
+      return res.status(400).json({ error: 'Invoice total must be greater than $0.00.' });
+    }
     const platformFee = 0;
     const total = subtotal;
 
@@ -846,8 +1357,10 @@ router.post('/payments/invoices', requireAuth, async (req: Request, res: Respons
       id: 'inv_' + Date.now() + '_' + randomUUID().slice(0, 8),
       invoiceNumber: `INV-${Date.now().toString().slice(-6)}`,
       userId: authenticatedUserId,
-      recipientName,
-      recipientEmail: recipientEmail || 'client@example.com',
+      buyerId: resolvedBuyerId || undefined,
+      sellerId: resolvedSellerId || undefined,
+      recipientName: resolvedRecipientName,
+      recipientEmail: resolvedRecipientEmail,
       title,
       issueDate: new Date().toISOString().substring(0, 10),
       dueDate: dueDate || new Date(Date.now() + 14 * 86400000).toISOString().substring(0, 10),
@@ -857,19 +1370,26 @@ router.post('/payments/invoices', requireAuth, async (req: Request, res: Respons
       platformFee,
       tax: 0,
       total,
-      notes: notes || 'Standard WorkPerHour Invoice'
+      notes: notes || 'Standard WorkPerHour Invoice',
+      relatedOrderId: resolvedOrderId || undefined
     };
 
     const invToSave = {
       id: newInvoice.id,
       invoiceNumber: newInvoice.invoiceNumber,
-      buyerId: authenticatedUserId,
-      sellerId: authenticatedUserId,
+      buyerId: resolvedBuyerId,
+      sellerId: resolvedSellerId,
+      recipientName: newInvoice.recipientName,
+      recipientEmail: newInvoice.recipientEmail,
+      dueDate: newInvoice.dueDate,
+      notes: newInvoice.notes,
+      items: newInvoice.items,
       amount: newInvoice.total,
       total: newInvoice.total,
       status: newInvoice.status,
       description: newInvoice.title,
-      createdAt: newInvoice.issueDate
+      createdAt: newInvoice.issueDate,
+      relatedOrderId: resolvedOrderId || undefined
     };
     await store.saveCustomInvoice(invToSave as any);
 
@@ -1002,7 +1522,7 @@ router.patch('/payments/methods/:id/default', requireAuth, async (req: Request, 
   }
 });
 
-router.post('/wallet/deposit', requireAuth, requireActiveStatus, rateLimit(10, 60_000), async (req: Request, res: Response) => {
+router.post('/wallet/deposit', requireAuth, requireFinancialActiveStatus, rateLimit(10, 60_000), async (req: Request, res: Response) => {
   try {
     if (!areSimulatedDepositsAllowed()) {
       return res.status(501).json({ error: 'Deposits require a connected payment gateway in production.' });
@@ -1196,12 +1716,19 @@ router.get('/admin/finance/escrow', requireAdmin, async (req: Request, res: Resp
     const refundsRes = await postgresStore.getPool().query("SELECT * FROM refunds WHERE status = 'approved'");
     const activeRefunds = new Set(refundsRes.rows.map((r: any) => r.order_id));
 
-    const escrowOrders = await Promise.all(allOrders.map(async o => {
+    const [allUsers, escrowsRes] = await Promise.all([
+      store.listUsers(),
+      postgresStore.getPool().query('SELECT * FROM escrows')
+    ]);
+    const userMap = new Map(allUsers.map(u => [u.id, u]));
+    const escrowMap = new Map(escrowsRes.rows.map((r: any) => [r.order_id, financialRepository.formatEscrowRow(r)]));
+
+    const escrowOrders = allOrders.map(o => {
       const enriched = enrichOrderWithServiceInfo(o);
       const isDisputed = activeDisputes.has(o.id);
       const isRefunded = activeRefunds.has(o.id);
-      const buyer = await store.getUser(o.buyerId);
-      const seller = await store.getUser(o.sellerId);
+      const buyer = userMap.get(o.buyerId);
+      const seller = userMap.get(o.sellerId);
 
       let escrowState = 'in_progress';
       if (isDisputed) escrowState = 'disputed';
@@ -1210,7 +1737,11 @@ router.get('/admin/finance/escrow', requireAdmin, async (req: Request, res: Resp
       else if (o.status === 'delivered') escrowState = 'release_pending';
       else if (o.status === 'funded_in_escrow') escrowState = 'funded';
 
-      const esc = await financialRepository.getEscrow(o.id);
+      const esc = escrowMap.get(o.id);
+      const fbComm = (o.feeBreakdown as any)?.commissionPercent;
+      const effectiveCommRate = (esc?.commissionPercent !== undefined && esc?.commissionPercent !== null)
+        ? Number(esc.commissionPercent)
+        : (fbComm !== undefined && fbComm !== null ? Number(fbComm) : financeLedger.getPlatformCommissionRate());
 
       return {
         ...enriched,
@@ -1218,15 +1749,15 @@ router.get('/admin/finance/escrow', requireAdmin, async (req: Request, res: Resp
         buyerEmail: buyer?.email || '',
         sellerName: seller?.name || 'Freelancer #' + o.sellerId,
         sellerEmail: seller?.email || '',
-        platformFeeRate: `${financeLedger.getPlatformCommissionRate()}%`,
-        platformFeeAmount: FinanceLedgerEngine.round(o.amount * financeLedger.getPlatformCommissionRate() / 100),
-        freelancerNetAmount: FinanceLedgerEngine.round(o.amount - o.amount * financeLedger.getPlatformCommissionRate() / 100),
+        platformFeeRate: `${effectiveCommRate}%`,
+        platformFeeAmount: FinanceLedgerEngine.round(o.amount * effectiveCommRate / 100),
+        freelancerNetAmount: FinanceLedgerEngine.round(o.amount - o.amount * effectiveCommRate / 100),
         ledgerEscrowStatus: esc?.status || 'not_funded',
         ledgerEscrowHeld: esc?.remaining ?? 0,
         escrowState,
         isDisputed
       };
-    }));
+    });
     res.json(escrowOrders);
   } catch (err: any) {
     res.status(500).json(formatApiError(err));
@@ -1328,11 +1859,17 @@ router.post('/admin/finance/escrow/:orderId/refund', requireAdmin, async (req: R
 
 router.get('/admin/finance/payouts', requireAdmin, async (req: Request, res: Response) => {
   try {
-    const payoutsList = await store.listPayouts();
+    const [payoutsList, allUsers, allWallets] = await Promise.all([
+      store.listPayouts(),
+      store.listUsers(),
+      financialRepository.getWallets()
+    ]);
+    const userMap = new Map(allUsers.map(u => [u.id, u]));
+    const walletMap = new Map(allWallets.map(w => [w.userId, w]));
 
-    const enrichedPayouts = await Promise.all(payoutsList.map(async p => {
-      const freelancer = await store.getUser(p.freelancerId);
-      const wallet = await financialRepository.getWallet(p.freelancerId);
+    const enrichedPayouts = payoutsList.map(p => {
+      const freelancer = userMap.get(p.freelancerId);
+      const wallet = walletMap.get(p.freelancerId);
       return {
         ...p,
         freelancerName: freelancer?.name || 'Freelancer #' + p.freelancerId,
@@ -1340,7 +1877,7 @@ router.get('/admin/finance/payouts', requireAdmin, async (req: Request, res: Res
         walletAvailableBalance: wallet?.availableBalance || 0,
         currency: 'USD'
       };
-    }));
+    });
     res.json(enrichedPayouts);
   } catch (err: any) {
     res.status(500).json(formatApiError(err));

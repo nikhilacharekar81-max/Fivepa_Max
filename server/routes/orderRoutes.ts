@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import {
   DEFAULT_SITE_SETTINGS,
   store,
@@ -11,6 +11,7 @@ import {
   type WorkstreamOffer
 } from '../store.js';
 import { calculateOrderFees } from '../domains/finance/fees.js';
+import { checkOrRecordIdempotency, recordIdempotencyResult } from '../domains/finance/index.js';
 import { postgresStore } from '../db/postgresStore.js';
 import { financialRepository } from '../services/financialService.js';
 import {
@@ -183,9 +184,14 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
 
     const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
     if (title.length < 3) return res.status(400).json({ error: 'A valid order title is required.' });
-    const buyerId = userCaller.id;
+    const isAdminCaller = userCaller.role === 'admin' || userCaller.role === 'super_admin';
+    const requestedBuyerId = isAdminCaller && typeof req.body?.buyerId === 'string' && req.body.buyerId.trim()
+      ? req.body.buyerId.trim()
+      : userCaller.id;
+    const buyer = requestedBuyerId === userCaller.id ? userCaller : await store.getUser(requestedBuyerId);
+    if (!buyer) return res.status(404).json({ error: 'Buyer account not found.' });
+    const buyerId = buyer.id;
     const sellerId = String(req.body?.sellerId || '');
-    const buyer = userCaller;
 
     const seller = await store.getUser(sellerId);
     if (!seller) return res.status(404).json({ error: 'Seller not found.' });
@@ -201,10 +207,29 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
       return res.status(400).json({ error: 'Order cannot specify both gigId and projectId.' });
     }
 
-    const id = 'ord_' + randomUUID().slice(0, 12);
-    const today = new Date().toISOString().split('T')[0];
     let rawAmount = Number(req.body?.amount);
     const isInquiry = rawAmount === 0 && /^inquiry:/i.test(title);
+
+    const rawIdempKey = String(
+      req.headers['idempotency-key'] ||
+      req.headers['x-idempotency-key'] ||
+      req.body?.idempotencyKey ||
+      req.body?.requestKey ||
+      req.body?.clientRequestId ||
+      ''
+    ).trim();
+
+    const isPaidGig = Boolean(req.body?.gigId) && !isInquiry;
+    if (isPaidGig && !rawIdempKey) {
+      return res.status(400).json({ error: 'Idempotency-Key header is required for paid Gig purchase requests.' });
+    }
+
+    const scopedIdempKey = rawIdempKey ? `ORD-CREATE:${buyerId}:${rawIdempKey}` : '';
+
+    const id = scopedIdempKey
+      ? 'ord_' + createHash('sha256').update(scopedIdempKey).digest('hex').slice(0, 12)
+      : 'ord_' + randomUUID().slice(0, 12);
+    const today = new Date().toISOString().split('T')[0];
 
     if (req.body?.gigId) {
       if (!isInquiry) {
@@ -255,6 +280,18 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
         return res.status(400).json({ error: 'Minimum order amount is $1.00.' });
       }
     }
+
+    const orderPayloadFingerprint = {
+      buyerId,
+      sellerId,
+      title,
+      gigId: req.body?.gigId || null,
+      projectId: req.body?.projectId || null,
+      proposalId: req.body?.proposalId || null,
+      extraIds: Array.isArray(req.body?.extraIds) ? [...req.body.extraIds].map(String).sort() : null,
+      amount: isInquiry ? 0 : rawAmount,
+      isInquiry
+    };
 
     const requirements = typeof req.body?.requirements === 'string' ? escapeHtml(req.body.requirements.trim()).slice(0, 2000) : '';
 
@@ -348,45 +385,51 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
       };
     }
 
-    await workspaceService.ensureWorkspaceForOrderAsync(newOrd);
-    const enriched = enrichOrderWithServiceInfo(newOrd);
-    await recordOrder(enriched);
-    await store.saveOrder(enriched);
-
-    if (!isInquiry) {
-      try {
-        await fundOrderEscrowWithEvent({
-          orderId: id,
-          orderTitle: title,
-          amount: rawAmount,
-          buyerId,
-          sellerId,
-          actor: `user:${buyerId}`
-        });
-
-        enriched.status = 'funded_in_escrow';
-        await store.saveOrder(enriched);
-        await syncUserBalances();
-      } catch (fundingErr: any) {
-        const escCheck = await postgresStore.getPool().query('SELECT 1 FROM escrows WHERE order_id = $1', [id]);
-        if (escCheck.rows.length === 0) {
-          await postgresStore.getPool().query('DELETE FROM orders WHERE id = $1', [id]);
-
-          const wsId = (enriched as any).workspaceId;
-          if (wsId) {
-            const wsCheck = await postgresStore.getPool().query('SELECT id FROM orders WHERE workspace_id = $1', [wsId]);
-            if (wsCheck.rows.length === 0) {
-              await workspaceService.deleteWorkspace(wsId);
-            }
-          }
-        } else {
-          enriched.status = 'payment_pending';
-          await store.saveOrder(enriched);
+    const txResult = await postgresStore.executeInTransaction(async (client) => {
+      if (scopedIdempKey) {
+        const idempCheck = await checkOrRecordIdempotency(client, scopedIdempKey, 'createOrder', orderPayloadFingerprint);
+        if (idempCheck.replayed) {
+          return { replayed: true, result: idempCheck.result };
         }
-
-        return res.status(400).json({ error: fundingErr.message || 'Failed to fund escrow. Order creation rolled back.' });
       }
+
+      await workspaceService.ensureWorkspaceForOrderAsync(newOrd);
+      const enriched = enrichOrderWithServiceInfo(newOrd);
+      await recordOrder(enriched);
+      await store.saveOrder(enriched);
+
+      if (!isInquiry) {
+        try {
+          await fundOrderEscrowWithEvent({
+            orderId: id,
+            orderTitle: title,
+            amount: rawAmount,
+            buyerId,
+            sellerId,
+            actor: `user:${buyerId}`,
+            idempotencyKey: scopedIdempKey ? `${scopedIdempKey}:fund` : undefined
+          });
+
+          enriched.status = 'funded_in_escrow';
+          await store.saveOrder(enriched);
+          await syncUserBalances();
+        } catch (fundingErr: any) {
+          throw new Error(fundingErr.message || 'Failed to fund escrow.');
+        }
+      }
+
+      if (scopedIdempKey) {
+        await recordIdempotencyResult(client, scopedIdempKey, 'createOrder', enriched, orderPayloadFingerprint);
+      }
+
+      return { replayed: false, result: enriched };
+    });
+
+    if (txResult.replayed) {
+      return res.status(201).json(txResult.result);
     }
+
+    const enriched = txResult.result;
 
     if (isInquiry) {
       await emitSystemEvent(newOrd.id, 'order_created', `Inquiry thread opened: ${title}.`);
@@ -409,54 +452,66 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
 
     res.status(201).json(enriched);
   } catch (err: any) {
-    res.status(err.status || 400).json({ error: err.message });
+    const msg = String(err?.message || 'Failed to create order');
+    const status = err?.status || (/conflict|idempotency/i.test(msg) ? 409 : 400);
+    res.status(status).json({ error: msg });
   }
 });
 
 // Extend Order Deadline (Admin)
 const handleOrderExtendTime = async (req: Request, res: Response) => {
-  const order = await store.getOrder(req.params.id);
-  if (!order) return res.status(404).json({ error: 'Order not found' });
+  const orderId = req.params.id;
+  if (!tryAcquireOrderLock(orderId, res)) return;
+  try {
+    const order = await store.getOrder(orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
 
-  const { days, newDueDate, reason } = req.body;
-  const oldDate = order.dueDate;
-  let targetDate = newDueDate;
+    if (['completed', 'cancelled', 'refunded'].includes(order.status)) {
+      return res.status(400).json({ error: `Cannot extend deadline: Order is already ${order.status}.` });
+    }
 
-  if (days && Number(days) > 0) {
-    const current = new Date(order.dueDate || Date.now());
-    current.setDate(current.getDate() + Number(days));
-    targetDate = current.toISOString().split('T')[0];
-  } else if (!targetDate) {
-    targetDate = new Date(Date.now() + 2 * 86400000).toISOString().split('T')[0];
+    const { days, newDueDate, reason } = req.body;
+    const oldDate = order.dueDate;
+    let targetDate = newDueDate;
+
+    if (days && Number(days) > 0) {
+      const current = new Date(order.dueDate || Date.now());
+      current.setDate(current.getDate() + Number(days));
+      targetDate = current.toISOString().split('T')[0];
+    } else if (!targetDate) {
+      targetDate = new Date(Date.now() + 2 * 86400000).toISOString().split('T')[0];
+    }
+
+    order.dueDate = targetDate;
+    await postgresStore.getPool().query('UPDATE orders SET due_date = $1 WHERE id = $2', [targetDate, order.id]);
+
+    const sysMsg: Message = {
+      id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+      orderId: order.id,
+      senderId: 'system',
+      senderName: 'System / Admin Notice',
+      text: `⏱️ Deadline extended from ${oldDate} to ${order.dueDate}. ${reason ? 'Reason: ' + reason : 'Admin approved time extension.'}`,
+      timestamp: new Date().toISOString(),
+      type: 'system',
+      metadata: { action: 'order_deadline_extended', oldDate, newDueDate: order.dueDate, reason } as any
+    };
+
+    await recordMessage(sysMsg);
+
+    registerAuditLog({
+      id: 'log_' + randomUUID(),
+      actor: adminActor(req),
+      role: (req as any).authenticatedUser?.role || 'admin',
+      action: 'ORDER_DEADLINE_EXTENDED',
+      target: `Order #${order.id}`,
+      details: `Extended deadline to ${order.dueDate} (${days || 'custom'} days). ${reason || ''}`,
+      timestamp: new Date().toLocaleString()
+    });
+
+    res.json({ success: true, order: enrichOrderWithServiceInfo(order), message: sysMsg });
+  } finally {
+    releaseOrderLock(orderId);
   }
-
-  order.dueDate = targetDate;
-  await postgresStore.getPool().query('UPDATE orders SET due_date = $1 WHERE id = $2', [targetDate, order.id]);
-
-  const sysMsg: Message = {
-    id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
-    orderId: order.id,
-    senderId: 'system',
-    senderName: 'System / Admin Notice',
-    text: `⏱️ Deadline extended from ${oldDate} to ${order.dueDate}. ${reason ? 'Reason: ' + reason : 'Admin approved time extension.'}`,
-    timestamp: new Date().toISOString(),
-    type: 'system',
-    metadata: { action: 'order_deadline_extended', oldDate, newDueDate: order.dueDate, reason } as any
-  };
-
-  await recordMessage(sysMsg);
-
-  registerAuditLog({
-    id: 'log_' + randomUUID(),
-    actor: adminActor(req),
-    role: (req as any).authenticatedUser?.role || 'admin',
-    action: 'ORDER_DEADLINE_EXTENDED',
-    target: `Order #${order.id}`,
-    details: `Extended deadline to ${order.dueDate} (${days || 'custom'} days). ${reason || ''}`,
-    timestamp: new Date().toLocaleString()
-  });
-
-  res.json({ success: true, order: enrichOrderWithServiceInfo(order), message: sysMsg });
 };
 router.patch('/orders/:id/extend-time', requireAdmin, handleOrderExtendTime);
 router.patch('/admin/orders/:id/extend-time', requireAdmin, handleOrderExtendTime);
@@ -675,7 +730,7 @@ router.post('/orders/:id/deliverable', requireAuth, requireActiveStatus, async (
       return res.status(403).json({ error: 'Forbidden: Only the seller or an administrator can submit deliverables.' });
     }
 
-    const allowedStatuses = ['funded_in_escrow', 'in_progress', 'revision', 'draft_review', 'delivered', 'work_in_progress', 'completed'];
+    const allowedStatuses = ['funded_in_escrow', 'in_progress', 'revision', 'draft_review', 'delivered', 'work_in_progress', 'late'];
     if (!allowedStatuses.includes(order.status)) {
       return res.status(409).json({ error: `Cannot submit a deliverable for an order in "${order.status}" status.` });
     }
@@ -1285,6 +1340,16 @@ router.post('/orders/:id/cancel-request/respond', requireAuth, requireActiveStat
       return res.status(400).json({ error: 'Rejection reason is required when rejecting a cancellation request.' });
     }
 
+    const isExpired = Boolean(
+      order.cancellationRequest.respondBy &&
+      new Date() > new Date(order.cancellationRequest.respondBy)
+    );
+    if (isExpired && action === 'reject') {
+      return res.status(400).json({
+        error: 'The 48-hour response window for this cancellation request has expired and it can no longer be rejected.'
+      });
+    }
+
     const now = new Date().toISOString();
     order.cancellationRequest.respondedBy = userId;
     order.cancellationRequest.respondedAt = now;
@@ -1405,7 +1470,7 @@ const handleOrderCancel = async (req: Request, res: Response) => {
       if (isSeller) {
         if (isGigOrder && (hasFundedEscrow || ['funded_in_escrow', 'in_progress', 'delivered', 'revision', 'revision_requested'].includes(order.status))) {
           return res.status(400).json({
-            error: 'Direct cancellation is not allowed for funded gig orders. Please submit a cancellation request (POST /api/orders/:id/cancel-request) or issue a voluntary escrow refund (POST /api/escrow/refund).'
+            error: 'Direct cancellation is not allowed for funded gig orders. Please submit a cancellation request (POST /api/orders/:id/cancel-request).'
           });
         }
         if (!isGigOrder && !['funded_in_escrow', 'in_progress'].includes(order.status)) {

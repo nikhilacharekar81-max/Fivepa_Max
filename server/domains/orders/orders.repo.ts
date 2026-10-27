@@ -13,6 +13,15 @@ export interface ClearingEarning {
   clearsAt: string;
 }
 
+export function mapRowToOrder(r: any): Order {
+  const o = mapOrderRow(r);
+  if (o) {
+    (o as any).serviceFee = r.service_fee !== null && r.service_fee !== undefined ? Number(r.service_fee) : (o.feeBreakdown?.buyerFee ?? 0);
+    (o as any).smallOrderFee = r.small_order_fee !== null && r.small_order_fee !== undefined ? Number(r.small_order_fee) : (o.feeBreakdown?.smallOrderFee ?? 0);
+  }
+  return o;
+}
+
 export class OrdersRepo {
   constructor(private ctx: RepoContext) {}
 
@@ -28,6 +37,8 @@ export class OrdersRepo {
           if (!order?.id || seen.has(order.id)) continue;
           seen.add(order.id);
           const resolvedOrderType = order.orderType || (order as any).type || (order.projectId ? 'project' : (order.gigId ? 'gig' : null));
+          const serviceFee = order.serviceFee ?? (order.feeBreakdown as any)?.buyerFee ?? 0;
+          const smallOrderFee = order.smallOrderFee ?? (order.feeBreakdown as any)?.smallOrderFee ?? 0;
           await client.query(
             `INSERT INTO orders (
               id, title, buyer_id, seller_id, amount, status, created_at, due_date, completed_at, 
@@ -39,25 +50,27 @@ export class OrdersRepo {
               workspace_id, seller_review, previous_status,
               order_type, gig_order_id, project_order_id, proposal_id,
               extension_requests, free_extension_used, cancellation_request, cancellation_history,
-              cancellation_type, review_window_restarted_at, response_deadline
+              cancellation_type, review_window_restarted_at, response_deadline,
+              service_fee, small_order_fee
             ) VALUES (
               $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
               $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37,
-              $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48
+              $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48,
+              $49, $50
             )
             ON CONFLICT (id) DO UPDATE SET
               title = EXCLUDED.title,
-              buyer_id = EXCLUDED.buyer_id,
-              seller_id = EXCLUDED.seller_id,
               amount = EXCLUDED.amount,
+              service_fee = EXCLUDED.service_fee,
+              small_order_fee = EXCLUDED.small_order_fee,
               status = CASE
-                WHEN orders.status IN ('completed', 'cancelled') THEN orders.status
+                WHEN orders.status IN ('completed', 'cancelled', 'refunded') THEN orders.status
                 ELSE EXCLUDED.status
               END,
               created_at = EXCLUDED.created_at,
               due_date = EXCLUDED.due_date,
               completed_at = CASE
-                WHEN orders.status IN ('completed', 'cancelled') THEN orders.completed_at
+                WHEN orders.status IN ('completed', 'cancelled', 'refunded') THEN orders.completed_at
                 ELSE COALESCE(EXCLUDED.completed_at, orders.completed_at)
               END,
               requirements = EXCLUDED.requirements,
@@ -82,7 +95,7 @@ export class OrdersRepo {
               delivery_notes = EXCLUDED.delivery_notes,
               delivery_reference = EXCLUDED.delivery_reference,
               accepted_version = CASE
-                WHEN orders.status IN ('completed', 'cancelled') THEN orders.accepted_version
+                WHEN orders.status IN ('completed', 'cancelled', 'refunded') THEN orders.accepted_version
                 ELSE COALESCE(EXCLUDED.accepted_version, orders.accepted_version)
               END,
               review_window_days = EXCLUDED.review_window_days,
@@ -100,7 +113,7 @@ export class OrdersRepo {
               cancellation_request = EXCLUDED.cancellation_request,
               cancellation_history = EXCLUDED.cancellation_history,
               cancellation_type = CASE
-                WHEN orders.status IN ('completed', 'cancelled') THEN orders.cancellation_type
+                WHEN orders.status IN ('completed', 'cancelled', 'refunded') THEN orders.cancellation_type
                 ELSE COALESCE(EXCLUDED.cancellation_type, orders.cancellation_type)
               END,
               review_window_restarted_at = EXCLUDED.review_window_restarted_at,
@@ -121,7 +134,8 @@ export class OrdersRepo {
               resolvedOrderType, order.gigOrderId || null, order.projectOrderId || null, order.proposalId || null,
               JSON.stringify(order.extensionRequests || []), Boolean(order.freeExtensionUsed),
               JSON.stringify(order.cancellationRequest || null), JSON.stringify(order.cancellationHistory || []),
-              order.cancellationType || null, order.reviewWindowRestartedAt || null, order.responseDeadline || null
+              order.cancellationType || null, order.reviewWindowRestartedAt || null, order.responseDeadline || null,
+              serviceFee, smallOrderFee
             ]
           );
         }
@@ -141,12 +155,12 @@ export class OrdersRepo {
 
   async listOrders(): Promise<Order[]> {
     const res = await this.ctx.getPool().query('SELECT * FROM orders ORDER BY created_at DESC');
-    return res.rows.map(mapOrderRow);
+    return res.rows.map(mapRowToOrder);
   }
 
   async getOrder(id: string): Promise<Order | null> {
     const res = await this.ctx.getPool().query('SELECT * FROM orders WHERE id = $1', [id]);
-    return res.rows.length > 0 ? mapOrderRow(res.rows[0]) : null;
+    return res.rows.length > 0 ? mapRowToOrder(res.rows[0]) : null;
   }
 
   async listOrdersForUser(userId: string): Promise<Order[]> {
@@ -154,7 +168,7 @@ export class OrdersRepo {
       'SELECT * FROM orders WHERE buyer_id = $1 OR seller_id = $1 ORDER BY created_at DESC',
       [userId]
     );
-    return res.rows.map(mapOrderRow);
+    return res.rows.map(mapRowToOrder);
   }
 
   async listOrdersByProjectId(projectId: string): Promise<Order[]> {
@@ -162,7 +176,7 @@ export class OrdersRepo {
       'SELECT * FROM orders WHERE project_id = $1 ORDER BY created_at DESC',
       [projectId]
     );
-    return res.rows.map(mapOrderRow);
+    return res.rows.map(mapRowToOrder);
   }
 
   // --- REVIEWS ---

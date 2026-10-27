@@ -9,13 +9,16 @@ import {
   adminActor,
   safeUser,
   isStaffUser,
-  escapeHtml
+  escapeHtml,
+  signToken,
+  resolveAuthenticatedUserId
 } from '../middleware/auth.js';
 import { siteSettings } from '../../src/server/siteSettings.js';
 import { registerAuditLog } from '../services/orderService.js';
 import { disconnectUserSockets } from '../websocket.js';
 import { deliverSecurityCode } from '../services/notificationService.js';
 import { generate6DigitCode, emailVerificationCodes } from '../services/authService.js';
+import { financialRepository } from '../domains/finance/financial.service.js';
 
 export const userRouter = Router();
 
@@ -230,7 +233,7 @@ userRouter.get('/users/:id', async (req: Request, res: Response) => {
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
-    const callerId = (req as any).authenticatedUserId;
+    const callerId = resolveAuthenticatedUserId(req) || (req as any).authenticatedUserId;
     const caller = (req as any).authenticatedUser || (callerId ? await store.getUser(callerId) : null);
     const isStaff = isStaffUser(caller);
     if (callerId === user.id || isStaff) {
@@ -253,23 +256,46 @@ const handleUserUpdate = async (req: Request, res: Response) => {
     const targetUser = await store.getUser(userId);
     if (!targetUser) return res.status(404).json({ error: 'User not found' });
 
-    const authUserId = (req as any).authenticatedUserId;
-    const caller = (req as any).authenticatedUser || (await store.getUser(authUserId));
-    const isFullAdmin = caller?.role === 'admin' || caller?.role === 'super_admin';
+    const authUserId = resolveAuthenticatedUserId(req) || (req as any).authenticatedUserId;
+    const caller = (req as any).authenticatedUser || (authUserId ? await store.getUser(authUserId) : null);
+    if (!caller) return res.status(401).json({ error: 'Authentication required' });
+
+    const isSuperAdminUser = caller.role === 'super_admin';
+    const isFullAdmin = caller.role === 'admin' || isSuperAdminUser;
 
     if (caller.id !== targetUser.id && !isFullAdmin) {
       return res.status(403).json({ error: 'Forbidden: You can only edit your own account.' });
     }
 
-    if (req.body.role && targetUser.role !== req.body.role) {
+    if (req.body.role !== undefined && targetUser.role !== req.body.role) {
       if (!isFullAdmin) {
         return res.status(403).json({ error: 'Forbidden: Only administrators can modify roles.' });
+      }
+      const allowedRoles = [
+        'Format', 'Freelancer', 'Employer', 'Both',
+        'admin', 'super_admin', 'support', 'moderator', 'finance_manager',
+        'buyer', 'freelancer'
+      ];
+      if (!allowedRoles.includes(req.body.role)) {
+        return res.status(400).json({ error: `Invalid role "${req.body.role}". Allowed roles: ${allowedRoles.join(', ')}` });
+      }
+      if ((targetUser.role === 'super_admin' || req.body.role === 'super_admin') && !isSuperAdminUser) {
+        return res.status(403).json({ error: 'Forbidden: Only super_admin can grant or revoke super_admin role.' });
       }
       targetUser.role = req.body.role;
     }
 
+    let newToken: string | undefined;
+
     if (req.body.password) {
-      if (caller.id === targetUser.id && !isFullAdmin) {
+      if (caller.id !== targetUser.id) {
+        if (!isFullAdmin) {
+          return res.status(403).json({ error: 'Forbidden: You cannot modify another user password.' });
+        }
+        if (targetUser.role === 'super_admin' && !isSuperAdminUser) {
+          return res.status(403).json({ error: 'Forbidden: Only super_admin can reset password of a super_admin.' });
+        }
+      } else {
         const currentPassword = req.body.currentPassword;
         if (!currentPassword) {
           return res.status(400).json({ error: 'Current password is required to change password' });
@@ -290,7 +316,28 @@ const handleUserUpdate = async (req: Request, res: Response) => {
       const hashed = await bcrypt.hash(newPassword, 10);
       targetUser.password = hashed;
       const pool = postgresStore.getPool();
-      await pool.query("UPDATE users SET password = $1, password_hash = $1 WHERE id = $2", [hashed, targetUser.id]);
+
+      // Session invalidation & WebSocket disconnect
+      const newVersion = (Number(targetUser.sessionVersion) || 1) + 1;
+      targetUser.sessionVersion = newVersion;
+      if (caller.id === targetUser.id) {
+        targetUser.activeSessionVersions = [newVersion];
+        newToken = signToken({
+          id: targetUser.id,
+          role: targetUser.role,
+          email: targetUser.email,
+          sessionVersion: newVersion
+        });
+      } else {
+        targetUser.activeSessionVersions = [];
+      }
+
+      await pool.query(
+        "UPDATE users SET password = $1, password_hash = $1, session_version = $2 WHERE id = $3",
+        [hashed, newVersion, targetUser.id]
+      );
+
+      disconnectUserSockets(targetUser.id);
     }
 
     if (req.body.name) targetUser.name = escapeHtml(String(req.body.name).trim().slice(0, 80));
@@ -299,7 +346,12 @@ const handleUserUpdate = async (req: Request, res: Response) => {
     if (req.body.avatar) targetUser.avatar = String(req.body.avatar).trim();
 
     await store.saveUser(targetUser);
-    res.json(safeUser(targetUser));
+    const safeResult: any = safeUser(targetUser);
+    if (newToken) {
+      safeResult.token = newToken;
+      res.setHeader('x-auth-token', newToken);
+    }
+    res.json(safeResult);
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to update user' });
   }
@@ -307,6 +359,78 @@ const handleUserUpdate = async (req: Request, res: Response) => {
 
 userRouter.put('/users/:id', requireAuth, handleUserUpdate);
 userRouter.patch('/users/:id', requireAuth, handleUserUpdate);
+
+userRouter.delete('/users/:id', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const target = await store.getUser(req.params.id);
+    if (!target) return res.status(404).json({ error: 'User not found' });
+
+    if (target.role === 'super_admin') {
+      return res.status(403).json({ error: 'Cannot delete a super_admin account.' });
+    }
+    if (await financialRepository.hasOutstandingFunds(target.id)) {
+      return res.status(409).json({
+        error: 'User still has wallet funds, pending withdrawals or active escrow. Resolve these before deleting the account.'
+      });
+    }
+
+    const pool = postgresStore.getPool();
+    const activeOrdersRes = await pool.query(
+      "SELECT 1 FROM orders WHERE (buyer_id = $1 OR seller_id = $1) AND status NOT IN ('completed', 'cancelled', 'refunded') AND amount > 0 LIMIT 1",
+      [target.id]
+    );
+    if (activeOrdersRes.rows.length > 0) {
+      return res.status(409).json({ error: 'User has active paid orders. Complete or cancel them first.' });
+    }
+
+    await postgresStore.executeInTransaction(async (client) => {
+      const txOrdersRes = await client.query(
+        "SELECT 1 FROM orders WHERE (buyer_id = $1 OR seller_id = $1) AND status NOT IN ('completed', 'cancelled', 'refunded') AND amount > 0 LIMIT 1",
+        [target.id]
+      );
+      if (txOrdersRes.rows.length > 0) {
+        const conflictErr: any = new Error('User has active paid orders. Complete or cancel them first.');
+        conflictErr.statusCode = 409;
+        throw conflictErr;
+      }
+
+      const [txWalletRes, txEscrowRes] = await Promise.all([
+        client.query('SELECT available_balance, funds_on_hold, pending_withdrawals FROM wallets WHERE user_id = $1 FOR UPDATE', [target.id]),
+        client.query("SELECT 1 FROM escrows WHERE (buyer_id = $1 OR seller_id = $1) AND status = 'held' AND remaining > 0 LIMIT 1", [target.id])
+      ]);
+      const walletRow = txWalletRes.rows[0];
+      if (
+        (walletRow && (Number(walletRow.available_balance) > 0 || Number(walletRow.funds_on_hold) > 0 || Number(walletRow.pending_withdrawals) > 0)) ||
+        txEscrowRes.rows.length > 0
+      ) {
+        const conflictErr: any = new Error('User still has wallet funds, pending withdrawals or active escrow. Resolve these before deleting the account.');
+        conflictErr.statusCode = 409;
+        throw conflictErr;
+      }
+
+      await client.query('DELETE FROM gigs WHERE freelancer_id = $1', [target.id]);
+      await client.query('DELETE FROM projects WHERE buyer_id = $1', [target.id]);
+      await client.query('DELETE FROM users WHERE id = $1', [target.id]);
+    });
+
+    const admin = (req as any).authenticatedUser;
+    registerAuditLog({
+      id: 'log_' + Date.now(),
+      actor: admin?.name || adminActor(req),
+      role: admin?.role || 'admin',
+      action: 'USER_DELETED',
+      target: `User ${target.name}`,
+      details: `Permanently deleted user account ${target.email} and cleared their associated gigs & projects`,
+      timestamp: new Date().toLocaleString()
+    });
+
+    disconnectUserSockets(target.id, 'Account deleted');
+    res.json({ success: true, id: target.id });
+  } catch (err: any) {
+    const status = err?.statusCode || 400;
+    res.status(status).json({ error: err.message || 'Failed to delete user' });
+  }
+});
 
 userRouter.post('/users/:id/flag', requireAdmin, async (req: Request, res: Response) => {
   const user = await store.getUser(req.params.id);

@@ -988,6 +988,7 @@ router.post('/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimit
       order.status = 'payment_pending';
       await store.saveOrder(order);
 
+      let escrowFunded = false;
       try {
         await fundOrderEscrowWithEvent({
           orderId: order.id,
@@ -998,6 +999,7 @@ router.post('/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimit
           actor: `user:${order.buyerId}`,
           idempotencyKey
         });
+        escrowFunded = true;
         order.title = newTitle;
         order.amount = offer.amount;
         order.status = 'funded_in_escrow';
@@ -1022,9 +1024,16 @@ router.post('/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimit
         await saveOfferToDb(offer);
         await postOfferMessage(order, offer, null, `${offer.number} was accepted and escrow was funded ($${offer.amount}).`, 'offer_accepted');
       } catch (fundingErr: any) {
-        order.status = prevStatus;
+        if (!escrowFunded) {
+          order.status = prevStatus;
+          await store.saveOrder(order);
+          return res.status(400).json({ error: fundingErr.message || 'Failed to fund escrow for offer.' });
+        }
+        order.status = 'in_progress';
+        offer.status = 'accepted';
         await store.saveOrder(order);
-        return res.status(400).json({ error: fundingErr.message || 'Failed to fund escrow for offer.' });
+        await saveOfferToDb(offer);
+        return res.json({ offer: await viewOffer(offer), order: enrichOrderWithServiceInfo(order) });
       }
     } else if (isFollowOnAfterCompletion || isCancelledGigFollowOn || (order.orderType === 'project' && (order.status === 'completed' || order.status === 'cancelled') && offer.kind === 'proposal')) {
       const newOrderId = 'ord_' + randomUUID().slice(0, 12);
@@ -1059,6 +1068,7 @@ router.post('/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimit
       await recordOrder(enrichedOrder);
       await store.saveOrder(enrichedOrder);
 
+      let followOnEscrowFunded = false;
       try {
         await fundOrderEscrowWithEvent({
           orderId: newOrder.id,
@@ -1069,20 +1079,26 @@ router.post('/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimit
           actor: `user:${newOrder.buyerId}`,
           idempotencyKey
         });
+        followOnEscrowFunded = true;
         
         enrichedOrder.status = 'funded_in_escrow';
         await store.saveOrder(enrichedOrder);
         await syncUserBalances();
       } catch (fundingErr: any) {
-        const pool = postgresStore.getPool();
-        const escCheck = await pool.query('SELECT 1 FROM escrows WHERE order_id = $1', [newOrder.id]);
-        if (escCheck.rows.length === 0) {
-          await pool.query('DELETE FROM orders WHERE id = $1', [newOrder.id]);
-        } else {
-          enrichedOrder.status = 'payment_pending';
-          await store.saveOrder(enrichedOrder);
+        if (!followOnEscrowFunded) {
+          const pool = postgresStore.getPool();
+          const escCheck = await pool.query('SELECT 1 FROM escrows WHERE order_id = $1', [newOrder.id]);
+          if (escCheck.rows.length === 0) {
+            await pool.query('DELETE FROM orders WHERE id = $1', [newOrder.id]);
+          } else {
+            enrichedOrder.status = 'payment_pending';
+            await store.saveOrder(enrichedOrder);
+          }
+          return res.status(400).json({ error: fundingErr.message || 'Failed to fund escrow for follow-on order.' });
         }
-        return res.status(400).json({ error: fundingErr.message || 'Failed to fund escrow for follow-on order.' });
+        enrichedOrder.status = 'in_progress';
+        await store.saveOrder(enrichedOrder);
+        return res.json({ offer: await viewOffer(offer), order: enrichOrderWithServiceInfo(enrichedOrder) });
       }
 
       await emitSystemEvent(newOrder.id, 'order_created', `Order placed: ${newOrder.title}. Payment is held in escrow until the work is approved.`);
@@ -1232,6 +1248,7 @@ router.post(
         await workspaceService.ensureWorkspaceForOrderAsync(newOrder);
         await store.saveOrder(newOrder);
 
+        let customOfferEscrowFunded = false;
         try {
           await fundOrderEscrowWithEvent({
             orderId: newOrder.id,
@@ -1242,6 +1259,7 @@ router.post(
             actor: `user:${caller.id}`,
             idempotencyKey
           });
+          customOfferEscrowFunded = true;
 
           newOrder.status = 'in_progress';
           await store.saveOrder(newOrder);
@@ -1255,14 +1273,19 @@ router.post(
 
           return res.json({ success: true, order: enrichOrderWithServiceInfo(newOrder), offer: await viewOffer(offer) });
         } catch (err: any) {
-          const escCheck = await pool.query("SELECT 1 FROM escrows WHERE order_id = $1", [newOrder.id]);
-          if (escCheck.rows.length === 0) {
-            await pool.query("DELETE FROM orders WHERE id = $1", [newOrder.id]);
-          } else {
-            newOrder.status = 'payment_pending';
-            await store.saveOrder(newOrder);
+          if (!customOfferEscrowFunded) {
+            const escCheck = await pool.query("SELECT 1 FROM escrows WHERE order_id = $1", [newOrder.id]);
+            if (escCheck.rows.length === 0) {
+              await pool.query("DELETE FROM orders WHERE id = $1", [newOrder.id]);
+            } else {
+              newOrder.status = 'payment_pending';
+              await store.saveOrder(newOrder);
+            }
+            return res.status(400).json({ error: err.message || 'Failed to fund escrow for custom offer' });
           }
-          return res.status(400).json({ error: err.message || 'Failed to fund escrow for custom offer' });
+          newOrder.status = 'in_progress';
+          await store.saveOrder(newOrder);
+          return res.json({ success: true, order: enrichOrderWithServiceInfo(newOrder), offer: await viewOffer(offer) });
         }
       }
 
@@ -1289,35 +1312,95 @@ router.post(
           return res.status(409).json({ error: `This offer is already ${targetOffer.status}.` });
         }
 
-        const amountToFund = Number(targetOffer.amount);
-        if (!Number.isFinite(amountToFund) || amountToFund <= 0) {
-          return res.status(400).json({ error: 'Invalid offer amount.' });
+        if (targetOffer.kind === 'invoice') {
+          const validationError = validateOrderReleasePreconditions(freshOrder, false, true);
+          if (validationError) {
+            return res.status(validationError.status).json({ error: validationError.error });
+          }
+
+          const esc = await financialRepository.getEscrow(freshOrder.id);
+          const currentEscrow = esc ? esc.remaining : (freshOrder.escrowBalance ?? Number(freshOrder.amount || 0));
+          const invoiceAmount = Number(targetOffer.amount);
+          const additionalAmount = Math.round((invoiceAmount - currentEscrow) * 100) / 100;
+
+          if (additionalAmount < 0) {
+            return res.status(400).json({ error: `Final invoice amount ($${invoiceAmount}) cannot be less than the current order escrow ($${currentEscrow}).` });
+          }
+
+          await ensureWallet(freshOrder.buyerId);
+          await ensureWallet(freshOrder.sellerId);
+
+          if (additionalAmount > 0) {
+            await topUpOrderEscrowWithEvent({
+              orderId: freshOrder.id,
+              orderTitle: `Invoice Top-up: ${targetOffer.title}`,
+              amount: additionalAmount,
+              buyerId: freshOrder.buyerId,
+              sellerId: freshOrder.sellerId,
+              actor: `user:${caller.id}`,
+              idempotencyKey: `${idempotencyKey}-topup`
+            });
+            freshOrder.amount = invoiceAmount;
+          }
+
+          let invoiceRevisionsResolved = false;
+          if (Array.isArray(freshOrder.revisions)) {
+            for (const rev of freshOrder.revisions) {
+              if (rev.status === 'requested') {
+                rev.status = 'resolved';
+                invoiceRevisionsResolved = true;
+              }
+            }
+          }
+          if (invoiceRevisionsResolved) {
+            await emitSystemEvent(freshOrder.id, 'revision_resolved', `📝 Revision resolved via accepted invoice ${targetOffer.number || targetOffer.id}.`);
+          }
+
+          await releaseOrderFunds(freshOrder, caller.name, `Final invoice ${targetOffer.number || targetOffer.id} accepted by buyer and escrow released`, false);
+
+          targetOffer.status = 'paid';
+          targetOffer.resolvedAt = new Date().toISOString();
+          targetOffer.resolvedBy = caller.id;
+          await saveOfferToDb(targetOffer);
+
+          freshOrder.status = 'completed';
+          freshOrder.completedAt = new Date().toISOString();
+          freshOrder.escrowReleased = true;
+          await store.saveOrder(freshOrder);
+          await syncUserBalances();
+
+          return res.json({ success: true, order: enrichOrderWithServiceInfo(freshOrder), offer: await viewOffer(targetOffer) });
+        } else {
+          const amountToFund = Number(targetOffer.amount);
+          if (!Number.isFinite(amountToFund) || amountToFund <= 0) {
+            return res.status(400).json({ error: 'Invalid offer amount.' });
+          }
+
+          await ensureWallet(freshOrder.buyerId);
+          await ensureWallet(freshOrder.sellerId);
+
+          await topUpOrderEscrowWithEvent({
+            orderId: freshOrder.id,
+            orderTitle: targetOffer.title || freshOrder.title,
+            amount: amountToFund,
+            buyerId: freshOrder.buyerId,
+            sellerId: freshOrder.sellerId,
+            actor: `user:${caller.id}`,
+            idempotencyKey
+          });
+
+          targetOffer.status = 'accepted';
+          targetOffer.resolvedAt = new Date().toISOString();
+          targetOffer.resolvedBy = caller.id;
+          await saveOfferToDb(targetOffer);
+
+          freshOrder.amount = Math.round((Number(freshOrder.amount || 0) + amountToFund) * 100) / 100;
+          freshOrder.status = 'in_progress';
+          await store.saveOrder(freshOrder);
+          await syncUserBalances();
+
+          return res.json({ success: true, order: enrichOrderWithServiceInfo(freshOrder), offer: await viewOffer(targetOffer) });
         }
-
-        await ensureWallet(freshOrder.buyerId);
-        await ensureWallet(freshOrder.sellerId);
-
-        await topUpOrderEscrowWithEvent({
-          orderId: freshOrder.id,
-          orderTitle: targetOffer.title || freshOrder.title,
-          amount: amountToFund,
-          buyerId: freshOrder.buyerId,
-          sellerId: freshOrder.sellerId,
-          actor: `user:${caller.id}`,
-          idempotencyKey
-        });
-
-        targetOffer.status = 'accepted';
-        targetOffer.resolvedAt = new Date().toISOString();
-        targetOffer.resolvedBy = caller.id;
-        await saveOfferToDb(targetOffer);
-
-        freshOrder.amount = Math.round((Number(freshOrder.amount || 0) + amountToFund) * 100) / 100;
-        freshOrder.status = 'in_progress';
-        await store.saveOrder(freshOrder);
-        await syncUserBalances();
-
-        return res.json({ success: true, order: enrichOrderWithServiceInfo(freshOrder), offer: await viewOffer(targetOffer) });
       } finally {
         releaseOrderLock(lockedExistingOrderId);
       }

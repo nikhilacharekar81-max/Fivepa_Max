@@ -277,7 +277,9 @@ CREATE TABLE IF NOT EXISTS payouts (
   method VARCHAR(64) NOT NULL,
   status VARCHAR(32) NOT NULL,
   created_at VARCHAR(32) NOT NULL,
-  account_details TEXT
+  account_details TEXT,
+  processed_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS support_tickets (
@@ -507,14 +509,16 @@ CREATE TABLE IF NOT EXISTS financial_idempotency (
   operation TEXT,
   status TEXT,
   result JSONB,
-  request_fingerprint TEXT,
+  request_fingerprint JSONB,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-ALTER TABLE financial_idempotency ADD COLUMN IF NOT EXISTS request_fingerprint TEXT;
+ALTER TABLE financial_idempotency ADD COLUMN IF NOT EXISTS request_fingerprint JSONB;
+ALTER TABLE financial_idempotency ALTER COLUMN request_fingerprint TYPE JSONB USING request_fingerprint::jsonb;
 ALTER TABLE payouts ADD COLUMN IF NOT EXISTS account_details TEXT;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_earnings_clearing_order ON earnings_clearing (order_id);
+DROP INDEX IF EXISTS idx_unique_earnings_clearing_order;
+CREATE INDEX IF NOT EXISTS idx_earnings_clearing_order ON earnings_clearing (order_id);
 
 ALTER TABLE wallets ADD COLUMN IF NOT EXISTS pending_balance NUMERIC(14,2) DEFAULT 0.00 NOT NULL;
 
@@ -755,3 +759,6 @@ WHERE metadata->>'clientMessageId' IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_workstream_offers_number
 ON workstream_offers (number)
 WHERE number IS NOT NULL;
+
+ALTER TABLE payouts ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ;
+ALTER TABLE payouts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();

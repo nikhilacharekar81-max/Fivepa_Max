@@ -3,125 +3,282 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useCallback } from 'react';
-import { 
-  ShieldCheck, 
-  Search, 
-  Briefcase, 
-  DollarSign, 
-  User as UserIcon, 
-  Settings, 
-  MessageSquare, 
-  CheckCircle2, 
-  Lock, 
-  Zap, 
-  SlidersHorizontal,
-  LogOut,
-  Bell,
-  Star,
-  ExternalLink,
-  PlusCircle,
-  HelpCircle,
-  ArrowRight,
-  Clock,
-  Check
-} from 'lucide-react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { useAppData } from './hooks/useAppData';
 import { useWorkstream } from './hooks/workstream/useWorkstream';
 import { Header } from './layout/Header';
 import { Footer } from './layout/Footer';
-import { MarketplaceGigsView } from './components/marketplace/MarketplaceGigsView';
-import {
-  WorkstreamWorkspace,
-  WorkstreamSidebar,
-  WorkstreamList,
-  StartWorkstreamModal,
-  type WorkstreamFilter
-} from './components/workstream';
-import { AdminPage } from './pages/AdminPage';
-import { SettingsPage } from './pages/SettingsPage';
-import { UserWalletsLedgerModule } from './components/UserWalletsLedgerModule';
-import { PaymentsModule } from './components/PaymentsModule';
-import { LoginModal, SignupModal, VerifyModal, UserSwitchModal, ForgotPasswordModal, WishlistModal, SupportModal } from './components/modals';
-import { slugify, getGigUrl } from './utils/slugify';
+import { ImpersonationBanner } from './layout/ImpersonationBanner';
 import { PPH_CATEGORIES } from './components/HeaderCategoriesNav';
-import { ProjectDetailView } from './components/marketplace/ProjectDetailView';
-import { ProjectSearchView } from './components/marketplace/ProjectSearchView';
+import { MarketplaceGigsView } from './components/marketplace/MarketplaceGigsView';
 import { FreelancerSearchView } from './components/marketplace/FreelancerSearchView';
+import { ProjectSearchView } from './components/marketplace/ProjectSearchView';
+import { ProjectDetailView } from './components/marketplace/ProjectDetailView';
 import { BuyerActivityView } from './components/marketplace/BuyerActivityView';
 import { FreelancerActivityView } from './components/marketplace/FreelancerActivityView';
-import { CreateGigView } from './components/gigs/CreateGigView';
 import { GigDetailView } from './components/gigs/GigDetailView';
-import { EditProfilePage } from './components/profile/EditProfilePage';
+import { CreateGigView } from './components/gigs/CreateGigView';
 import { FreelancerProfileView } from './components/profile/FreelancerProfileView';
-import { getAuthToken, setAuthToken, clearAuthToken, requestDemoSession, installAuthFetch } from './utils/authToken';
+import { EditProfilePage } from './components/profile/EditProfilePage';
+import { AdminPage } from './pages/AdminPage';
+import { SettingsPage } from './pages/SettingsPage';
+import { WorkstreamWorkspace } from './components/workstream/WorkstreamWorkspace';
+import { WorkstreamList } from './components/workstream/WorkstreamList';
+import { PaymentsModule } from './components/PaymentsModule';
+import {
+  LoginModal,
+  SignupModal,
+  UserSwitchModal,
+  ForgotPasswordModal,
+  VerifyModal,
+  SupportModal,
+  WishlistModal,
+  EmailNotificationsModal
+} from './components/modals';
+import { slugify, getGigUrl } from './utils/slugify';
+import { getAuthToken, setAuthToken, clearAuthToken, requestDemoSession } from './utils/authToken';
 import { getDeviceId } from './utils/deviceId';
+import { DEFAULT_GIG_IMAGE } from './constants';
+import { RESERVED_ROUTES } from './shared/routes';
+import type { UserAccount, Gig, Order, GigExtra } from './types';
 
-declare global {
-  interface Window {
-    __INITIAL_DATA__?: any;
-  }
+export interface AppProps {
+  initialPath?: string;
+  initialData?: any;
 }
 
-export default function App({ initialPath = '/', initialData }: { initialPath?: string; initialData?: any } = {}) {
-  const resolvedInitialData = initialData || (typeof window !== 'undefined' ? window.__INITIAL_DATA__ : undefined);
-  const [path, setPath] = useState(initialPath || (typeof window !== 'undefined' ? window.location.pathname : '/'));
-  const appData = useAppData(resolvedInitialData);
-  const { users, gigs, projects, orders, proposals, messages, setMessages, setReviews, setOrders, refresh } = appData;
+const CATEGORY_SLUGS: Record<string, string> = {
+  'All': 'all',
+  'Development & IT': 'technology-programming',
+  'AI & Data': 'ai-services',
+  'Design & Creative': 'design',
+  'Mobile Apps': 'technology-programming'
+};
 
-  const [currentUser, setCurrentUser] = useState<any>(null);
-  const [impersonatedUser, setImpersonatedUser] = useState<any>(null);
-  const [selectedOrder, setSelectedOrder] = useState<any>(null);
-  const [likedGigIds, setLikedGigIds] = useState<string[]>([]);
-  const [isLoginOpen, setIsLoginOpen] = useState(false);
-  const [isSignupOpen, setIsSignupOpen] = useState(false);
-  const [isSwitchUserOpen, setIsSwitchUserOpen] = useState(false);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [currentCategory, setCurrentCategory] = useState('All');
-  const [gigViewMode, setGigViewMode] = useState<'grid' | 'list'>('grid');
-  const [activeDropdown, setActiveDropdown] = useState<string | null>(null);
-  const [serviceOptionFilter, setServiceOptionFilter] = useState('all');
-  const [sellerLevelFilter, setSellerLevelFilter] = useState('all');
-  const [budgetFilter, setBudgetFilter] = useState('all');
-  const [deliveryTimeFilter, setDeliveryTimeFilter] = useState<number | null>(null);
-  const [onlineNowOnly, setOnlineNowOnly] = useState(false);
-  const [toastMessage, setToastMessage] = useState<string | null>(null);
+PPH_CATEGORIES.forEach(cat => {
+  CATEGORY_SLUGS[cat.name] = cat.slug;
+  cat.subcategories?.forEach(sub => {
+    CATEGORY_SLUGS[sub.name] = sub.slug;
+  });
+});
 
-  // Workstream filter & modal state
-  const [workstreamTab, setWorkstreamTab] = useState<WorkstreamFilter>('all');
-  const [starredWorkstreams, setStarredWorkstreams] = useState<string[]>([]);
-  const [selectedPersonFilter, setSelectedPersonFilter] = useState<string | null>(null);
-  const [peopleSearch, setPeopleSearch] = useState('');
-  const [projectFilterSearch, setProjectFilterSearch] = useState('');
-  const [workstreamSearch, setWorkstreamSearch] = useState('');
-  const [isStartWorkstreamModalOpen, setIsStartWorkstreamModalOpen] = useState(false);
+export default function App({ initialPath = '/', initialData }: AppProps) {
+  // Navigation / Route state
+  const [currentPath, setCurrentPath] = useState<string>(() => {
+    if (typeof window !== 'undefined') {
+      return window.location.pathname + window.location.search;
+    }
+    return initialPath;
+  });
 
-  // Login form state for LoginModal
+  const navigate = useCallback((to: string, e?: React.MouseEvent) => {
+    if (e && (e.button !== 0 || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey)) {
+      return;
+    }
+    if (e) {
+      e.preventDefault();
+    }
+    if (typeof window !== 'undefined') {
+      window.history.pushState({}, '', to);
+      window.scrollTo(0, 0);
+    }
+    setCurrentPath(to);
+  }, []);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      setCurrentPath(window.location.pathname + window.location.search);
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
+
+  // Application Data
+  const appData = useAppData(initialData);
+  const {
+    users,
+    setUsers,
+    gigs,
+    setGigs,
+    projects,
+    setProjects,
+    proposals,
+    setProposals,
+    offers,
+    setOffers,
+    orders,
+    setOrders,
+    reviews,
+    setReviews,
+    messages,
+    setMessages,
+    disputes,
+    setDisputes,
+    refunds,
+    setRefunds,
+    payouts,
+    setPayouts,
+    categories,
+    setCategories,
+    supportTickets,
+    setSupportTickets,
+    auditLogs,
+    setAuditLogs,
+    userEmails,
+    setUserEmails,
+    fetchUserEmails,
+    platformFee,
+    clientServiceFee,
+    smallOrderFeeThreshold,
+    smallOrderFeeAmount,
+    escrowProtectionDays,
+    refresh
+  } = appData;
+
+  // Active / Impersonated User state
+  const [currentUser, setCurrentUser] = useState<UserAccount | null>(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const stored = localStorage.getItem('current_user');
+        if (stored) {
+          const parsed = JSON.parse(stored);
+          if (parsed && parsed.id) return parsed;
+        }
+      } catch {}
+    }
+    if (initialData?.users && initialData.users.length > 0) {
+      const marcus = initialData.users.find((u: any) => u.id === 'u2' || u.name?.includes('Marcus Vance'));
+      if (marcus) {
+        if (typeof window !== 'undefined') {
+          localStorage.setItem('current_user', JSON.stringify(marcus));
+        }
+        return marcus;
+      }
+      return initialData.users[0];
+    }
+    return null;
+  });
+
+  const [impersonatedUser, setImpersonatedUser] = useState<UserAccount | null>(null);
+  const activeUser = impersonatedUser || currentUser;
+
+  // Keep currentUser in sync with canonical users list
+  useEffect(() => {
+    if (currentUser?.id && users.length > 0) {
+      const freshUser = users.find(u => u.id === currentUser.id);
+      if (freshUser && JSON.stringify(freshUser) !== JSON.stringify(currentUser)) {
+        setCurrentUser(freshUser);
+        if (typeof window !== 'undefined') {
+          localStorage.setItem('current_user', JSON.stringify(freshUser));
+        }
+      }
+    }
+  }, [users, currentUser?.id]);
+
+  const updateCurrentUser = useCallback(
+    (u: UserAccount | null | ((prev: UserAccount | null) => UserAccount | null)) => {
+      setCurrentUser(prev => {
+        const next = typeof u === 'function' ? u(prev) : u;
+        if (typeof window !== 'undefined') {
+          if (next) {
+            localStorage.setItem('current_user', JSON.stringify(next));
+          } else {
+            localStorage.removeItem('current_user');
+          }
+        }
+        return next;
+      });
+    },
+    []
+  );
+
+  const loadUserSession = useCallback(async (): Promise<boolean> => {
+    let storedUser: any = null;
+    try {
+      const storedRaw = typeof window !== 'undefined'
+        ? localStorage.getItem('current_user')
+        : null;
+      storedUser = storedRaw ? JSON.parse(storedRaw) : null;
+    } catch {}
+
+    const targetUserId = storedUser?.id || 'u2';
+
+    try {
+      const demoSession = await requestDemoSession(targetUserId);
+      if (demoSession?.token && demoSession?.user) {
+        setAuthToken(demoSession.token);
+        updateCurrentUser(demoSession.user);
+        return true;
+      }
+    } catch {}
+    return false;
+  }, [updateCurrentUser]);
+
+  // Initial client hydration fetch
+  useEffect(() => {
+    loadUserSession().finally(() => {
+      refresh();
+    });
+  }, [loadUserSession, refresh]);
+
+  // Liked Gigs state
+  const [likedGigIds, setLikedGigIds] = useState<string[]>(() => {
+    if (typeof window === 'undefined') return [];
+    try {
+      const stored = localStorage.getItem('worksphere_liked_gigs');
+      return stored ? JSON.parse(stored) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const handleToggleLike = useCallback((gigId: string, e?: React.MouseEvent) => {
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    setLikedGigIds(prev => {
+      const next = prev.includes(gigId) ? prev.filter(id => id !== gigId) : [...prev, gigId];
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('worksphere_liked_gigs', JSON.stringify(next));
+      }
+      return next;
+    });
+  }, []);
+
+  // Modal open states
+  const [isLoginModalOpen, setIsLoginModalOpen] = useState(false);
+  const [isSignupModalOpen, setIsSignupModalOpen] = useState(false);
+  const [isUserSwitchModalOpen, setIsUserSwitchModalOpen] = useState(false);
+  const [isForgotPasswordModalOpen, setIsForgotPasswordModalOpen] = useState(false);
+  const [isVerifyModalOpen, setIsVerifyModalOpen] = useState(false);
+  const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
+  const [isWishlistModalOpen, setIsWishlistModalOpen] = useState(false);
+  const [isEmailNotificationsModalOpen, setIsEmailNotificationsModalOpen] = useState(false);
+
+  // Authentication form states
   const [loginEmail, setLoginEmail] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
   const [loginCode, setLoginCode] = useState('');
   const [loginRequiresCode, setLoginRequiresCode] = useState(false);
   const [loginVerificationMessage, setLoginVerificationMessage] = useState('');
   const [mockEmailCodeDisplay, setMockEmailCodeDisplay] = useState<string | null>(null);
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [isSubmittingLogin, setIsSubmittingLogin] = useState(false);
 
-  // Signup form state for SignupModal
   const [signupName, setSignupName] = useState('');
   const [signupEmail, setSignupEmail] = useState('');
   const [signupMobile, setSignupMobile] = useState('');
   const [signupPassword, setSignupPassword] = useState('');
   const [signupConfirmPassword, setSignupConfirmPassword] = useState('');
+  const [signupError, setSignupError] = useState<string | null>(null);
+  const [isSubmittingSignup, setIsSubmittingSignup] = useState(false);
 
-  // Verify modal state
-  const [isVerifyModalOpen, setIsVerifyModalOpen] = useState(false);
-  const [verifyEmail, setVerifyEmail] = useState('');
-  const [verifyMobile, setVerifyMobile] = useState('');
   const [verificationMode, setVerificationMode] = useState<'email' | 'sms'>('email');
   const [emailCodeInput, setEmailCodeInput] = useState('');
   const [smsCodeInput, setSmsCodeInput] = useState('');
-  const [mockSmsCodeDisplay, setMockSmsCodeDisplay] = useState<string | null>(null);
+  const [verifyEmail, setVerifyEmail] = useState('');
 
-  // Forgot Password & Support modal state
-  const [isForgotPasswordOpen, setIsForgotPasswordOpen] = useState(false);
   const [forgotStep, setForgotStep] = useState<'request' | 'verify' | 'reset'>('request');
   const [forgotQuery, setForgotQuery] = useState('');
   const [forgotCode, setForgotCode] = useState('');
@@ -129,1201 +286,926 @@ export default function App({ initialPath = '/', initialData }: { initialPath?: 
   const [newPassword, setNewPassword] = useState('');
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
 
-  // Wishlist and Support modal state
-  const [isWishlistOpen, setIsWishlistOpen] = useState(false);
-  const [isSupportOpen, setIsSupportOpen] = useState(false);
   const [supportSubject, setSupportSubject] = useState('');
   const [supportMessage, setSupportMessage] = useState('');
 
-  const showToast = useCallback((msg: string) => {
-    setToastMessage(msg);
-    setTimeout(() => setToastMessage(null), 4000);
+  // Marketplace filter states
+  const [searchQuery, setSearchQuery] = useState('');
+  const [activeDropdown, setActiveDropdown] = useState<string | null>(null);
+  const [serviceOptionFilter, setServiceOptionFilter] = useState('All');
+  const [sellerLevelFilter, setSellerLevelFilter] = useState('All');
+  const [budgetFilter, setBudgetFilter] = useState('');
+  const [deliveryTimeFilter, setDeliveryTimeFilter] = useState<number | null>(null);
+  const [onlineNowOnly, setOnlineNowOnly] = useState(false);
+  const [gigViewMode, setGigViewMode] = useState<'grid' | 'list'>('grid');
+
+  // Workstream & Selected Order state
+  const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
+  const [starredOrderIds, setStarredOrderIds] = useState<string[]>([]);
+  const [workstreamSearch, setWorkstreamSearch] = useState('');
+
+  const toggleStarOrder = useCallback((orderId: string) => {
+    setStarredOrderIds(prev =>
+      prev.includes(orderId) ? prev.filter(id => id !== orderId) : [...prev, orderId]
+    );
   }, []);
 
-  const handleForgotRequest = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const workstream = useWorkstream({
+    orders,
+    setOrders,
+    messages,
+    setMessages,
+    reviews,
+    setReviews,
+    currentUser: activeUser,
+    impersonatedUser,
+    selectedOrder,
+    setSelectedOrder,
+    refresh
+  });
+
+  // Create Gig state
+  const [newGigTitle, setNewGigTitle] = useState('');
+  const [newGigCat, setNewGigCat] = useState('Development & IT');
+  const [newGigDesc, setNewGigDesc] = useState('');
+  const [newGigPrice, setNewGigPrice] = useState(25);
+  const [newGigDays, setNewGigDays] = useState(3);
+  const [newGigImage, setNewGigImage] = useState('');
+  const [isOptimizingGig, setIsOptimizingGig] = useState(false);
+  const [newGigExtras, setNewGigExtras] = useState<GigExtra[]>([]);
+  const [extraTitleInput, setExtraTitleInput] = useState('');
+  const [extraPriceInput, setExtraPriceInput] = useState(10);
+
+  const handleOptimizeGigWithAI = async () => {
+    if (!newGigTitle.trim()) return;
+    setIsOptimizingGig(true);
     try {
-      const res = await fetch('/api/auth/forgot-password/request', {
+      const res = await fetch('/api/gigs/optimize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: forgotQuery })
+        body: JSON.stringify({ title: newGigTitle, category: newGigCat })
       });
-      const data = await res.json();
       if (res.ok) {
-        if (data.mockCode) setMockForgotCodeDisplay(data.mockCode);
-        setForgotStep('verify');
-        showToast('Recovery code sent successfully!');
-      } else {
-        showToast(data.error || 'User not found');
+        const data = await res.json();
+        if (data.title) setNewGigTitle(data.title);
+        if (data.description) setNewGigDesc(data.description);
       }
-    } catch {
-      showToast('Failed to send recovery code');
+    } catch (e) {
+      console.warn('AI optimize error:', e);
+    } finally {
+      setIsOptimizingGig(false);
     }
   };
 
-  const handleForgotVerify = async (e: React.FormEvent) => {
-    e.preventDefault();
-    try {
-      const res = await fetch('/api/auth/forgot-password/verify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: forgotQuery, code: forgotCode })
-      });
-      const data = await res.json();
-      if (res.ok) {
-        setForgotStep('reset');
-        showToast('Code verified. Set new password.');
-      } else {
-        showToast(data.error || 'Invalid recovery code');
-      }
-    } catch {
-      showToast('Failed to verify code');
-    }
+  const handleAddGigExtra = () => {
+    if (!extraTitleInput.trim()) return;
+    setNewGigExtras(prev => [
+      ...prev,
+      { id: 'extra_' + Date.now(), title: extraTitleInput.trim(), price: extraPriceInput }
+    ]);
+    setExtraTitleInput('');
+    setExtraPriceInput(10);
   };
 
-  const handleForgotReset = async (e: React.FormEvent) => {
+  const handleRemoveGigExtra = (id: string) => {
+    setNewGigExtras(prev => prev.filter(e => e.id !== id));
+  };
+
+  const handlePublishGig = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (newPassword.length < 6) {
-      showToast('Password must be at least 6 characters');
+    const token = getAuthToken();
+    if (!token || !activeUser) {
+      setIsLoginModalOpen(true);
       return;
     }
-    if (newPassword !== confirmNewPassword) {
-      showToast('Passwords do not match');
-      return;
-    }
     try {
-      const res = await fetch('/api/auth/forgot-password/reset', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: forgotQuery, code: forgotCode, newPassword })
-      });
-      const data = await res.json();
-      if (res.ok) {
-        setIsForgotPasswordOpen(false);
-        setForgotStep('request');
-        setForgotCode('');
-        setNewPassword('');
-        setConfirmNewPassword('');
-        showToast('Password reset successfully. Please log in.');
-        setIsLoginOpen(true);
-      } else {
-        showToast(data.error || 'Failed to reset password');
-      }
-    } catch {
-      showToast('Failed to reset password');
-    }
-  };
-
-  const handleSubmitSupportTicket = async (e: React.FormEvent, isAppeal?: boolean) => {
-    e.preventDefault();
-    try {
-      const res = await fetch('/api/support-tickets', {
+      const res = await fetch('/api/gigs', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${getAuthToken() || ''}`
+          Authorization: `Bearer ${token}`
         },
         body: JSON.stringify({
-          subject: supportSubject,
-          text: supportMessage,
-          isAppeal
+          title: newGigTitle,
+          category: newGigCat,
+          description: newGigDesc,
+          price: newGigPrice,
+          deliveryDays: newGigDays,
+          image: newGigImage || DEFAULT_GIG_IMAGE,
+          extras: newGigExtras
+        })
+      });
+      if (res.ok) {
+        const created = await res.json();
+        await refresh();
+        navigate(getGigUrl(created));
+      }
+    } catch (err) {
+      console.error('Publish gig failed:', err);
+    }
+  };
+
+  // Auth Handlers
+  const handleLoginSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsSubmittingLogin(true);
+    setLoginError(null);
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-device-id': getDeviceId()
+        },
+        body: JSON.stringify({
+          email: loginEmail,
+          password: loginPassword,
+          code: loginCode
         })
       });
       const data = await res.json();
-      if (res.ok) {
-        setIsSupportOpen(false);
-        setSupportSubject('');
-        setSupportMessage('');
-        showToast('Support ticket submitted successfully!');
-      } else {
-        showToast(data.error || 'Failed to submit support ticket.');
+      if (!res.ok) {
+        setLoginError(data.error || 'Login failed.');
+        return;
       }
-    } catch {
-      showToast('Failed to submit support ticket.');
+      if (data.requiresVerification || data.requires2FA) {
+        setLoginRequiresCode(true);
+        setLoginVerificationMessage(data.message || 'Verification required');
+        if (data.mockEmailCode) setMockEmailCodeDisplay(data.mockEmailCode);
+        return;
+      }
+      if (data.token) {
+        setAuthToken(data.token);
+        updateCurrentUser(data.user);
+        setIsLoginModalOpen(false);
+        setLoginPassword('');
+        setLoginCode('');
+        refresh();
+      }
+    } catch (err: any) {
+      setLoginError(err.message || 'Network error.');
+    } finally {
+      setIsSubmittingLogin(false);
+    }
+  };
+
+  const handleSignupSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsSubmittingSignup(true);
+    setSignupError(null);
+    if (signupPassword !== signupConfirmPassword) {
+      setSignupError('Passwords do not match.');
+      setIsSubmittingSignup(false);
+      return;
+    }
+    try {
+      const res = await fetch('/api/auth/signup', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-device-id': getDeviceId()
+        },
+        body: JSON.stringify({
+          name: signupName,
+          email: signupEmail,
+          mobile: signupMobile,
+          password: signupPassword
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setSignupError(data.error || 'Signup failed.');
+        return;
+      }
+      setIsSignupModalOpen(false);
+      if (data.requiresVerification) {
+        setVerifyEmail(signupEmail);
+        if (data.mockEmailCode) setMockEmailCodeDisplay(data.mockEmailCode);
+        setIsVerifyModalOpen(true);
+      } else if (data.token) {
+        setAuthToken(data.token);
+        updateCurrentUser(data.user);
+        refresh();
+      }
+    } catch (err: any) {
+      setSignupError(err.message || 'Network error.');
+    } finally {
+      setIsSubmittingSignup(false);
     }
   };
 
   const handleVerifyEmailSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!emailCodeInput.trim()) {
-      showToast('Please enter your 6-digit verification code.');
-      return;
-    }
     try {
       const res = await fetch('/api/auth/verify-email', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: verifyEmail, code: emailCodeInput.trim() })
+        body: JSON.stringify({ email: verifyEmail, code: emailCodeInput })
       });
       const data = await res.json();
-      if (res.ok) {
+      if (res.ok && data.token) {
+        setAuthToken(data.token);
+        updateCurrentUser(data.user);
         setIsVerifyModalOpen(false);
-        setEmailCodeInput('');
-        if (data.token && data.user) {
-          setAuthToken(data.token);
-          setCurrentUser(data.user);
-          setImpersonatedUser(null);
-          await refresh(data.user.id);
-          showToast(`Email verified successfully! Welcome, ${data.user.name}.`);
-        } else {
-          showToast('Email verified successfully! You can now log in.');
-          setIsLoginOpen(true);
-          setLoginEmail(verifyEmail);
-        }
-      } else {
-        showToast(data.error || 'Invalid verification code.');
+        refresh();
       }
-    } catch {
-      showToast('Failed to verify code.');
+    } catch (e) {
+      console.error('Verify error:', e);
     }
   };
 
-  const handleResendEmailCode = async () => {
-    if (!verifyEmail) return;
-    try {
-      const res = await fetch('/api/auth/resend-email-code', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: verifyEmail })
-      });
-      const data = await res.json();
-      if (res.ok) {
-        if (data.mockCode) setMockEmailCodeDisplay(data.mockCode);
-        showToast('A new verification code has been dispatched.');
-      } else {
-        showToast(data.error || 'Failed to resend code.');
-      }
-    } catch {
-      showToast('Failed to resend verification code.');
-    }
-  };
-
-  const handleVerifySmsSubmit = async (e: React.FormEvent) => {
+  const handleForgotRequest = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!smsCodeInput.trim()) {
-      showToast('Please enter your 6-digit SMS code.');
-      return;
-    }
     try {
-      const res = await fetch('/api/auth/verify-sms', {
+      const res = await fetch('/api/auth/forgot-password', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mobile: verifyMobile, code: smsCodeInput.trim() })
+        body: JSON.stringify({ identifier: forgotQuery, email: forgotQuery })
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (res.ok) {
-        showToast('Mobile number verified successfully!');
-      } else {
-        showToast(data.error || 'Invalid SMS code.');
-      }
-    } catch {
-      showToast('Failed to verify SMS code.');
-    }
-  };
-
-  const handleResendSmsCode = async () => {
-    showToast('SMS verification code dispatched.');
-  };
-
-  const loadUserSession = useCallback(async () => {
-    if (typeof window !== 'undefined') {
-      installAuthFetch();
-    }
-    const token = getAuthToken();
-    if (!token) {
-      const loggedOut = typeof window !== 'undefined' && localStorage.getItem('workperhour_logged_out') === 'true';
-      if (!loggedOut) {
-        const demo = await requestDemoSession('u2');
-        if (demo?.token && demo?.user) {
-          setAuthToken(demo.token);
-          setCurrentUser(demo.user);
-          await refresh(demo.user.id);
-          return true;
+        if (data.mockCode || data.mockEmailCode) {
+          setMockForgotCodeDisplay(data.mockCode || data.mockEmailCode);
         }
+        setForgotStep('verify');
       }
-      setCurrentUser(null);
-      return false;
+    } catch (err) {
+      console.error('Forgot password request error:', err);
     }
+  };
+
+  const handleForgotVerify = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (forgotCode.trim().length === 6) {
+      setForgotStep('reset');
+    }
+  };
+
+  const handleForgotReset = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newPassword || newPassword !== confirmNewPassword) return;
     try {
-      const res = await fetch('/api/auth/me', {
-        headers: { 'Authorization': `Bearer ${token}`, 'x-device-id': getDeviceId() }
+      const res = await fetch('/api/auth/reset-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          identifier: forgotQuery,
+          email: forgotQuery,
+          code: forgotCode,
+          newPassword
+        })
       });
       if (res.ok) {
-        const u = await res.json();
-        setCurrentUser(u);
-        await refresh(u.id);
-        return true;
-      } else {
-        clearAuthToken();
-        const loggedOut = typeof window !== 'undefined' && localStorage.getItem('workperhour_logged_out') === 'true';
-        if (!loggedOut) {
-          const demo = await requestDemoSession('u2');
-          if (demo?.token && demo?.user) {
-            setAuthToken(demo.token);
-            setCurrentUser(demo.user);
-            await refresh(demo.user.id);
-            return true;
+        setIsForgotPasswordModalOpen(false);
+        setForgotStep('request');
+        setForgotCode('');
+        setNewPassword('');
+        setConfirmNewPassword('');
+        setIsLoginModalOpen(true);
+      }
+    } catch (err) {
+      console.error('Reset password error:', err);
+    }
+  };
+
+  const [isCreatingOrder, setIsCreatingOrder] = useState(false);
+  const isCreatingOrderRef = useRef(false);
+  const handleCreateOrder = useCallback(
+    async (orderTitle: string, priceUSD: number, sellerId: string, gigId?: string, extraIds?: string[]) => {
+      if (!activeUser) {
+        setIsLoginModalOpen(true);
+        return;
+      }
+      if (isCreatingOrderRef.current || isCreatingOrder) return;
+      isCreatingOrderRef.current = true;
+      setIsCreatingOrder(true);
+
+      const clientRequestId = 'req_' + Math.random().toString(36).substring(2, 11) + '_' + Date.now();
+      try {
+        let token = getAuthToken();
+        const isPrivileged = ['admin', 'super_admin', 'support'].includes(activeUser.role || '');
+        if (!token && !isPrivileged) {
+          const session = await requestDemoSession(activeUser.id);
+          if (session?.token) {
+            token = session.token;
+            setAuthToken(token);
           }
         }
-        setCurrentUser(null);
+        if (!token) {
+          setIsLoginModalOpen(true);
+          return;
+        }
+
+        const sendOrderRequest = (tok: string) =>
+          fetch('/api/orders', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-device-id': getDeviceId(),
+              'x-idempotency-key': clientRequestId,
+              Authorization: `Bearer ${tok}`
+            },
+            body: JSON.stringify({
+              title: orderTitle,
+              amount: priceUSD,
+              buyerId: activeUser.id,
+              sellerId,
+              gigId,
+              extraIds
+            })
+          });
+
+        let res = await sendOrderRequest(token);
+        if (res.status === 401 && !isPrivileged) {
+          const recovered = await requestDemoSession(activeUser.id);
+          if (recovered?.token) {
+            token = recovered.token;
+            setAuthToken(token);
+            res = await sendOrderRequest(token);
+          }
+        }
+        if (res.ok) {
+          const newOrder = await res.json();
+          setOrders(prev => [newOrder, ...prev.filter(o => o.id !== newOrder.id)]);
+          await refresh(activeUser.id);
+          setSelectedOrder(newOrder);
+          navigate(`/messages/${newOrder.id}`);
+        }
+      } catch (e) {
+        console.error('Order creation failed:', e);
+      } finally {
+        isCreatingOrderRef.current = false;
+        setIsCreatingOrder(false);
+      }
+    },
+    [activeUser, isCreatingOrder, navigate, refresh, setOrders]
+  );
+
+  const handleContactSeller = useCallback(
+    (_freelancerId: string, _freelancerName: string, _gigTitle: string) => {
+      if (!activeUser) {
+        setIsLoginModalOpen(true);
+        return;
+      }
+      navigate('/messages');
+    },
+    [activeUser, navigate]
+  );
+
+  // Parse path & route segments
+  const cleanPath = currentPath.split('?')[0].replace(/\/+$/, '') || '/';
+  const pathParts = cleanPath.split('/').filter(Boolean);
+
+  // Check modal trigger routes
+  useEffect(() => {
+    if (cleanPath === '/login') setIsLoginModalOpen(true);
+    if (cleanPath === '/signup') setIsSignupModalOpen(true);
+    if (cleanPath === '/switch-user') setIsUserSwitchModalOpen(true);
+    if (cleanPath === '/support') setIsSupportModalOpen(true);
+    if (cleanPath === '/wishlist') setIsWishlistModalOpen(true);
+    if (cleanPath === '/notifications') setIsEmailNotificationsModalOpen(true);
+    if (cleanPath === '/verify') setIsVerifyModalOpen(true);
+    if (cleanPath === '/forgot-password') setIsForgotPasswordModalOpen(true);
+  }, [cleanPath]);
+
+  // Route flags
+  const isGigsList = cleanPath === '/' || cleanPath === '/gigs' || cleanPath.startsWith('/categories');
+  const isProjectsList = ['/projects', '/search-projects', '/project-search', '/freelance-jobs'].includes(cleanPath);
+  const isFreelancersList = ['/freelancers', '/search-freelancers', '/freelancer-search'].includes(cleanPath);
+  const isCategoryRoute = cleanPath.startsWith('/categories');
+  const isProjectDetail = pathParts.length === 2 && (pathParts[0].toLowerCase() === 'projects' || pathParts[0].toLowerCase() === 'project');
+  const isGigDetail =
+    (pathParts.length >= 2 && (pathParts[0].toLowerCase() === 'gig' || pathParts[0].toLowerCase() === 'gigs')) ||
+    (pathParts.length === 2 && !RESERVED_ROUTES.includes(pathParts[0].toLowerCase()));
+
+  // Active Category detection
+  const currentCategory = useMemo(() => {
+    if (cleanPath.startsWith('/categories/')) {
+      const slug = cleanPath.replace('/categories/', '').toLowerCase();
+      for (const [name, s] of Object.entries(CATEGORY_SLUGS)) {
+        if (s.toLowerCase() === slug) return name;
+      }
+      return slug;
+    }
+    return 'All';
+  }, [cleanPath]);
+
+  // Filtered Gigs
+  const filteredGigs = useMemo(() => {
+    return gigs.filter(g => {
+      if (currentCategory && currentCategory !== 'All') {
+        const catSlug = CATEGORY_SLUGS[g.category] || slugify(g.category);
+        const targetSlug = CATEGORY_SLUGS[currentCategory] || slugify(currentCategory);
+        if (catSlug !== targetSlug && g.category.toLowerCase() !== currentCategory.toLowerCase()) {
+          return false;
+        }
+      }
+      if (searchQuery.trim()) {
+        const q = searchQuery.toLowerCase();
+        const matchTitle = g.title.toLowerCase().includes(q);
+        const matchDesc = g.description?.toLowerCase().includes(q);
+        const matchSeller = g.freelancerName?.toLowerCase().includes(q);
+        const matchTags = g.tags?.some(t => t.toLowerCase().includes(q));
+        if (!matchTitle && !matchDesc && !matchSeller && !matchTags) return false;
+      }
+      if (budgetFilter) {
+        if (budgetFilter === 'under25' && g.price >= 25) return false;
+        if (budgetFilter === '25to50' && (g.price < 25 || g.price > 50)) return false;
+        if (budgetFilter === '50to100' && (g.price < 50 || g.price > 100)) return false;
+        if (budgetFilter === 'over100' && g.price <= 100) return false;
+      }
+      if (deliveryTimeFilter) {
+        if (g.deliveryDays > deliveryTimeFilter) return false;
+      }
+      if (sellerLevelFilter && sellerLevelFilter !== 'All' && g.freelancerLevel && g.freelancerLevel !== sellerLevelFilter) {
         return false;
       }
-    } catch {
-      return false;
-    }
-  }, [refresh]);
+      return true;
+    });
+  }, [gigs, currentCategory, searchQuery, budgetFilter, deliveryTimeFilter, sellerLevelFilter]);
 
-  useEffect(() => {
-    loadUserSession();
-    refresh();
-  }, [loadUserSession, refresh]);
+  // Determine current active view
+  let mainContent: React.ReactNode = null;
 
-  useEffect(() => {
-    const handleNotify = (e: any) => {
-      if (e.detail) {
-        showToast(String(e.detail));
-      }
-    };
-    window.addEventListener('app:notify' as any, handleNotify);
-    return () => window.removeEventListener('app:notify' as any, handleNotify);
-  }, [showToast]);
+  if (cleanPath.startsWith('/admin')) {
+    mainContent = (
+      <AdminPage
+        currentUser={activeUser}
+        impersonatedUser={impersonatedUser}
+        updateCurrentUser={updateCurrentUser}
+        setImpersonatedUser={setImpersonatedUser}
+        usersList={users}
+        setUsersList={setUsers}
+        projects={projects}
+        gigs={gigs}
+        orders={orders}
+        proposals={proposals}
+        platformFee={platformFee}
+        clientServiceFee={clientServiceFee}
+        smallOrderFeeThreshold={smallOrderFeeThreshold}
+        smallOrderFeeAmount={smallOrderFeeAmount}
+        escrowProtectionDays={escrowProtectionDays}
+        navigate={navigate}
+        refresh={refresh}
+        getDeviceId={getDeviceId}
+      />
+    );
+  } else if (cleanPath === '/settings') {
+    mainContent = (
+      <SettingsPage
+        currentUser={activeUser}
+        updateCurrentUser={updateCurrentUser}
+        navigate={navigate}
+      />
+    );
+  } else if (cleanPath === '/edit-profile') {
+    mainContent = (
+      <EditProfilePage
+        currentUser={activeUser}
+        updateCurrentUser={updateCurrentUser}
+        navigate={navigate}
+      />
+    );
+  } else if (cleanPath === '/create-gig' || cleanPath === '/post-gig') {
+    mainContent = (
+      <div className="max-w-4xl mx-auto py-8 px-4">
+        <CreateGigView
+          newGigTitle={newGigTitle}
+          setNewGigTitle={setNewGigTitle}
+          newGigCat={newGigCat}
+          setNewGigCat={setNewGigCat}
+          newGigDesc={newGigDesc}
+          setNewGigDesc={setNewGigDesc}
+          newGigPrice={newGigPrice}
+          setNewGigPrice={setNewGigPrice}
+          newGigDays={newGigDays}
+          setNewGigDays={setNewGigDays}
+          newGigImage={newGigImage}
+          setNewGigImage={setNewGigImage}
+          isOptimizingGig={isOptimizingGig}
+          handleOptimizeGigWithAI={handleOptimizeGigWithAI}
+          newGigExtras={newGigExtras}
+          extraTitleInput={extraTitleInput}
+          setExtraTitleInput={setExtraTitleInput}
+          extraPriceInput={extraPriceInput}
+          setExtraPriceInput={setExtraPriceInput}
+          handleAddGigExtra={handleAddGigExtra}
+          handleRemoveGigExtra={handleRemoveGigExtra}
+          handlePublishGig={handlePublishGig}
+        />
+      </div>
+    );
+  } else if (cleanPath === '/buyer-activity') {
+    mainContent = (
+      <BuyerActivityView
+        projects={projects}
+        orders={orders}
+        offers={offers}
+        gigs={gigs}
+        users={users}
+        proposals={proposals}
+        currentUser={activeUser}
+        navigate={navigate}
+        onOpenWorkstream={(ord) => {
+          setSelectedOrder(ord);
+          navigate(`/messages/${ord.id}`);
+        }}
+      />
+    );
+  } else if (cleanPath === '/freelance-activity' || cleanPath === '/freelancer') {
+    mainContent = (
+      <FreelancerActivityView
+        currentUser={activeUser}
+        orders={orders}
+        allGigs={gigs}
+        categories={categories}
+        projects={projects}
+        proposals={proposals}
+        users={users}
+        navigate={navigate}
+        onRefresh={refresh}
+      />
+    );
+  } else if (
+    cleanPath === '/orders' ||
+    cleanPath === '/messages' ||
+    cleanPath === '/workstream' ||
+    cleanPath === '/workspace' ||
+    cleanPath.startsWith('/messages/') ||
+    cleanPath.startsWith('/orders/')
+  ) {
+    const routeOrderId = pathParts.length >= 2 ? pathParts[1] : null;
+    const activeWorkstreamOrder = routeOrderId
+      ? orders.find(o => o.id === routeOrderId) || selectedOrder
+      : selectedOrder;
 
-  useEffect(() => {
-    const onPopState = () => {
-      setPath(window.location.pathname);
-    };
-    window.addEventListener('popstate', onPopState);
-    return () => window.removeEventListener('popstate', onPopState);
-  }, []);
+    if (activeWorkstreamOrder) {
+      const workstreamPartner = users.find(
+        u => u.id === (activeUser?.id === activeWorkstreamOrder.buyerId ? activeWorkstreamOrder.sellerId : activeWorkstreamOrder.buyerId)
+      );
+      mainContent = (
+        <WorkstreamWorkspace
+          order={activeWorkstreamOrder as any}
+          messages={workstream.messages}
+          files={workstream.activeSharedFiles}
+          currentUser={activeUser}
+          usersList={users}
+          partner={workstreamPartner}
+          onBack={() => {
+            setSelectedOrder(null);
+            navigate('/messages');
+          }}
+          onSendMessage={workstream.sendMessage}
+          onAttachFile={(file) => workstream.sendMessage(`Attached file: ${file.name}`, 'file', file)}
+          sendEvent={workstream.sendEvent}
+          onReleaseEscrow={workstream.handleReleaseEscrow}
+          onDeliverWork={workstream.handleDeliverWork}
+          onRequestRevision={workstream.handleRequestRevision}
+          isReviewModalOpen={workstream.isReviewModalOpen}
+          setIsReviewModalOpen={workstream.setIsReviewModalOpen}
+          handleSubmitReview={workstream.handleSubmitReview}
+        />
+      );
+    } else {
+      mainContent = (
+        <div className="max-w-7xl mx-auto py-8 px-4">
+          <WorkstreamList
+            workstreams={workstream.hydratedWorkstreamItems}
+            selectedOrderId={selectedOrder?.id}
+            onSelectOrder={(id: string) => {
+              const matched = orders.find(o => o.id === id);
+              setSelectedOrder(matched || null);
+              navigate(`/messages/${id}`);
+            }}
+            starredIds={starredOrderIds}
+            onToggleStar={toggleStarOrder}
+            searchQuery={workstreamSearch}
+            onSearchChange={setWorkstreamSearch}
+            onStartNewWorkstream={() => navigate('/gigs')}
+          />
+        </div>
+      );
+    }
+  } else if (isProjectsList) {
+    mainContent = (
+      <ProjectSearchView
+        projects={projects}
+        navigate={navigate}
+        currentUser={activeUser}
+        query={typeof window !== 'undefined' ? window.location.search : ''}
+      />
+    );
+  } else if (isFreelancersList) {
+    mainContent = (
+      <FreelancerSearchView
+        usersList={users}
+        gigs={gigs}
+        navigate={navigate}
+        currentUser={activeUser}
+        setIsSignupModalOpen={setIsSignupModalOpen}
+        slugify={slugify}
+        query={typeof window !== 'undefined' ? window.location.search : ''}
+      />
+    );
+  } else if (isProjectDetail) {
+    const projId = pathParts[1];
+    const project = projects.find(
+      p => p.id === projId || (p.slug && p.slug.toLowerCase() === projId.toLowerCase())
+    );
+    if (project) {
+      mainContent = (
+        <ProjectDetailView
+          project={project}
+          currentUser={activeUser as any}
+          navigate={navigate}
+          allProjects={projects}
+          proposals={proposals}
+          orders={orders}
+          onRefresh={refresh}
+        />
+      );
+    }
+  } else if (isGigDetail) {
+    let gig: Gig | undefined;
+    if (pathParts[0].toLowerCase() === 'gig' || pathParts[0].toLowerCase() === 'gigs') {
+      const gigId = pathParts[1];
+      gig = gigs.find(g => g.id === gigId || (g.slug && g.slug.toLowerCase() === gigId.toLowerCase()));
+    } else if (pathParts.length === 2) {
+      const [, gigSlug] = pathParts;
+      gig = gigs.find(
+        g =>
+          (g.slug && g.slug.toLowerCase() === gigSlug.toLowerCase()) ||
+          g.id === gigSlug ||
+          slugify(g.title) === gigSlug.toLowerCase()
+      );
+    }
+    if (gig) {
+      mainContent = (
+        <GigDetailView
+          currentGig={gig}
+          gigs={gigs}
+          reviews={reviews}
+          orders={orders}
+          currentUser={activeUser}
+          navigate={navigate}
+          handleContactSeller={handleContactSeller}
+          handleCreateOrder={handleCreateOrder}
+          slugify={slugify}
+        />
+      );
+    }
+  } else if (cleanPath === '/payments' || cleanPath.startsWith('/payments')) {
+    mainContent = (
+      <div className="max-w-7xl mx-auto py-8 px-4">
+        <PaymentsModule
+          currentUser={activeUser}
+          orders={orders}
+          offers={offers}
+          gigs={gigs}
+          projects={projects}
+          proposals={proposals}
+          users={users}
+          platformFee={platformFee}
+          clientServiceFee={clientServiceFee}
+          smallOrderFeeThreshold={smallOrderFeeThreshold}
+          smallOrderFeeAmount={smallOrderFeeAmount}
+          escrowProtectionDays={escrowProtectionDays}
+          navigate={navigate}
+          onOpenWorkstream={(ord) => {
+            setSelectedOrder(ord);
+            navigate(`/messages/${ord.id}`);
+          }}
+          onBalanceUpdate={refresh}
+        />
+      </div>
+    );
+  } else if (pathParts.length === 1 && !RESERVED_ROUTES.includes(pathParts[0].toLowerCase())) {
+    const usernameParam = pathParts[0].toLowerCase();
+    const matchedUser = users.find(
+      u =>
+        (u.username && u.username.toLowerCase() === usernameParam) ||
+        slugify(u.name) === usernameParam ||
+        u.id === usernameParam
+    );
+    if (matchedUser) {
+      mainContent = (
+        <FreelancerProfileView
+          profileUser={matchedUser}
+          currentUser={activeUser}
+          gigs={gigs}
+          reviews={reviews}
+          onNavigate={navigate}
+        />
+      );
+    }
+  }
 
-  const navigate = useCallback((to: string, e?: React.MouseEvent) => {
-    if (e) e.preventDefault();
-    if (to === '/login') {
-      setIsLoginOpen(true);
-      return;
-    }
-    if (to === '/signup') {
-      setIsSignupOpen(true);
-      return;
-    }
-    if (to === '/switch-user') {
-      setIsSwitchUserOpen(true);
-      return;
-    }
-    if (to === '/support') {
-      setIsSupportOpen(true);
-      return;
-    }
-    if (to === '/wishlist') {
-      setIsWishlistOpen(true);
-      return;
-    }
-    if (to === '/post-project' || to === '/create-project') {
-      if (typeof window !== 'undefined') {
-        window.history.pushState({}, '', '/buyer-activity');
-      }
-      setPath('/buyer-activity');
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-      return;
-    }
-    if (typeof window !== 'undefined') {
-      window.history.pushState({}, '', to);
-    }
-    const isTargetWorkstreamSubroute = /^\/(?:workstream|workstreams|messages|orders)\/[^/?#]+/.test(to);
-    if (!isTargetWorkstreamSubroute) {
-      setSelectedOrder(null);
-    }
-    setPath(to);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  }, []);
+  // Fallback to Marketplace Gigs View if not matched
+  if (!mainContent) {
+    mainContent = (
+      <MarketplaceGigsView
+        filteredGigs={filteredGigs}
+        projects={projects}
+        currentCategory={currentCategory}
+        searchQuery={searchQuery}
+        setSearchQuery={setSearchQuery}
+        activeDropdown={activeDropdown}
+        setActiveDropdown={setActiveDropdown}
+        serviceOptionFilter={serviceOptionFilter}
+        setServiceOptionFilter={setServiceOptionFilter}
+        sellerLevelFilter={sellerLevelFilter}
+        setSellerLevelFilter={setSellerLevelFilter}
+        budgetFilter={budgetFilter}
+        setBudgetFilter={setBudgetFilter}
+        deliveryTimeFilter={deliveryTimeFilter}
+        setDeliveryTimeFilter={setDeliveryTimeFilter}
+        onlineNowOnly={onlineNowOnly}
+        setOnlineNowOnly={setOnlineNowOnly}
+        gigViewMode={gigViewMode}
+        setGigViewMode={setGigViewMode}
+        likedGigIds={likedGigIds}
+        handleToggleLike={handleToggleLike}
+        navigate={navigate}
+        getGigUrl={getGigUrl}
+        currentUser={activeUser}
+        setIsSignupModalOpen={setIsSignupModalOpen}
+        slugify={slugify}
+        CATEGORY_SLUGS={CATEGORY_SLUGS}
+      />
+    );
+  }
 
-  const handleToggleLike = (gigId: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    setLikedGigIds(prev => prev.includes(gigId) ? prev.filter(id => id !== gigId) : [...prev, gigId]);
+  const handleStopImpersonation = () => {
+    setImpersonatedUser(null);
   };
-
-  const effectiveUser = impersonatedUser || currentUser;
-
-  const workstream = useWorkstream({
-    currentUser,
-    impersonatedUser,
-    orders,
-    setOrders,
-    usersList: users,
-    gigs,
-    projects,
-    messages,
-    setMessages,
-    setReviews,
-    selectedOrder,
-    setSelectedOrder,
-    workstreamTab,
-    starredWorkstreams,
-    selectedPersonFilter,
-    projectFilterSearch,
-    workstreamSearch,
-    setIsStartWorkstreamModalOpen,
-    navigate,
-    refresh
-  });
-
-  // Synchronize URL routes (/workstream/:id, /workstreams/:id, /messages/:id, /orders/:id) with selectedOrder
-  useEffect(() => {
-    const match = path.match(/^\/(?:workstream|workstreams|messages|orders)\/([^/?#]+)/);
-    if (!match) return;
-    const targetOrderId = decodeURIComponent(match[1]);
-    if (!targetOrderId) return;
-
-    if (selectedOrder?.id === targetOrderId) {
-      return;
-    }
-
-    const existing = orders.find(o => o.id === targetOrderId);
-    if (existing) {
-      setSelectedOrder(existing);
-      workstream.fetchMessages(targetOrderId);
-      return;
-    }
-
-    const token = getAuthToken();
-    if (!token) return;
-    fetch(`/api/orders/${encodeURIComponent(targetOrderId)}`, {
-      headers: { 'Authorization': `Bearer ${token}`, 'x-device-id': getDeviceId() }
-    })
-      .then(res => (res.ok ? res.json() : null))
-      .then(data => {
-        if (data && data.id) {
-          setSelectedOrder(data);
-          if (Array.isArray(data.messages)) {
-            setMessages(prev => {
-              const other = prev.filter(m => m.orderId !== data.id);
-              return [...other, ...data.messages];
-            });
-          } else {
-            workstream.fetchMessages(data.id);
-          }
-        }
-      })
-      .catch(() => {});
-  }, [path, orders, selectedOrder?.id, setMessages, workstream]);
-
-  const isWorkstreamRoute =
-    path === '/workstreams' ||
-    path.startsWith('/workstreams/') ||
-    path.startsWith('/workstream/') ||
-    path === '/messages' ||
-    path.startsWith('/messages/') ||
-    path === '/orders' ||
-    path.startsWith('/orders/');
-
-  const canViewGig = (g: any) => {
-    if (!g) return false;
-    if (g.status === 'active' || g.status === 'paused') return true;
-    if (!effectiveUser) return false;
-    return g.freelancerId === effectiveUser.id || effectiveUser.role === 'admin' || effectiveUser.role === 'super_admin';
-  };
-
-  const filteredGigs = gigs.filter(g => {
-    if (g.status === 'moderation' || g.status === 'deleted') return false;
-    if (currentCategory !== 'All' && g.category !== currentCategory) return false;
-    if (searchQuery.trim() && !g.title.toLowerCase().includes(searchQuery.toLowerCase()) && !g.description.toLowerCase().includes(searchQuery.toLowerCase())) {
-      return false;
-    }
-    return true;
-  });
-
-  const selectedPersonObj = selectedPersonFilter
-    ? users.find(u => u.id === selectedPersonFilter)
-    : null;
-
-  const activeWorkstreamOrder = workstream.selectedOrder || selectedOrder;
-  const activeOrderMessages = activeWorkstreamOrder
-    ? messages.filter(m => m.orderId === activeWorkstreamOrder.id)
-    : [];
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col font-sans">
-      {/* Toast Notification */}
-      {toastMessage && (
-        <div className="fixed top-6 right-6 z-50 bg-slate-900 text-white px-6 py-3 rounded-2xl shadow-2xl flex items-center gap-3 border border-slate-800 animate-bounce">
-          <ShieldCheck className="w-5 h-5 text-emerald-400" />
-          <span className="text-sm font-medium">{toastMessage}</span>
-        </div>
-      )}
-
-      {/* Header */}
-      <Header 
-        navigate={navigate}
-        currentUser={effectiveUser}
-        orders={orders}
-        likedGigIds={likedGigIds}
-        isGigsList={path === '/' || path === '/gigs'}
-        isGigDetail={path.startsWith('/gig/')}
-        isProjectsList={path === '/projects'}
-        isProjectDetail={path.startsWith('/project/')}
-        isCategoryRoute={false}
-        loadUserSession={loadUserSession}
-        updateCurrentUser={setCurrentUser}
-        setImpersonatedUser={setImpersonatedUser}
-        setSelectedOrder={setSelectedOrder}
-        setPath={setPath}
-        fetchMessages={workstream.fetchMessages}
-        onOpenLogin={() => setIsLoginOpen(true)}
-        onOpenSignup={() => setIsSignupOpen(true)}
-        onOpenSwitchUser={() => setIsSwitchUserOpen(true)}
+    <div className="min-h-screen bg-slate-50 flex flex-col font-sans text-slate-800 antialiased selection:bg-emerald-500 selection:text-white">
+      {/* Impersonation Banner for Super Admin */}
+      <ImpersonationBanner
+        impersonatedUser={impersonatedUser}
+        onStop={handleStopImpersonation}
       />
 
-      {/* Main Content Router */}
-      <main className="flex-1 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full">
-        {path.startsWith('/admin') ? (
-          <AdminPage 
-            currentUser={effectiveUser}
-            impersonatedUser={impersonatedUser}
-            updateCurrentUser={setCurrentUser}
-            setImpersonatedUser={setImpersonatedUser}
-            usersList={users}
-            setUsersList={() => {}}
-            projects={projects}
-            gigs={gigs}
-            orders={orders}
-            proposals={proposals}
-            navigate={navigate}
-            refresh={async () => { await refresh(); }}
-          />
-        ) : isWorkstreamRoute ? (
-          activeWorkstreamOrder ? (
-            <WorkstreamWorkspace 
-              order={activeWorkstreamOrder}
-              currentUser={effectiveUser}
-              messages={activeOrderMessages}
-              files={workstream.activeSharedFiles}
-              onBack={() => {
-                setSelectedOrder(null);
-                navigate('/messages');
-              }}
-              onSendMessage={(text: string) => {
-                workstream.sendMessage(text, 'text', undefined, activeWorkstreamOrder.id);
-              }}
-              onRetryMessage={(msg) => {
-                workstream.retryMessage(msg as any);
-              }}
-              onAttachFile={(file) => {
-                workstream.sendMessage(`Shared file: ${file.name}`, 'file', file, activeWorkstreamOrder.id);
-              }}
-              sendEvent={workstream.sendEvent}
-              onDeliverWork={workstream.handleDeliverWork}
-              onReleaseEscrow={workstream.handleReleaseEscrow}
-              onRequestRevision={workstream.handleRequestRevision}
-              isReviewModalOpen={workstream.isReviewModalOpen}
-              setIsReviewModalOpen={workstream.setIsReviewModalOpen}
-              handleSubmitReview={workstream.handleSubmitReview}
-              reviewError={workstream.reviewError}
-              isSubmittingReview={workstream.isSubmittingReview}
-              escrowError={workstream.escrowError}
-              onOrderChanged={(updated: any, followOnOrder?: any) => {
-                if (followOnOrder && followOnOrder.id) {
-                  setOrders(prev => [followOnOrder, ...prev.filter(o => o.id !== followOnOrder.id)]);
-                  setSelectedOrder(followOnOrder);
-                  workstream.fetchMessages(followOnOrder.id);
-                  navigate(`/messages/${followOnOrder.id}`);
-                } else if (updated && updated.id) {
-                  setSelectedOrder((prev: any) => (prev && prev.id === updated.id ? { ...prev, ...updated } : updated));
-                  setOrders(prev => prev.map(o => (o.id === updated.id ? { ...o, ...updated } : o)));
-                }
-                refresh();
-              }}
-              usersList={users}
-            />
-          ) : (
-            <div className="space-y-6">
-              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-                <div>
-                  <h1 className="text-2xl font-extrabold text-slate-900 tracking-tight">Workstreams & Collaboration</h1>
-                  <p className="text-xs text-slate-500 mt-1">
-                    Manage active escrow orders, real-time messaging, deliverables, invoices, and project milestones.
-                  </p>
-                </div>
-                <button
-                  onClick={() => setIsStartWorkstreamModalOpen(true)}
-                  className="inline-flex items-center gap-2 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl shadow-xs transition cursor-pointer self-start sm:self-auto"
-                >
-                  <PlusCircle className="w-4 h-4" />
-                  <span>Start New Workstream</span>
-                </button>
-              </div>
+      {/* Main Global Header */}
+      <Header
+        navigate={navigate}
+        currentUser={activeUser}
+        orders={orders}
+        likedGigIds={likedGigIds}
+        isGigsList={isGigsList}
+        isGigDetail={isGigDetail}
+        isProjectsList={isProjectsList}
+        isProjectDetail={isProjectDetail}
+        isCategoryRoute={isCategoryRoute}
+        loadUserSession={loadUserSession}
+        updateCurrentUser={updateCurrentUser}
+        setImpersonatedUser={setImpersonatedUser}
+        setSelectedOrder={setSelectedOrder}
+        setPath={setCurrentPath}
+        fetchMessages={workstream.fetchMessages}
+        onOpenLogin={() => setIsLoginModalOpen(true)}
+        onOpenSignup={() => setIsSignupModalOpen(true)}
+        onOpenSwitchUser={() => setIsUserSwitchModalOpen(true)}
+      />
 
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-                <div className="lg:col-span-4 xl:col-span-3">
-                  <WorkstreamSidebar
-                    currentTab={workstreamTab}
-                    onTabChange={setWorkstreamTab}
-                    orders={workstream.hydratedWorkstreamItems}
-                    starredCount={starredWorkstreams.length}
-                    projects={projects}
-                    usersList={users}
-                    currentUser={effectiveUser}
-                    selectedPersonFilter={selectedPersonFilter}
-                    onSelectPersonFilter={setSelectedPersonFilter}
-                    peopleSearch={peopleSearch}
-                    onPeopleSearchChange={setPeopleSearch}
-                    projectSearch={projectFilterSearch}
-                    onProjectSelect={(title) => setProjectFilterSearch(prev => (prev === title ? '' : title))}
-                  />
-                </div>
-                <div className="lg:col-span-8 xl:col-span-9">
-                  <WorkstreamList
-                    workstreams={workstream.filteredWorkstreamItems}
-                    selectedOrderId={(activeWorkstreamOrder as any)?.id}
-                    onSelectOrder={(orderId: string) => {
-                      const found = workstream.hydratedWorkstreamItems.find(o => o.id === orderId) || orders.find(o => o.id === orderId);
-                      if (found) {
-                        setSelectedOrder(found);
-                      }
-                      workstream.fetchMessages(orderId);
-                      navigate(`/messages/${orderId}`);
-                    }}
-                    starredIds={starredWorkstreams}
-                    onToggleStar={(orderId: string) => {
-                      setStarredWorkstreams(prev =>
-                        prev.includes(orderId) ? prev.filter(id => id !== orderId) : [...prev, orderId]
-                      );
-                    }}
-                    searchQuery={workstreamSearch}
-                    onSearchChange={setWorkstreamSearch}
-                    onStartNewWorkstream={() => setIsStartWorkstreamModalOpen(true)}
-                    activeTab={workstreamTab}
-                    selectedPersonName={selectedPersonObj?.name || null}
-                    selectedProjectTitle={projectFilterSearch || null}
-                    onClearTab={() => setWorkstreamTab('all')}
-                    onClearPersonFilter={() => setSelectedPersonFilter(null)}
-                    onClearProjectFilter={() => setProjectFilterSearch('')}
-                    onClearAllFilters={() => {
-                      setWorkstreamTab('all');
-                      setSelectedPersonFilter(null);
-                      setProjectFilterSearch('');
-                      setWorkstreamSearch('');
-                    }}
-                  />
-                </div>
-              </div>
-
-              <StartWorkstreamModal
-                isOpen={isStartWorkstreamModalOpen}
-                onClose={() => setIsStartWorkstreamModalOpen(false)}
-                onSubmit={workstream.handleStartWorkstreamModalSubmit}
-                usersList={users}
-                currentUser={effectiveUser}
-              />
-            </div>
-          )
-        ) : path === '/wallet' || path.startsWith('/wallet') || path.startsWith('/wallets') ? (
-          <UserWalletsLedgerModule currentUser={effectiveUser} />
-        ) : path.startsWith('/payments') ? (
-          <PaymentsModule currentUser={effectiveUser} />
-        ) : path.startsWith('/settings') ? (
-          <SettingsPage 
-            currentUser={effectiveUser}
-            updateCurrentUser={setCurrentUser}
-            navigate={navigate}
-          />
-        ) : path === '/projects' || path.startsWith('/projects?') ? (
-          <ProjectSearchView 
-            projects={projects} 
-            navigate={navigate} 
-            currentUser={effectiveUser} 
-            query={path.includes('?') ? path.substring(path.indexOf('?')) : ''} 
-          />
-        ) : path.startsWith('/projects/') || path.startsWith('/project/') ? (
-          (() => {
-            const projId = path.split('/')[2];
-            const targetProject = projects.find(p => p.id === projId || p.slug === projId || slugify(p.title) === projId);
-            if (targetProject) {
-              return (
-                <ProjectDetailView 
-                  project={targetProject}
-                  currentUser={effectiveUser}
-                  navigate={navigate}
-                  allProjects={projects}
-                  proposals={proposals}
-                  orders={orders}
-                  onRefresh={refresh}
-                />
-              );
-            }
-            return <ProjectSearchView projects={projects} navigate={navigate} currentUser={effectiveUser} />;
-          })()
-        ) : path === '/freelancers' || path.startsWith('/freelancers?') ? (
-          <FreelancerSearchView 
-            usersList={users} 
-            gigs={gigs} 
-            navigate={navigate} 
-            currentUser={effectiveUser} 
-            setIsSignupModalOpen={setIsSignupOpen} 
-            slugify={slugify} 
-            query={path.includes('?') ? path.substring(path.indexOf('?')) : ''} 
-          />
-        ) : path === '/freelance-activity' ? (
-          <FreelancerActivityView
-            currentUser={effectiveUser}
-            orders={orders}
-            allGigs={gigs}
-            categories={appData.categories}
-            projects={projects}
-            proposals={proposals}
-            users={users}
-            navigate={navigate}
-            onOpenWorkstream={(order) => {
-              setSelectedOrder(order);
-              workstream.fetchMessages(order.id);
-              navigate(`/messages/${order.id}`);
-            }}
-            onRefresh={refresh}
-          />
-        ) : path === '/buyer-activity' || path === '/activity' ? (
-          <BuyerActivityView 
-            projects={projects} 
-            orders={orders} 
-            offers={[]} 
-            currentUser={effectiveUser} 
-            navigate={navigate} 
-          />
-        ) : path === '/create-gig' ? (
-          <CreateGigView 
-            newGigTitle="" 
-            setNewGigTitle={() => {}} 
-            newGigCat="technology-programming" 
-            setNewGigCat={() => {}} 
-            newGigDesc="" 
-            setNewGigDesc={() => {}} 
-            newGigPrice={50} 
-            setNewGigPrice={() => {}} 
-            newGigDays={3} 
-            setNewGigDays={() => {}} 
-            isOptimizingGig={false} 
-            handleOptimizeGigWithAI={() => {}} 
-            newGigExtras={[]} 
-            extraTitleInput="" 
-            setExtraTitleInput={() => {}} 
-            extraPriceInput={10} 
-            setExtraPriceInput={() => {}} 
-            handleAddGigExtra={() => {}} 
-            handleRemoveGigExtra={() => {}} 
-            handlePublishGig={(e) => { e.preventDefault(); navigate('/gigs'); }} 
-          />
-        ) : path === '/edit-profile' ? (
-          <EditProfilePage 
-            currentUser={effectiveUser} 
-            updateCurrentUser={setCurrentUser} 
-            navigate={navigate} 
-          />
-        ) : path.startsWith('/profile/') ? (
-          (() => {
-            const uname = path.split('/')[2];
-            const targetUser = users.find(u => u.username === uname || slugify(u.name) === uname || u.id === uname);
-            if (targetUser) {
-              return <FreelancerProfileView profileUser={targetUser} currentUser={effectiveUser} gigs={gigs} reviews={appData.reviews} onNavigate={navigate} />;
-            }
-            return (
-              <MarketplaceGigsView 
-                filteredGigs={filteredGigs}
-                projects={projects}
-                currentCategory={currentCategory}
-                searchQuery={searchQuery}
-                setSearchQuery={setSearchQuery}
-                activeDropdown={activeDropdown}
-                setActiveDropdown={setActiveDropdown}
-                serviceOptionFilter={serviceOptionFilter}
-                setServiceOptionFilter={setServiceOptionFilter}
-                sellerLevelFilter={sellerLevelFilter}
-                setSellerLevelFilter={setSellerLevelFilter}
-                budgetFilter={budgetFilter}
-                setBudgetFilter={setBudgetFilter}
-                deliveryTimeFilter={deliveryTimeFilter}
-                setDeliveryTimeFilter={setDeliveryTimeFilter}
-                onlineNowOnly={onlineNowOnly}
-                setOnlineNowOnly={setOnlineNowOnly}
-                gigViewMode={gigViewMode}
-                setGigViewMode={setGigViewMode}
-                likedGigIds={likedGigIds}
-                handleToggleLike={handleToggleLike}
-                navigate={navigate}
-                getGigUrl={getGigUrl}
-                currentUser={effectiveUser}
-                setIsSignupModalOpen={setIsSignupOpen}
-                slugify={slugify}
-                CATEGORY_SLUGS={Object.fromEntries(PPH_CATEGORIES.map(c => [c.name, c.slug]))}
-              />
-            );
-          })()
-        ) : path.startsWith('/gig/') || path.startsWith('/gigs/') ? (
-          (() => {
-            const parts = path.split('/').filter(Boolean);
-            const identifier = parts[1];
-            const subIdentifier = parts[2];
-            const targetGig = gigs.find(g => 
-              g.id === identifier || 
-              g.slug === identifier || 
-              slugify(g.title) === identifier ||
-              (subIdentifier && (g.slug === subIdentifier || slugify(g.title) === subIdentifier || g.id === subIdentifier))
-            );
-            if (targetGig && canViewGig(targetGig)) {
-              return (
-                <GigDetailView 
-                  currentGig={targetGig} 
-                  gigs={gigs} 
-                  reviews={appData.reviews} 
-                  orders={orders} 
-                  currentUser={effectiveUser} 
-                  navigate={navigate} 
-                  handleContactSeller={() => navigate('/messages')} 
-                  handleCreateOrder={() => navigate('/messages')} 
-                  slugify={slugify} 
-                />
-              );
-            }
-            return (
-              <MarketplaceGigsView 
-                filteredGigs={filteredGigs}
-                projects={projects}
-                currentCategory={currentCategory}
-                searchQuery={searchQuery}
-                setSearchQuery={setSearchQuery}
-                activeDropdown={activeDropdown}
-                setActiveDropdown={setActiveDropdown}
-                serviceOptionFilter={serviceOptionFilter}
-                setServiceOptionFilter={setServiceOptionFilter}
-                sellerLevelFilter={sellerLevelFilter}
-                setSellerLevelFilter={setSellerLevelFilter}
-                budgetFilter={budgetFilter}
-                setBudgetFilter={setBudgetFilter}
-                deliveryTimeFilter={deliveryTimeFilter}
-                setDeliveryTimeFilter={setDeliveryTimeFilter}
-                onlineNowOnly={onlineNowOnly}
-                setOnlineNowOnly={setOnlineNowOnly}
-                gigViewMode={gigViewMode}
-                setGigViewMode={setGigViewMode}
-                likedGigIds={likedGigIds}
-                handleToggleLike={handleToggleLike}
-                navigate={navigate}
-                getGigUrl={getGigUrl}
-                currentUser={effectiveUser}
-                setIsSignupModalOpen={setIsSignupOpen}
-                slugify={slugify}
-                CATEGORY_SLUGS={Object.fromEntries(PPH_CATEGORIES.map(c => [c.name, c.slug]))}
-              />
-            );
-          })()
-        ) : (() => {
-          // Dynamic path resolution for /:username/:gigSlug, /:username, /categories/:slug
-          const cleanPath = path.split('?')[0].split('#')[0];
-          const parts = cleanPath.split('/').filter(Boolean);
-
-          if (parts.length === 2 && parts[0] === 'categories') {
-            const catSlug = parts[1];
-            const matchedParent = PPH_CATEGORIES.find(c => c.slug === catSlug);
-            const matchedSub = !matchedParent ? PPH_CATEGORIES.flatMap(c => c.subcategories).find(s => s.slug === catSlug) : undefined;
-            const matchedCategory = matchedParent || matchedSub;
-            const categoryName = matchedCategory ? matchedCategory.name : 'All';
-            const categoryFilteredGigs = gigs.filter(g => {
-              if (matchedParent) {
-                if (g.category !== matchedParent.name && slugify(g.category) !== matchedParent.slug) return false;
-              } else if (matchedSub) {
-                if (g.subcategory?.toLowerCase() !== matchedSub.name.toLowerCase() && slugify(g.subcategory || '') !== matchedSub.slug) return false;
-              }
-              if (searchQuery.trim() && !g.title.toLowerCase().includes(searchQuery.toLowerCase())) return false;
-              return true;
-            });
-
-            return (
-              <div>
-                {!matchedCategory && (
-                  <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-800 text-xs font-semibold">
-                    Category "{catSlug}" not found. Showing all marketplace offers.
-                  </div>
-                )}
-                <MarketplaceGigsView 
-                  filteredGigs={categoryFilteredGigs}
-                  projects={projects}
-                  currentCategory={categoryName}
-                  searchQuery={searchQuery}
-                  setSearchQuery={setSearchQuery}
-                  activeDropdown={activeDropdown}
-                  setActiveDropdown={setActiveDropdown}
-                  serviceOptionFilter={serviceOptionFilter}
-                  setServiceOptionFilter={setServiceOptionFilter}
-                  sellerLevelFilter={sellerLevelFilter}
-                  setSellerLevelFilter={setSellerLevelFilter}
-                  budgetFilter={budgetFilter}
-                  setBudgetFilter={setBudgetFilter}
-                  deliveryTimeFilter={deliveryTimeFilter}
-                  setDeliveryTimeFilter={setDeliveryTimeFilter}
-                  onlineNowOnly={onlineNowOnly}
-                  setOnlineNowOnly={setOnlineNowOnly}
-                  gigViewMode={gigViewMode}
-                  setGigViewMode={setGigViewMode}
-                  likedGigIds={likedGigIds}
-                  handleToggleLike={handleToggleLike}
-                  navigate={navigate}
-                  getGigUrl={getGigUrl}
-                  currentUser={effectiveUser}
-                  setIsSignupModalOpen={setIsSignupOpen}
-                  slugify={slugify}
-                  CATEGORY_SLUGS={Object.fromEntries(PPH_CATEGORIES.map(c => [c.name, c.slug]))}
-                />
-              </div>
-            );
-          }
-
-          if (parts.length >= 1 && (parts[0] === 'gig' || parts[0] === 'gigs')) {
-            const identifier = parts[1];
-            const subIdentifier = parts[2];
-            const targetGig = gigs.find(g => 
-              g.id === identifier || 
-              g.slug === identifier || 
-              slugify(g.title) === identifier ||
-              (subIdentifier && (g.slug === subIdentifier || slugify(g.title) === subIdentifier || g.id === subIdentifier))
-            );
-            if (targetGig && canViewGig(targetGig)) {
-              return (
-                <GigDetailView 
-                  currentGig={targetGig} 
-                  gigs={gigs} 
-                  reviews={appData.reviews} 
-                  orders={orders} 
-                  currentUser={effectiveUser} 
-                  navigate={navigate} 
-                  handleContactSeller={() => navigate('/messages')} 
-                  handleCreateOrder={() => navigate('/messages')} 
-                  slugify={slugify} 
-                />
-              );
-            }
-          }
-
-          if (parts.length === 1) {
-            const idOrUsername = parts[0];
-            const directGig = gigs.find(g => g.id === idOrUsername || g.slug === idOrUsername || slugify(g.title) === idOrUsername);
-            if (directGig && canViewGig(directGig)) {
-              return (
-                <GigDetailView 
-                  currentGig={directGig} 
-                  gigs={gigs} 
-                  reviews={appData.reviews} 
-                  orders={orders} 
-                  currentUser={effectiveUser} 
-                  navigate={navigate} 
-                  handleContactSeller={() => navigate('/messages')} 
-                  handleCreateOrder={() => navigate('/messages')} 
-                  slugify={slugify} 
-                />
-              );
-            }
-            const targetUser = users.find(u => u.username?.toLowerCase() === idOrUsername.toLowerCase() || slugify(u.name).toLowerCase() === idOrUsername.toLowerCase() || u.id === idOrUsername);
-            if (targetUser) {
-              return <FreelancerProfileView profileUser={targetUser} currentUser={effectiveUser} gigs={gigs} reviews={appData.reviews} onNavigate={navigate} />;
-            }
-          }
-
-          if (parts.length === 2) {
-            const [seg1, seg2] = parts;
-            if (seg1 !== 'categories') {
-              const targetGig = gigs.find(g => {
-                const gigUser = (g.freelancerUsername || slugify(g.freelancerName || '')).toLowerCase();
-                const gSlug = (g.slug || slugify(g.title)).toLowerCase();
-                return (
-                  (gigUser === seg1.toLowerCase() || g.freelancerId === seg1) && 
-                  (gSlug === seg2.toLowerCase() || g.id === seg2)
-                ) || gSlug === seg2.toLowerCase() || g.id === seg2;
-              });
-              if (targetGig && canViewGig(targetGig)) {
-                return (
-                  <GigDetailView 
-                    currentGig={targetGig} 
-                    gigs={gigs} 
-                    reviews={appData.reviews} 
-                    orders={orders} 
-                    currentUser={effectiveUser} 
-                    navigate={navigate} 
-                    handleContactSeller={() => navigate('/messages')} 
-                    handleCreateOrder={() => navigate('/messages')} 
-                    slugify={slugify} 
-                  />
-                );
-              }
-              const targetUser = users.find(u => u.username?.toLowerCase() === seg1.toLowerCase() || slugify(u.name).toLowerCase() === seg1.toLowerCase() || u.id === seg1);
-              if (targetUser) {
-                return <FreelancerProfileView profileUser={targetUser} currentUser={effectiveUser} gigs={gigs} reviews={appData.reviews} onNavigate={navigate} />;
-              }
-            }
-          }
-
-          return (
-            <MarketplaceGigsView 
-              filteredGigs={filteredGigs}
-              projects={projects}
-              currentCategory={currentCategory}
-              searchQuery={searchQuery}
-              setSearchQuery={setSearchQuery}
-              activeDropdown={activeDropdown}
-              setActiveDropdown={setActiveDropdown}
-              serviceOptionFilter={serviceOptionFilter}
-              setServiceOptionFilter={setServiceOptionFilter}
-              sellerLevelFilter={sellerLevelFilter}
-              setSellerLevelFilter={setSellerLevelFilter}
-              budgetFilter={budgetFilter}
-              setBudgetFilter={setBudgetFilter}
-              deliveryTimeFilter={deliveryTimeFilter}
-              setDeliveryTimeFilter={setDeliveryTimeFilter}
-              onlineNowOnly={onlineNowOnly}
-              setOnlineNowOnly={setOnlineNowOnly}
-              gigViewMode={gigViewMode}
-              setGigViewMode={setGigViewMode}
-              likedGigIds={likedGigIds}
-              handleToggleLike={handleToggleLike}
-              navigate={navigate}
-              getGigUrl={getGigUrl}
-              currentUser={effectiveUser}
-              setIsSignupModalOpen={setIsSignupOpen}
-              slugify={slugify}
-              CATEGORY_SLUGS={Object.fromEntries(PPH_CATEGORIES.map(c => [c.name, c.slug]))}
-            />
-          );
-        })()}
+      {/* Main Page Content Body */}
+      <main className="flex-1">
+        {mainContent}
       </main>
 
-      {/* Footer */}
+      {/* Global Footer */}
       <Footer navigate={navigate} />
 
-      {/* Modals */}
-      {isLoginOpen && (
-        <LoginModal 
-          isOpen={isLoginOpen}
-          onClose={() => setIsLoginOpen(false)}
-          loginRequiresCode={loginRequiresCode}
-          loginVerificationMessage={loginVerificationMessage}
-          mockEmailCodeDisplay={mockEmailCodeDisplay}
-          loginEmail={loginEmail}
-          setLoginEmail={setLoginEmail}
-          loginPassword={loginPassword}
-          setLoginPassword={setLoginPassword}
-          loginCode={loginCode}
-          setLoginCode={setLoginCode}
-          handleLoginSubmit={async (e: React.FormEvent) => {
-            e.preventDefault();
-            try {
-              const res = await fetch('/api/auth/login', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  query: loginEmail,
-                  password: loginPassword,
-                  code: loginCode,
-                  deviceId: getDeviceId()
-                })
-              });
-              const data = await res.json();
-              if (res.status === 403 && data.requiresVerification) {
-                setIsLoginOpen(false);
-                setVerifyEmail(data.email || loginEmail);
-                if (data.mockEmailCode) setMockEmailCodeDisplay(data.mockEmailCode);
-                setEmailCodeInput('');
-                setIsVerifyModalOpen(true);
-                showToast(data.error || 'Please verify your email before logging in.');
-                return;
-              }
-              if (data.requiresCode) {
-                setLoginRequiresCode(true);
-                setLoginVerificationMessage(data.message || 'Verification code sent to your email.');
-                if (data.mockCode) setMockEmailCodeDisplay(data.mockCode);
-                showToast(data.message || 'Verification code required.');
-                return;
-              }
-              if (res.ok && data.token && data.user) {
-                setAuthToken(data.token);
-                setCurrentUser(data.user);
-                setImpersonatedUser(null);
-                await refresh(data.user.id);
-                setIsLoginOpen(false);
-                setLoginEmail('');
-                setLoginPassword('');
-                setLoginCode('');
-                setLoginRequiresCode(false);
-                showToast(`Welcome back, ${data.user.name}!`);
-              } else {
-                showToast(data.error || 'Login failed. Please check your credentials.');
-              }
-            } catch {
-              showToast('An error occurred during login.');
-            }
-          }}
-          setLoginRequiresCode={setLoginRequiresCode}
-          usersList={users}
-          updateCurrentUser={setCurrentUser}
-          setImpersonatedUser={setImpersonatedUser}
-          refresh={refresh}
-          setIsForgotPasswordModalOpen={setIsForgotPasswordOpen}
-          setMockEmailCodeDisplay={setMockEmailCodeDisplay}
-          onSwitchToSignup={() => { setIsLoginOpen(false); setIsSignupOpen(true); }}
-        />
-      )}
+      {/* Auth & Utility Modals */}
+      <LoginModal
+        isOpen={isLoginModalOpen}
+        onClose={() => setIsLoginModalOpen(false)}
+        loginRequiresCode={loginRequiresCode}
+        loginVerificationMessage={loginVerificationMessage}
+        mockEmailCodeDisplay={mockEmailCodeDisplay}
+        loginEmail={loginEmail}
+        setLoginEmail={setLoginEmail}
+        loginPassword={loginPassword}
+        setLoginPassword={setLoginPassword}
+        loginCode={loginCode}
+        setLoginCode={setLoginCode}
+        handleLoginSubmit={handleLoginSubmit}
+        setLoginRequiresCode={setLoginRequiresCode}
+        usersList={users}
+        updateCurrentUser={updateCurrentUser}
+        setImpersonatedUser={setImpersonatedUser}
+        refresh={refresh}
+        setIsForgotPasswordModalOpen={setIsForgotPasswordModalOpen}
+        setMockEmailCodeDisplay={setMockEmailCodeDisplay}
+        loginError={loginError}
+        isSubmittingLogin={isSubmittingLogin}
+        onSwitchToSignup={() => {
+          setIsLoginModalOpen(false);
+          setIsSignupModalOpen(true);
+        }}
+      />
 
-      {isSignupOpen && (
-        <SignupModal 
-          isOpen={isSignupOpen}
-          onClose={() => setIsSignupOpen(false)}
-          handleSignupSubmit={async (e: React.FormEvent) => {
-            e.preventDefault();
-            if (signupPassword.length < 6) {
-              showToast('Password must be at least 6 characters');
-              return;
-            }
-            if (signupPassword !== signupConfirmPassword) {
-              showToast('Passwords do not match');
-              return;
-            }
-            try {
-              const res = await fetch('/api/auth/signup', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  name: signupName,
-                  email: signupEmail,
-                  mobile: signupMobile,
-                  password: signupPassword,
-                  confirmPassword: signupConfirmPassword,
-                  deviceId: getDeviceId()
-                })
-              });
-              const data = await res.json();
-              if (res.ok && data.requiresVerification) {
-                setIsSignupOpen(false);
-                setVerifyEmail(data.email || signupEmail);
-                setVerifyMobile(signupMobile);
-                if (data.mockEmailCode) setMockEmailCodeDisplay(data.mockEmailCode);
-                setEmailCodeInput('');
-                setIsVerifyModalOpen(true);
-                setSignupName('');
-                setSignupEmail('');
-                setSignupMobile('');
-                setSignupPassword('');
-                setSignupConfirmPassword('');
-                showToast(data.message || 'Verification code sent to your email. Please verify to complete registration.');
-                return;
-              }
-              if (res.ok && data.token && data.user) {
-                setAuthToken(data.token);
-                setCurrentUser(data.user);
-                setImpersonatedUser(null);
-                await refresh(data.user.id);
-                setIsSignupOpen(false);
-                setSignupName('');
-                setSignupEmail('');
-                setSignupMobile('');
-                setSignupPassword('');
-                setSignupConfirmPassword('');
-                showToast(`Account created successfully! Welcome, ${data.user.name}.`);
-              } else {
-                showToast(data.error || 'Signup failed.');
-              }
-            } catch {
-              showToast('An error occurred during signup.');
-            }
-          }}
-          signupName={signupName}
-          setSignupName={setSignupName}
-          signupEmail={signupEmail}
-          setSignupEmail={setSignupEmail}
-          signupMobile={signupMobile}
-          setSignupMobile={setSignupMobile}
-          signupPassword={signupPassword}
-          setSignupPassword={setSignupPassword}
-          signupConfirmPassword={signupConfirmPassword}
-          setSignupConfirmPassword={setSignupConfirmPassword}
-          onSwitchToLogin={() => { setIsSignupOpen(false); setIsLoginOpen(true); }}
-        />
-      )}
+      <SignupModal
+        isOpen={isSignupModalOpen}
+        onClose={() => setIsSignupModalOpen(false)}
+        handleSignupSubmit={handleSignupSubmit}
+        signupName={signupName}
+        setSignupName={setSignupName}
+        signupEmail={signupEmail}
+        setSignupEmail={setSignupEmail}
+        signupMobile={signupMobile}
+        setSignupMobile={setSignupMobile}
+        signupPassword={signupPassword}
+        setSignupPassword={setSignupPassword}
+        signupConfirmPassword={signupConfirmPassword}
+        setSignupConfirmPassword={setSignupConfirmPassword}
+        signupError={signupError}
+        isSubmittingSignup={isSubmittingSignup}
+        onSwitchToLogin={() => {
+          setIsSignupModalOpen(false);
+          setIsLoginModalOpen(true);
+        }}
+      />
 
-      {isVerifyModalOpen && (
-        <VerifyModal
-          isOpen={isVerifyModalOpen}
-          onClose={() => setIsVerifyModalOpen(false)}
-          verificationMode={verificationMode}
-          setVerificationMode={setVerificationMode}
-          emailCodeInput={emailCodeInput}
-          setEmailCodeInput={setEmailCodeInput}
-          smsCodeInput={smsCodeInput}
-          setSmsCodeInput={setSmsCodeInput}
-          handleVerifyEmailSubmit={handleVerifyEmailSubmit}
-          handleVerifySmsSubmit={handleVerifySmsSubmit}
-          handleResendEmailCode={handleResendEmailCode}
-          handleResendSmsCode={handleResendSmsCode}
-          verifyEmail={verifyEmail}
-          verifyMobile={verifyMobile}
-          mockEmailCodeDisplay={mockEmailCodeDisplay || undefined}
-          mockSmsCodeDisplay={mockSmsCodeDisplay || undefined}
-        />
-      )}
+      <UserSwitchModal
+        isOpen={isUserSwitchModalOpen}
+        onClose={() => setIsUserSwitchModalOpen(false)}
+        usersList={users}
+        currentUser={activeUser}
+        setCurrentUser={updateCurrentUser}
+        setImpersonatedUser={setImpersonatedUser}
+        refresh={refresh}
+      />
 
-      {isForgotPasswordOpen && (
-        <ForgotPasswordModal
-          isOpen={isForgotPasswordOpen}
-          onClose={() => setIsForgotPasswordOpen(false)}
-          forgotStep={forgotStep}
-          setForgotStep={setForgotStep}
-          forgotQuery={forgotQuery}
-          setForgotQuery={setForgotQuery}
-          forgotCode={forgotCode}
-          setForgotCode={setForgotCode}
-          mockForgotCodeDisplay={mockForgotCodeDisplay}
-          newPassword={newPassword}
-          setNewPassword={setNewPassword}
-          confirmNewPassword={confirmNewPassword}
-          setConfirmNewPassword={setConfirmNewPassword}
-          handleForgotRequest={handleForgotRequest}
-          handleForgotVerify={handleForgotVerify}
-          handleForgotReset={handleForgotReset}
-          setForgotCodeEmpty={() => setForgotCode('')}
-        />
-      )}
+      <ForgotPasswordModal
+        isOpen={isForgotPasswordModalOpen}
+        onClose={() => setIsForgotPasswordModalOpen(false)}
+        forgotStep={forgotStep}
+        setForgotStep={setForgotStep}
+        forgotQuery={forgotQuery}
+        setForgotQuery={setForgotQuery}
+        forgotCode={forgotCode}
+        setForgotCode={setForgotCode}
+        mockForgotCodeDisplay={mockForgotCodeDisplay}
+        newPassword={newPassword}
+        setNewPassword={setNewPassword}
+        confirmNewPassword={confirmNewPassword}
+        setConfirmNewPassword={setConfirmNewPassword}
+        handleForgotRequest={handleForgotRequest}
+        handleForgotVerify={handleForgotVerify}
+        handleForgotReset={handleForgotReset}
+        setForgotCodeEmpty={() => setForgotCode('')}
+      />
 
-      {isSwitchUserOpen && (
-        <UserSwitchModal 
-          isOpen={isSwitchUserOpen}
-          onClose={() => setIsSwitchUserOpen(false)}
-          usersList={users}
-          currentUser={effectiveUser}
-          setCurrentUser={setCurrentUser}
-          setImpersonatedUser={setImpersonatedUser}
-          refresh={refresh}
-        />
-      )}
+      <VerifyModal
+        isOpen={isVerifyModalOpen}
+        onClose={() => setIsVerifyModalOpen(false)}
+        verificationMode={verificationMode}
+        setVerificationMode={setVerificationMode}
+        emailCodeInput={emailCodeInput}
+        setEmailCodeInput={setEmailCodeInput}
+        smsCodeInput={smsCodeInput}
+        setSmsCodeInput={setSmsCodeInput}
+        handleVerifyEmailSubmit={handleVerifyEmailSubmit}
+        handleVerifySmsSubmit={(e) => e.preventDefault()}
+        handleResendEmailCode={() => {}}
+        handleResendSmsCode={() => {}}
+        verifyEmail={verifyEmail}
+        mockEmailCodeDisplay={mockEmailCodeDisplay || undefined}
+      />
 
-      {isWishlistOpen && (
-        <WishlistModal
-          isOpen={isWishlistOpen}
-          onClose={() => setIsWishlistOpen(false)}
-          likedGigIds={likedGigIds}
-          gigs={gigs}
-          onToggleLike={(gigId: string) => setLikedGigIds(prev => prev.includes(gigId) ? prev.filter(id => id !== gigId) : [...prev, gigId])}
-          getGigUrl={getGigUrl}
-          navigate={(to: string, e: React.MouseEvent) => {
-            setIsWishlistOpen(false);
-            navigate(to, e);
-          }}
-        />
-      )}
+      <SupportModal
+        isOpen={isSupportModalOpen}
+        onClose={() => setIsSupportModalOpen(false)}
+        supportSubject={supportSubject}
+        setSupportSubject={setSupportSubject}
+        supportMessage={supportMessage}
+        setSupportMessage={setSupportMessage}
+        onSubmitTicket={(e) => {
+          e.preventDefault();
+          setIsSupportModalOpen(false);
+        }}
+      />
 
-      {isSupportOpen && (
-        <SupportModal
-          isOpen={isSupportOpen}
-          onClose={() => setIsSupportOpen(false)}
-          supportSubject={supportSubject}
-          setSupportSubject={setSupportSubject}
-          supportMessage={supportMessage}
-          setSupportMessage={setSupportMessage}
-          onSubmitTicket={handleSubmitSupportTicket}
-        />
-      )}
+      <WishlistModal
+        isOpen={isWishlistModalOpen}
+        onClose={() => setIsWishlistModalOpen(false)}
+        likedGigIds={likedGigIds}
+        gigs={gigs}
+        onToggleLike={(id) => handleToggleLike(id)}
+        getGigUrl={getGigUrl}
+        navigate={navigate}
+      />
+
+      <EmailNotificationsModal
+        isOpen={isEmailNotificationsModalOpen}
+        onClose={() => setIsEmailNotificationsModalOpen(false)}
+        userEmails={userEmails as any}
+        userEmail={activeUser?.email || ''}
+        onMarkAsRead={() => {}}
+        onOpenSupport={() => setIsSupportModalOpen(true)}
+      />
     </div>
   );
 }

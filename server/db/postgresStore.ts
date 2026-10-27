@@ -1,6 +1,7 @@
 import pkg from 'pg';
 import { PGlite } from '@electric-sql/pglite';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import type { 
@@ -202,7 +203,7 @@ export function getPool(): pkg.Pool {
       try {
         const pgDataDir = process.env.NODE_ENV === 'test'
           ? undefined
-          : path.resolve(__dirname, '../../data/pgdata');
+          : (process.env.PGLITE_DATA_DIR || path.join(os.tmpdir(), 'wph-pglite-data'));
         global._appMockPool = new PGlitePool(pgDataDir);
       } catch (err) {
         console.warn('WARNING: PGlite disk storage failed to init, falling back to in-memory PGlite:', err);
@@ -248,6 +249,10 @@ export class PostgresStore {
   getPool(): pkg.Pool {
     if ((this as any)._customPool) return (this as any)._customPool;
     return getPool();
+  }
+
+  public isEnabled(): boolean {
+    return isPostgresEnabled();
   }
 
   public withLock<T = void>(key: string, fn: () => Promise<T>): Promise<T> {
@@ -378,14 +383,11 @@ export class PostgresStore {
   }
 
   async saveClearingEarning(e: ClearingEarning): Promise<void> {
-    const id = 'clr_' + (e.orderId || Math.random().toString(36).substring(2));
+    const id = (e as any).id || ('clr_' + (e.orderId || Math.random().toString(36).substring(2)));
     await this.getPool().query(
       `INSERT INTO earnings_clearing (id, order_id, seller_id, amount, clearance_end, status, payout_eligible)
        VALUES ($1, $2, $3, $4, $5, 'clearing', FALSE)
-       ON CONFLICT (id) DO UPDATE SET
-         amount = EXCLUDED.amount,
-         clearance_end = EXCLUDED.clearance_end,
-         status = EXCLUDED.status`,
+       ON CONFLICT (id) DO NOTHING`,
       [id, e.orderId, e.sellerId, e.amount, e.clearsAt]
     );
   }
@@ -718,6 +720,7 @@ export class PostgresStore {
       'support_tickets',
       'payment_methods',
       'clearing_earnings',
+      'earnings_clearing',
       'payouts',
       'refunds',
       'disputes',

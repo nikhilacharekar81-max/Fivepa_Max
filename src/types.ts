@@ -248,6 +248,10 @@ export interface Order {
   sellerReview?: Review;
   escrowRemaining?: number;
   totalReleased?: number;
+  serviceFee?: number;
+  smallOrderFee?: number;
+  escrowBalance?: number;
+  escrowReleased?: number | boolean;
   hasPaidInvoice?: boolean;
   type?: 'gig' | 'project';
   reviewWindowRestartedAt?: string;
@@ -294,7 +298,7 @@ export interface UserAccount {
   completedJobs: number;
   bio: string;
   skills: string[];
-  status: 'active' | 'suspended' | 'restricted' | 'deactivated';
+  status: 'active' | 'suspended' | 'restricted' | 'deactivated' | 'frozen';
   verified: boolean;
   emailVerified?: boolean;
   mobileVerified?: boolean;

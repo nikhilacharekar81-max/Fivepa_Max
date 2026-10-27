@@ -880,16 +880,42 @@ router.delete('/admin/users/:id', requireAdmin, async (req: Request, res: Respon
 
     const pool = postgresStore.getPool();
     const activeOrdersRes = await pool.query(
-      "SELECT 1 FROM orders WHERE (buyer_id = $1 OR seller_id = $1) AND status NOT IN ('completed', 'cancelled') AND amount > 0 LIMIT 1",
+      "SELECT 1 FROM orders WHERE (buyer_id = $1 OR seller_id = $1) AND status NOT IN ('completed', 'cancelled', 'refunded') AND amount > 0 LIMIT 1",
       [target.id]
     );
     if (activeOrdersRes.rows.length > 0) {
       return res.status(409).json({ error: 'User has active paid orders. Complete or cancel them first.' });
     }
 
-    await pool.query('DELETE FROM gigs WHERE freelancer_id = $1', [target.id]);
-    await pool.query('DELETE FROM projects WHERE buyer_id = $1', [target.id]);
-    await pool.query('DELETE FROM users WHERE id = $1', [target.id]);
+    await postgresStore.executeInTransaction(async (client) => {
+      const txOrdersRes = await client.query(
+        "SELECT 1 FROM orders WHERE (buyer_id = $1 OR seller_id = $1) AND status NOT IN ('completed', 'cancelled', 'refunded') AND amount > 0 LIMIT 1",
+        [target.id]
+      );
+      if (txOrdersRes.rows.length > 0) {
+        const conflictErr: any = new Error('User has active paid orders. Complete or cancel them first.');
+        conflictErr.statusCode = 409;
+        throw conflictErr;
+      }
+
+      const [txWalletRes, txEscrowRes] = await Promise.all([
+        client.query('SELECT available_balance, funds_on_hold, pending_withdrawals FROM wallets WHERE user_id = $1 FOR UPDATE', [target.id]),
+        client.query("SELECT 1 FROM escrows WHERE (buyer_id = $1 OR seller_id = $1) AND status = 'held' AND remaining > 0 LIMIT 1", [target.id])
+      ]);
+      const walletRow = txWalletRes.rows[0];
+      if (
+        (walletRow && (Number(walletRow.available_balance) > 0 || Number(walletRow.funds_on_hold) > 0 || Number(walletRow.pending_withdrawals) > 0)) ||
+        txEscrowRes.rows.length > 0
+      ) {
+        const conflictErr: any = new Error('User still has wallet funds, pending withdrawals or active escrow. Resolve these before deleting the account.');
+        conflictErr.statusCode = 409;
+        throw conflictErr;
+      }
+
+      await client.query('DELETE FROM gigs WHERE freelancer_id = $1', [target.id]);
+      await client.query('DELETE FROM projects WHERE buyer_id = $1', [target.id]);
+      await client.query('DELETE FROM users WHERE id = $1', [target.id]);
+    });
 
     const admin = (req as any).authenticatedUser;
     registerAuditLog({
@@ -905,7 +931,8 @@ router.delete('/admin/users/:id', requireAdmin, async (req: Request, res: Respon
     disconnectUserSockets(req.params.id, 'Account deleted');
     res.json({ success: true, id: target.id });
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    const status = err?.statusCode || 400;
+    res.status(status).json({ error: err.message });
   }
 });
 

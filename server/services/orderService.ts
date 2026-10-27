@@ -99,19 +99,52 @@ export function saveOrdersToDisk() { return Promise.resolve(); }
 export function saveUsersToPostgres() { return Promise.resolve(); }
 export function saveGigsToPostgres() { return Promise.resolve(); }
 
-export async function syncUserBalances() {
+export async function syncUserBalances(userIds?: string[]) {
   try {
-    await postgresStore.getPool().query(`
-      UPDATE users u
-      SET wallet_balance = w.available_balance
-      FROM wallets w
-      WHERE u.id = w.user_id
-    `);
-    for (const u of (users || [])) {
-      if (!u) continue;
-      const w = await financialRepository.getWallet(u.id);
-      if (w) {
-        u.walletBalance = w.availableBalance;
+    const pool = postgresStore.getPool();
+    const hasSpecificUsers = Array.isArray(userIds) && userIds.length > 0;
+
+    if (hasSpecificUsers) {
+      const distinctIds = Array.from(new Set(userIds.filter(Boolean)));
+      if (distinctIds.length === 0) return;
+
+      await pool.query(`
+        UPDATE users u
+        SET wallet_balance = w.available_balance
+        FROM wallets w
+        WHERE u.id = w.user_id AND u.id = ANY($1)
+      `, [distinctIds]);
+
+      const walletRows = await pool.query(
+        'SELECT user_id, available_balance FROM wallets WHERE user_id = ANY($1)',
+        [distinctIds]
+      );
+      const balanceMap = new Map<string, number>();
+      for (const r of walletRows.rows) {
+        balanceMap.set(r.user_id, Number(r.available_balance));
+      }
+
+      for (const u of (users || [])) {
+        if (!u || !balanceMap.has(u.id)) continue;
+        u.walletBalance = balanceMap.get(u.id)!;
+      }
+    } else {
+      await pool.query(`
+        UPDATE users u
+        SET wallet_balance = w.available_balance
+        FROM wallets w
+        WHERE u.id = w.user_id
+      `);
+
+      const walletRows = await pool.query('SELECT user_id, available_balance FROM wallets');
+      const balanceMap = new Map<string, number>();
+      for (const r of walletRows.rows) {
+        balanceMap.set(r.user_id, Number(r.available_balance));
+      }
+
+      for (const u of (users || [])) {
+        if (!u || !balanceMap.has(u.id)) continue;
+        u.walletBalance = balanceMap.get(u.id)!;
       }
     }
   } catch (err) {
@@ -238,7 +271,7 @@ export async function releaseOrderFunds(order: Order, actor: string, reason: str
     order.acceptedVersion = order.deliveryHistory[order.deliveryHistory.length - 1].version;
   }
 
-  await syncUserBalances();
+  await syncUserBalances([order.buyerId, order.sellerId].filter(Boolean));
   await postgresStore.getPool().query(
     'UPDATE orders SET status = $1, completed_at = COALESCE(completed_at, $2), accepted_version = COALESCE($3, accepted_version) WHERE id = $4 AND status NOT IN (\'completed\', \'cancelled\')',
     ['completed', order.completedAt, order.acceptedVersion ?? null, order.id]
@@ -275,7 +308,7 @@ export async function refundOrderFunds(order: Order, amount: number | undefined,
     order.status = 'cancelled';
   }
 
-  await syncUserBalances();
+  await syncUserBalances([order.buyerId, order.sellerId].filter(Boolean));
   await postgresStore.getPool().query(
     'UPDATE orders SET status = $1, cancellation_type = COALESCE($2, cancellation_type) WHERE id = $3 AND status NOT IN (\'completed\', \'cancelled\')',
     [order.status, order.cancellationType || null, order.id]
@@ -297,7 +330,7 @@ export async function splitOrderFunds(order: Order, refundAmount: number, actor:
     order.completedAt = new Date().toISOString();
   }
 
-  await syncUserBalances();
+  await syncUserBalances([order.buyerId, order.sellerId].filter(Boolean));
   await postgresStore.getPool().query(
     'UPDATE orders SET status = $1, completed_at = COALESCE(completed_at, $2) WHERE id = $3 AND status NOT IN (\'completed\', \'cancelled\')',
     ['completed', order.completedAt, order.id]

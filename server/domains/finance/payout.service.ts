@@ -51,7 +51,37 @@ export async function handlePayoutRequest(req: Request, res: Response) {
     if (!user) {
       return res.status(404).json({ error: 'User account not found.' });
     }
-    await financialTransactionService.ensureWallet(freelancerId);
+    if (user.status === 'frozen') {
+      return res.status(403).json({ error: 'User account is frozen. Financial transactions are restricted.' });
+    }
+    await financialTransactionService.ensureWallet({
+      userId: freelancerId,
+      name: user.name,
+      email: user.email,
+      role: user.role || 'freelancer'
+    });
+
+    const idempotencyKey = String(req.body?.idempotencyKey || req.body?.requestKey || req.headers['x-idempotency-key'] || '').trim();
+    if (idempotencyKey) {
+      const pool = postgresStore.getPool();
+      const checkRes = await pool.query(
+        "SELECT result FROM financial_idempotency WHERE key = $1 AND operation = 'requestPayout' AND status = 'completed' AND request_fingerprint->>'freelancerId' = $2",
+        [idempotencyKey, freelancerId]
+      );
+      if (checkRes.rows.length > 0) {
+        const resVal = typeof checkRes.rows[0].result === 'string' ? JSON.parse(checkRes.rows[0].result) : checkRes.rows[0].result;
+        const activePayoutId = resVal?.payoutId || resVal?.payout?.id;
+        const record = activePayoutId ? await store.getPayoutById(activePayoutId) : null;
+        const newBalance = (await financialRepository.getWalletBalance(freelancerId)) ?? Number(user.walletBalance || 0);
+        return res.status(200).json({
+          success: true,
+          replayed: true,
+          newBalance,
+          payout: record,
+          ...(record || {})
+        });
+      }
+    }
 
     const rawCode = req.body?.code;
     if (!rawCode || typeof rawCode !== 'string' || !rawCode.trim()) {
@@ -67,7 +97,7 @@ export async function handlePayoutRequest(req: Request, res: Response) {
     }
 
     const numAmount = Number(req.body?.amount);
-    if (!Number.isFinite(numAmount) || numAmount <= 0 || Math.round(numAmount * 100) !== numAmount * 100) {
+    if (!Number.isFinite(numAmount) || numAmount <= 0 || Math.abs(Math.round(numAmount * 100) - numAmount * 100) > 1e-6) {
       return res.status(400).json({ error: 'Please enter a valid withdrawal amount greater than $0.00' });
     }
 
@@ -81,7 +111,7 @@ export async function handlePayoutRequest(req: Request, res: Response) {
     const walletRes = await pool.query('SELECT available_balance, status, user_role FROM wallets WHERE user_id = $1', [freelancerId]);
     if (walletRes.rows.length > 0) {
       const wallet = walletRes.rows[0];
-      if (wallet.status === 'frozen' || wallet.status === 'suspended') {
+      if (wallet.status === 'frozen' || wallet.status === 'suspended' || wallet.status === 'restricted') {
         return res.status(400).json({ error: `Cannot request payout from a ${wallet.status} wallet.` });
       }
       if (wallet.user_role && wallet.user_role !== 'freelancer') {
@@ -105,28 +135,41 @@ export async function handlePayoutRequest(req: Request, res: Response) {
       });
     }
 
-    const verification = await verifyAndConsumeWithdrawalCode(freelancerId, rawCode);
-    if (!verification.ok) {
-      return res.status(verification.status).json({ error: verification.error });
-    }
-
-    const idempotencyKey = String(req.body?.idempotencyKey || req.headers['x-idempotency-key'] || '').trim();
     // Deterministic payoutId if idempotencyKey provided, else random
     const id = idempotencyKey
-      ? ('pay_' + createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 12))
+      ? ('pay_' + createHash('sha256').update(`${freelancerId}:${idempotencyKey}`).digest('hex').slice(0, 12))
       : ('pay_' + randomUUID().slice(0, 8));
 
     const accountDetails = String(req.body?.accountDetails || 'Primary Bank Account').slice(0, 500);
 
-    const payoutResult = await financialTransactionService.requestPayout({
-      payoutId: id,
-      freelancerId,
-      amount: numAmount,
-      method: rawMethod,
-      accountDetails,
-      actor: `user:${freelancerId}`,
-      idempotencyKey: idempotencyKey || undefined
+    // Atomic OTP consumption + Payout creation inside a single database transaction:
+    // - If OTP verification fails (invalid/expired/max attempts), commit the attempt counter increment and return error.
+    // - If OTP verification succeeds, consume the code on the same client and execute requestPayout on that client.
+    // - If requestPayout throws, the transaction rolls back and the valid OTP remains unconsumed.
+    const txOutcome = await postgresStore.executeInTransaction(async (client) => {
+      const verification = await verifyAndConsumeWithdrawalCode(freelancerId, rawCode, client);
+      if (!verification.ok) {
+        return { verified: false as const, verification };
+      }
+
+      const result = await financialTransactionService.requestPayout({
+        payoutId: id,
+        freelancerId,
+        amount: numAmount,
+        method: rawMethod,
+        accountDetails,
+        actor: `user:${freelancerId}`,
+        idempotencyKey: idempotencyKey || undefined
+      }, client);
+
+      return { verified: true as const, payoutResult: result };
     });
+
+    if (!txOutcome.verified) {
+      return res.status(txOutcome.verification.status).json({ error: txOutcome.verification.error });
+    }
+
+    const payoutResult = txOutcome.payoutResult;
 
     const activePayoutId = payoutResult.payoutId || id;
     let record = await store.getPayoutById(activePayoutId);
@@ -137,13 +180,13 @@ export async function handlePayoutRequest(req: Request, res: Response) {
         amount: payoutResult.amount ?? numAmount,
         method: rawMethod as Payout['method'],
         status: 'pending',
-        createdAt: new Date().toISOString().substring(0, 10),
+        createdAt: new Date().toISOString(),
         accountDetails: payoutResult.accountDetails || accountDetails
       };
       await store.savePayout(record);
     }
 
-    await syncUserBalances();
+    await syncUserBalances([freelancerId]);
 
     registerAuditLog({
       id: 'log_' + Date.now(),
@@ -173,27 +216,43 @@ export async function handlePayoutRequest(req: Request, res: Response) {
 
 export const approvePayout = async (req: Request, res: Response) => {
   try {
-    const p = await store.getPayoutById(req.params.id);
-    if (!p) return res.status(404).json({ error: 'Payout not found' });
-    if (p.status !== 'pending') return res.status(400).json({ error: `Cannot approve payout in status "${p.status}"` });
+    const payoutId = req.params.id;
+    const updatedPayout = await postgresStore.executeInTransaction(async (client) => {
+      const pRes = await client.query('SELECT * FROM payouts WHERE id = $1 FOR UPDATE', [payoutId]);
+      if (pRes.rows.length === 0) throw { status: 404, message: 'Payout not found' };
+      const payout = pRes.rows[0];
+      if (payout.status === 'approved') {
+        return mapPayoutRow(payout);
+      }
+      if (payout.status !== 'pending') {
+        throw { status: 400, message: `Cannot approve payout in status "${payout.status}"` };
+      }
+      const updated = await client.query(
+        "UPDATE payouts SET status = 'approved', updated_at = NOW() WHERE id = $1 RETURNING *",
+        [payoutId]
+      );
+      return mapPayoutRow(updated.rows[0]);
+    });
 
-    p.status = 'approved';
-    await store.savePayout(p);
-    payoutAudit(req, 'PAYOUT_APPROVED', p, `Approved payout of $${p.amount} via ${p.method} for freelancer ${p.freelancerId}`);
-    res.json(p);
+    payoutAudit(req, 'PAYOUT_APPROVED', updatedPayout, `Approved payout of $${updatedPayout.amount} via ${updatedPayout.method} for freelancer ${updatedPayout.freelancerId}`);
+    res.json(updatedPayout);
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    const status = typeof err?.status === 'number' ? err.status : 400;
+    res.status(status).json({ error: err.message || err.error });
   }
 };
 
 export const processPayout = async (req: Request, res: Response) => {
   try {
-    const p = await store.getPayoutById(req.params.id);
-    if (!p) return res.status(404).json({ error: 'Payout not found' });
-    if (p.status !== 'pending' && p.status !== 'approved') {
-      return res.status(400).json({ error: `Cannot process payout in status "${p.status}"` });
+    const payoutId = req.params.id;
+    const pool = postgresStore.getPool();
+    const pCheck = await pool.query('SELECT * FROM payouts WHERE id = $1', [payoutId]);
+    if (pCheck.rows.length === 0) return res.status(404).json({ error: 'Payout not found' });
+    const preRow = pCheck.rows[0];
+    if (preRow.status !== 'pending' && preRow.status !== 'approved') {
+      return res.status(400).json({ error: `Cannot process payout in status "${preRow.status}"` });
     }
-    if (p.amount >= 500 && p.status !== 'approved') {
+    if (Number(preRow.amount) >= 500 && preRow.status !== 'approved') {
       return res.status(400).json({ error: 'Payouts of $500.00 or more require explicit administrative approval before processing.' });
     }
     const providerReference = req.body?.providerReference ? String(req.body.providerReference).trim() : '';
@@ -201,17 +260,19 @@ export const processPayout = async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Explicit providerReference is required in production to process a payout.' });
     }
     const { journal } = await financialTransactionService.settlePayout({
-      payoutId: p.id,
+      payoutId,
       actor: adminActor(req),
       providerReference: providerReference || `GW-SETTLE-${Date.now()}`
     });
-    p.status = 'processed';
-    p.processedAt = new Date().toISOString();
-    payoutAudit(req, 'PAYOUT_PROCESSED', p, `Processed payout of $${p.amount} via ${p.method}`);
-    await syncUserBalances();
-    res.json({ success: true, payout: p, journal, ...p });
+    const p = await store.getPayoutById(payoutId);
+    if (p) {
+      payoutAudit(req, 'PAYOUT_PROCESSED', p, `Processed payout of $${p.amount} via ${p.method}`);
+    }
+    await syncUserBalances([preRow.freelancer_id]);
+    res.json({ success: true, payout: p, journal, ...(p || {}) });
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    const status = typeof err?.status === 'number' ? err.status : 400;
+    res.status(status).json({ error: err.message || err.error });
   }
 };
 
@@ -227,11 +288,10 @@ export const rejectPayout = async (req: Request, res: Response) => {
       reason: String(req.body?.reason || 'Administrative rejection'),
       actor: adminActor(req)
     });
-    p.status = 'cancelled';
-    await store.savePayout(p);
-    payoutAudit(req, 'PAYOUT_REJECTED', p, `Rejected payout of $${p.amount}; funds returned to wallet`);
-    await syncUserBalances();
-    res.json({ success: true, payout: p, ...p });
+    const updated = (await store.getPayoutById(p.id)) || { ...p, status: 'cancelled' as const };
+    payoutAudit(req, 'PAYOUT_REJECTED', updated, `Rejected payout of $${updated.amount}; funds returned to wallet`);
+    await syncUserBalances([p.freelancerId]);
+    res.json({ success: true, payout: updated, ...updated });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
@@ -239,38 +299,58 @@ export const rejectPayout = async (req: Request, res: Response) => {
 
 export const failPayout = async (req: Request, res: Response) => {
   try {
-    const p = await store.getPayoutById(req.params.id);
-    if (!p) return res.status(404).json({ error: 'Payout not found' });
-    if (p.status !== 'pending' && p.status !== 'approved') {
-      return res.status(400).json({ error: `Cannot fail payout in status "${p.status}"` });
+    const payoutId = req.params.id;
+    const pool = postgresStore.getPool();
+    const pCheck = await pool.query('SELECT * FROM payouts WHERE id = $1', [payoutId]);
+    if (pCheck.rows.length === 0) return res.status(404).json({ error: 'Payout not found' });
+    const currentPayout = pCheck.rows[0];
+
+    if (currentPayout.status === 'failed') {
+      const p = await store.getPayoutById(payoutId);
+      return res.json(p || mapPayoutRow(currentPayout));
     }
+    if (currentPayout.status === 'processed') {
+      return res.status(400).json({ error: 'Cannot fail payout: Payout has already been processed.' });
+    }
+    if (currentPayout.status !== 'pending' && currentPayout.status !== 'approved') {
+      return res.status(400).json({ error: `Cannot fail payout in status "${currentPayout.status}"` });
+    }
+
     await financialTransactionService.failPayout({
-      payoutId: p.id,
+      payoutId,
       reason: String(req.body?.reason || 'Gateway reported a transfer failure'),
       actor: adminActor(req)
     });
-    p.status = 'failed';
-    await store.savePayout(p);
-    payoutAudit(req, 'PAYOUT_FAILED', p, `Payout of $${p.amount} failed; funds returned to wallet`);
-    await syncUserBalances();
-    res.json(p);
+    const p = await store.getPayoutById(payoutId);
+    if (p) {
+      payoutAudit(req, 'PAYOUT_FAILED', p, `Payout of $${p.amount} failed; funds returned to wallet`);
+    }
+    await syncUserBalances([currentPayout.freelancer_id]);
+    res.json(p || mapPayoutRow(currentPayout));
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    const status = typeof err?.status === 'number' ? err.status : 400;
+    res.status(status).json({ error: err.message || err.error });
   }
 };
 
 export const retryPayout = async (req: Request, res: Response) => {
   try {
-    const p = await store.getPayoutById(req.params.id);
-    if (!p) return res.status(404).json({ error: 'Payout not found' });
+    const payoutId = req.params.id;
+    const pool = postgresStore.getPool();
+    const pCheck = await pool.query('SELECT * FROM payouts WHERE id = $1', [payoutId]);
+    if (pCheck.rows.length === 0) return res.status(404).json({ error: 'Payout not found' });
+    const p = pCheck.rows[0];
     if (p.status !== 'failed') return res.status(400).json({ error: 'Only failed payouts can be retried.' });
-    await financialTransactionService.retryPayout({ payoutId: p.id, actor: adminActor(req) });
-    p.status = 'pending';
-    await store.savePayout(p);
-    payoutAudit(req, 'PAYOUT_RETRIED', p, `Re-queued failed payout of $${p.amount}`);
-    await syncUserBalances();
-    res.json(p);
+
+    await financialTransactionService.retryPayout({ payoutId, actor: adminActor(req) });
+    const updated = await store.getPayoutById(payoutId);
+    if (updated) {
+      payoutAudit(req, 'PAYOUT_RETRIED', updated, `Re-queued failed payout of $${updated.amount}`);
+    }
+    await syncUserBalances([p.freelancer_id]);
+    res.json(updated || mapPayoutRow(p));
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    const status = typeof err?.status === 'number' ? err.status : 400;
+    res.status(status).json({ error: err.message || err.error });
   }
 };
