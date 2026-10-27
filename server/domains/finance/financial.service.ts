@@ -998,8 +998,8 @@ export class FinancialTransactionService {
       if (check.replayed) return check.result;
 
       const orderRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [params.orderId]);
-      if (orderRes.rows.length > 0 && orderRes.rows[0].status === 'cancelled') {
-        throw new Error('Cannot release escrow: Order has already been cancelled.');
+      if (orderRes.rows.length > 0 && (orderRes.rows[0].status === 'cancelled' || orderRes.rows[0].status === 'completed')) {
+        throw new Error(`Cannot release escrow: Order is already ${orderRes.rows[0].status}.`);
       }
 
       const escRes = await client.query('SELECT * FROM escrows WHERE order_id = $1 FOR UPDATE', [params.orderId]);
@@ -1100,8 +1100,8 @@ export class FinancialTransactionService {
     assertPostgresAvailable();
     const run = async (client: any) => {
       const orderRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [params.orderId]);
-      if (orderRes.rows.length > 0 && orderRes.rows[0].status === 'completed') {
-        throw new Error('Cannot refund escrow: Order has already been completed.');
+      if (orderRes.rows.length > 0 && (orderRes.rows[0].status === 'completed' || orderRes.rows[0].status === 'cancelled')) {
+        throw new Error(`Cannot refund escrow: Order is already ${orderRes.rows[0].status}.`);
       }
 
       const escRes = await client.query('SELECT * FROM escrows WHERE order_id = $1 FOR UPDATE', [params.orderId]);
