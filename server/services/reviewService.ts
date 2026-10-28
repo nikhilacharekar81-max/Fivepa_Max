@@ -61,7 +61,7 @@ export async function recalculateGigRating(gigId: string): Promise<void> {
          AND o.status = 'completed'
          AND r.is_cancelled_order = false
          AND (r.moderation_status = 'approved' OR r.moderation_status IS NULL)
-         AND (r.reviewer_role = 'buyer' OR r.reviewer_id = o.buyer_id)`,
+         AND r.reviewer_id = o.buyer_id`,
       [gigId]
     );
     const count = Number(res.rows[0]?.count || 0);

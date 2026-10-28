@@ -914,6 +914,20 @@ router.post('/orders/:id/deliverable', requireAuth, requireActiveStatus, async (
       }
     }
 
+    const success = await store.updateOrderStatus(orderId, {
+      status: isDraft ? 'draft_review' : 'delivered',
+      deliverable_files: JSON.stringify(order.deliverableFiles),
+      delivery_history: JSON.stringify(order.deliveryHistory),
+      delivery_notes: trimmedNotes,
+      delivery_reference: trimmedReference,
+      revisions: JSON.stringify(order.revisions),
+      response_deadline: order.responseDeadline || null
+    }, allowedStatuses);
+
+    if (!success) return res.status(409).json({ error: 'Order state changed concurrently. Please retry.' });
+
+    order.status = isDraft ? 'draft_review' : 'delivered';
+
     if (resolvedRevisionCount > 0) {
       await emitSystemEvent(order.id, 'revision_resolved', `📝 Revision resolved via Delivery #v${version}.`, {
         deliveryVersion: version
@@ -1013,18 +1027,6 @@ router.post('/orders/:id/deliverable', requireAuth, requireActiveStatus, async (
         createdInvoiceOffer = await viewOffer(newInv);
       }
     }
-
-    const success = await store.updateOrderStatus(orderId, {
-      status: isDraft ? 'draft_review' : 'delivered',
-      deliverable_files: JSON.stringify(order.deliverableFiles),
-      delivery_history: JSON.stringify(order.deliveryHistory),
-      delivery_notes: trimmedNotes,
-      delivery_reference: trimmedReference,
-      revisions: JSON.stringify(order.revisions),
-      response_deadline: order.responseDeadline || null
-    }, allowedStatuses);
-
-    if (!success) return res.status(409).json({ error: 'Order state changed concurrently. Please retry.' });
 
     res.json({ success: true, files: uploadedFiles, file: uploadedFiles[0], offer: createdInvoiceOffer, order: enrichOrderWithServiceInfo(order) });
   } catch (err: any) {

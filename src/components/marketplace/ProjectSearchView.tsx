@@ -780,7 +780,7 @@ export const ProjectSearchView: React.FC<ProjectSearchViewProps> = ({
                   return (
                     <div
                       key={proj.id}
-                      className="bg-white rounded-2xl border border-slate-200/90 p-5 sm:p-6 hover:border-emerald-500/50 hover:shadow-lg transition-all relative group"
+                      className="bg-white rounded-xl border border-[#E4E5E7] p-5 sm:p-6 hover:border-[#1DBF73] hover:shadow-md transition-all relative group"
                     >
                       {/* Top Row: Buyer Avatar, Title, Budget */}
                       <div className="flex flex-col md:flex-row md:items-start justify-between gap-4 mb-3">
@@ -788,46 +788,40 @@ export const ProjectSearchView: React.FC<ProjectSearchViewProps> = ({
                           <img
                             src={proj.buyerAvatar || DEFAULT_AVATAR}
                             alt={proj.buyerName}
-                            className="w-11 h-11 rounded-full object-cover border border-slate-200 shrink-0 mt-0.5"
+                            className="w-10 h-10 rounded-full object-cover border border-[#E4E5E7] shrink-0 mt-0.5"
                             onError={(e) => {
                               (e.target as HTMLImageElement).src = DEFAULT_AVATAR;
                             }}
                           />
                           <div className="space-y-1">
                             <div className="flex flex-wrap items-center gap-2">
-                              <span className="text-xs font-bold text-slate-800 flex items-center gap-1">
+                              <span className="text-[13px] font-bold text-[#222325] flex items-center gap-1">
                                 {proj.buyerName}
                                 {proj.countryFlag && <span className="text-xs ml-0.5">{proj.countryFlag}</span>}
                               </span>
                               {proj.verifiedBuyer && (
-                                <span className="inline-flex items-center gap-0.5 px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-700 text-[10px] font-bold border border-emerald-200">
-                                  <ShieldCheck className="w-3 h-3 text-emerald-600" />
-                                  <span>Verified</span>
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-[#EBF8F2] text-[#1DBF73] text-[10px] font-bold border border-[#1DBF73]/20">
+                                  <ShieldCheck className="w-3 h-3 text-[#1DBF73]" />
+                                  <span>Payment Verified · 100% Escrow</span>
                                 </span>
                               )}
                               {proj.buyerRating ? (
-                                <span className="text-[11px] text-slate-500 font-medium flex items-center gap-1">
-                                  <Star className="w-3 h-3 fill-amber-400 text-amber-400" />
-                                  <span className="font-bold text-slate-800">{proj.buyerRating.toFixed(1)}</span>
+                                <span className="text-[12px] text-[#74767E] font-medium flex items-center gap-1">
+                                  <Star className="w-3.5 h-3.5 fill-[#FFBE5B] text-[#FFBE5B]" />
+                                  <span className="font-bold text-[#222325]">{proj.buyerRating.toFixed(1)}</span>
                                   {proj.buyerSpent !== undefined ? <span>• ${proj.buyerSpent.toLocaleString()} spent</span> : null}
-                                  <span className="mx-1">•</span>
-                                  {proj.hireRate !== null && proj.hireRate !== undefined ? (
-                                    <span className="text-emerald-600 font-bold">{Math.round(proj.hireRate * 100)}% Hire Rate</span>
-                                  ) : (
-                                    <span className="text-slate-400">Not enough history</span>
-                                  )}
                                 </span>
                               ) : (
-                                <span className="text-[11px] text-slate-500 font-medium">New buyer</span>
+                                <span className="text-[12px] text-[#74767E] font-medium">New buyer</span>
                               )}
-                              <span className="text-[11px] text-slate-400 font-medium">• {proj.createdAt}</span>
+                              <span className="text-[12px] text-[#74767E] font-medium">• {proj.createdAt}</span>
                             </div>
 
                             {/* Project Title */}
                             <a
                               href={`/projects/${proj.id}`}
                               onClick={(e) => navigate(`/projects/${proj.id}`, e)}
-                              className="text-base sm:text-lg font-bold text-slate-900 hover:text-emerald-600 transition-colors line-clamp-1 block"
+                              className="text-[17px] font-bold text-[#222325] hover:text-[#1DBF73] transition-colors line-clamp-1 block pt-0.5"
                             >
                               {proj.title}
                             </a>
@@ -835,23 +829,23 @@ export const ProjectSearchView: React.FC<ProjectSearchViewProps> = ({
                         </div>
 
                         {/* Budget Badge & Bookmark Button */}
-                        <div className="flex items-center justify-between md:justify-end gap-3 shrink-0 pt-2 md:pt-0 border-t md:border-t-0 border-slate-100">
+                        <div className="flex items-center justify-between md:justify-end gap-3 shrink-0 pt-2 md:pt-0 border-t md:border-t-0 border-[#E4E5E7]">
                           <div className="text-left md:text-right">
-                            <span className="text-[10px] text-slate-400 uppercase tracking-wider font-extrabold block">
+                            <span className="text-[10px] text-[#74767E] uppercase tracking-wider font-extrabold block">
                               {proj.projectType === 'hourly' ? 'Hourly Rate' : 'Fixed Budget'}
                             </span>
-                            <span className="text-base sm:text-lg font-black text-emerald-600">
+                            <span className="text-base sm:text-lg font-black text-[#222325]">
                               ${proj.budgetMin} - ${proj.budgetMax}
-                              {proj.projectType === 'hourly' && <span className="text-xs font-normal text-slate-500">/hr</span>}
+                              {proj.projectType === 'hourly' && <span className="text-xs font-normal text-[#74767E]">/hr</span>}
                             </span>
                           </div>
 
                           <button
                             onClick={(e) => handleToggleSaveProject(proj.id, e)}
-                            className={`p-2 rounded-xl border transition-all cursor-pointer ${
+                            className={`p-2 rounded-lg border transition-colors cursor-pointer ${
                               isSaved
                                 ? 'bg-rose-50 border-rose-200 text-rose-500'
-                                : 'bg-slate-50 border-slate-200 text-slate-400 hover:text-slate-700 hover:bg-slate-100'
+                                : 'bg-[#F7F7F7] border-[#E4E5E7] text-[#74767E] hover:text-[#222325] hover:bg-[#E4E5E7]'
                             }`}
                             title={isSaved ? 'Saved Project' : 'Save Project'}
                           >
@@ -861,18 +855,18 @@ export const ProjectSearchView: React.FC<ProjectSearchViewProps> = ({
                       </div>
 
                       {/* Description Preview */}
-                      <p className="text-xs sm:text-sm text-slate-600 leading-relaxed mb-4 line-clamp-2">
+                      <p className="text-[14px] text-[#404145] leading-relaxed mb-3.5 line-clamp-2">
                         {proj.description}
                       </p>
 
                       {/* Skills Chips */}
                       {proj.skills && proj.skills.length > 0 && (
-                        <div className="flex flex-wrap items-center gap-1.5 mb-4">
+                        <div className="flex flex-wrap items-center gap-1.5 mb-3.5">
                           {proj.skills.map(skill => (
                             <button
                               key={skill}
                               onClick={() => setSearchQuery(skill)}
-                              className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-emerald-50 hover:text-emerald-700 text-slate-700 text-[11px] font-medium transition-colors cursor-pointer"
+                              className="px-2.5 py-1 rounded-md bg-[#F5F5F5] hover:bg-[#E4E5E7] text-[#404145] text-[12px] font-medium transition-colors cursor-pointer"
                             >
                               {skill}
                             </button>
@@ -881,9 +875,9 @@ export const ProjectSearchView: React.FC<ProjectSearchViewProps> = ({
                       )}
 
                       {/* Footer Row: Category, Badges, Proposals, Actions */}
-                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-3.5 border-t border-slate-100 text-xs">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-3.5 border-t border-[#E4E5E7] text-xs">
                         <div className="flex flex-wrap items-center gap-2">
-                          <span className="px-2.5 py-1 rounded-md bg-slate-100 text-slate-700 font-bold text-[11px]">
+                          <span className="px-2.5 py-0.5 rounded-md bg-[#F7F7F7] border border-[#E4E5E7] text-[#404145] font-semibold text-[11px]">
                             {proj.category}
                           </span>
 
@@ -894,17 +888,17 @@ export const ProjectSearchView: React.FC<ProjectSearchViewProps> = ({
                           )}
 
                           {proj.featured && (
-                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-100 text-amber-800 font-bold text-[10px]">
-                              <Sparkles className="w-3 h-3 text-amber-500" /> Featured
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-[#F0EFFF] text-[#2E258E] font-bold text-[10px]">
+                              <Sparkles className="w-3 h-3 text-[#2E258E]" /> Featured
                             </span>
                           )}
 
-                          <span className="text-slate-400 font-medium">
-                            • <strong className="text-slate-700 font-bold">{proj.proposalsCount}</strong> proposals
+                          <span className="text-[#74767E] font-medium">
+                            • <strong className="text-[#222325] font-bold">{proj.proposalsCount}</strong> proposals
                           </span>
 
-                          <span className="text-slate-400 font-medium hidden sm:inline">
-                            • Est. {proj.deadlineDays} days
+                          <span className="text-[#74767E] font-medium hidden sm:inline">
+                            • Est. {proj.deadlineDays} days delivery
                           </span>
                         </div>
 
@@ -912,19 +906,19 @@ export const ProjectSearchView: React.FC<ProjectSearchViewProps> = ({
                         <div className="flex items-center gap-2 shrink-0">
                           <button
                             onClick={() => setPreviewProject(proj)}
-                            className="px-3 py-1.5 rounded-xl border border-slate-200 hover:border-slate-300 text-slate-700 font-bold text-xs transition-colors flex items-center gap-1 cursor-pointer bg-slate-50"
+                            className="px-3 py-1.5 rounded-lg border border-[#E4E5E7] hover:bg-[#F5F5F5] text-[#404145] font-bold text-xs transition-colors flex items-center gap-1 cursor-pointer bg-white"
                           >
-                            <Eye className="w-3.5 h-3.5 text-slate-500" />
+                            <Eye className="w-3.5 h-3.5 text-[#74767E]" />
                             <span>Quick View</span>
                           </button>
 
                           <a
                             href={`/projects/${proj.id}`}
                             onClick={(e) => navigate(`/projects/${proj.id}`, e)}
-                            className="px-4 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs transition-colors shadow-xs flex items-center gap-1.5"
+                            className="px-4 py-1.5 rounded-lg bg-[#1DBF73] hover:bg-[#19A463] text-white font-bold text-xs transition-colors shadow-xs flex items-center gap-1.5"
                           >
                             <Send className="w-3.5 h-3.5" />
-                            <span>Submit Proposal</span>
+                            <span>Submit Offer</span>
                           </a>
                         </div>
                       </div>

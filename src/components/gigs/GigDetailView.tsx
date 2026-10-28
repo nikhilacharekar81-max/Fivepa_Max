@@ -1,5 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { Star, Sparkles, Clock, RefreshCw, ShieldCheck, Lock, MessageSquare, AlertCircle, CheckCircle2, Loader2, X } from 'lucide-react';
+import { 
+  Star, Clock, RefreshCw, ShieldCheck, MessageSquare, 
+  AlertCircle, CheckCircle2, Loader2, X, Check, ArrowRight, ChevronLeft, ChevronRight, User
+} from 'lucide-react';
 import { Gig, Review, UserAccount, Order } from '../../types';
 import { RelatedGigsSection } from './RelatedGigsSection';
 import { Reviews } from '../gig_reviews';
@@ -51,9 +54,8 @@ export const GigDetailView: React.FC<GigDetailViewProps> = ({
   slugify
 }) => {
   const [selectedExtras, setSelectedExtras] = useState<string[]>([]);
-  const [isPuppetVideoPlaying, setIsPuppetVideoPlaying] = useState<boolean>(false);
 
-  // Fee quote from the server: the same math the ledger applies when the order is funded.
+  // Fee quote from the server
   const [quote, setQuote] = useState<{ gigPrice: number; serviceFee: number; smallOrderFee: number; clientTotal: number; config?: { buyerFeePercent: number; smallOrderThreshold: number } } | null>(null);
   useEffect(() => {
     let cancelled = false;
@@ -71,395 +73,395 @@ export const GigDetailView: React.FC<GigDetailViewProps> = ({
     return str.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '');
   };
 
+  const extrasList = currentGig.extras || [];
+  const selectedExtrasObjects = extrasList.filter(e => selectedExtras.includes(e.id));
+  const extrasTotalUSD = selectedExtrasObjects.reduce((sum, e) => sum + e.price, 0);
+  const totalOrderPrice = currentGig.price + extrasTotalUSD;
+
   return (
-    <div className="max-w-6xl mx-auto space-y-8">
+    <div className="max-w-[1300px] mx-auto px-4 sm:px-6 py-8 font-sans text-[#404145]">
       {/* Breadcrumbs */}
-      <div className="flex items-center gap-2 text-xs text-fiverr-muted font-medium">
-        <a href="/gigs" onClick={(e) => navigate('/gigs', e)} className="hover:text-fiverr-dark">Home</a>
+      <div className="flex items-center gap-2 text-xs text-[#74767E] font-medium mb-6">
+        <a href="/" onClick={(e) => navigate('/', e)} className="hover:text-[#222325]">Home</a>
         <span>/</span>
         <a 
           href={`/categories/${CATEGORY_SLUGS[currentGig.category] || 'technology-programming'}`} 
           onClick={(e) => navigate(`/categories/${CATEGORY_SLUGS[currentGig.category] || 'technology-programming'}`, e)} 
-          className="hover:text-fiverr-dark"
+          className="hover:text-[#222325]"
         >
           {currentGig.category}
         </a>
         <span>/</span>
-        <span className="text-fiverr-dark font-semibold truncate max-w-xs">{currentGig.subcategory || 'Services'}</span>
+        <span className="text-[#222325] font-semibold truncate max-w-xs">{currentGig.subcategory || 'Services'}</span>
       </div>
 
-      {/* Title & Seller Header */}
-      <div>
-        <h1 className="text-3xl font-bold text-slate-900 text-fiverr-dark tracking-tight leading-tight mb-4">
-          {currentGig.title}
-        </h1>
-
-        <div className="flex flex-wrap items-center gap-4 text-xs">
-          <div className="flex items-center gap-2.5">
-            <img 
-              src={currentGig.freelancerAvatar || DEFAULT_AVATAR} 
-              alt={currentGig.freelancerName} 
-              className="w-10 h-10 rounded-full object-cover ring-2 ring-slate-100" 
-              onError={(e) => { (e.target as HTMLImageElement).src = DEFAULT_AVATAR; }}
-            />
-            <div>
-              <span className="font-bold text-fiverr-dark block">{currentGig.freelancerName}</span>
-              <span className="text-fiverr-muted font-mono">@{currentGig.freelancerUsername || safeSlugify(currentGig.freelancerName)}</span>
-            </div>
-          </div>
-
-          <div className="h-6 w-px bg-slate-200 hidden sm:block"></div>
-
-          <div className="flex items-center gap-1 font-bold text-fiverr-dark">
-            <Star className="w-4 h-4 fill-amber-500 text-amber-500" />
-            <span>{currentGig.rating}</span>
-            <span className="text-slate-400 font-normal">({currentGig.reviewsCount.toLocaleString()} reviews)</span>
-          </div>
-
-          <div className="h-6 w-px bg-slate-200 hidden sm:block"></div>
-
-          <span className="bg-amber-100 text-amber-800 font-bold px-2.5 py-1 rounded-md text-[11px]">
-            {currentGig.freelancerLevel || 'Top Rated Seller'}
-          </span>
-
-          <span className="text-emerald-700 bg-emerald-50 border border-emerald-200 font-semibold px-2.5 py-1 rounded-md text-[11px]">
-            3 orders in queue
-          </span>
-        </div>
-      </div>
-
-      {/* Main Content Grid: Gallery & Description Left, Package Box Right */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 items-start">
+      {/* 2-COLUMN ASYMMETRIC LAYOUT (8 Cols Left, 4 Cols Right Sticky) */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-10 lg:gap-12 items-start">
         
-        {/* LEFT COLUMN: Gallery & Details */}
-        <div className="lg:col-span-2 space-y-8">
-          {/* Main Media Preview: Interactive Promotional Explainer Video Player */}
-          <div className="bg-slate-900 rounded-3xl overflow-hidden border border-slate-800 shadow-xl relative group">
-            {isPuppetVideoPlaying ? (
-              <div className="relative aspect-video bg-black flex flex-col items-center justify-center text-white p-6">
-                <div className="absolute inset-0 bg-cover bg-center opacity-40" style={{ backgroundImage: `url('https://images.unsplash.com/photo-1536240478700-b869070f9279?w=1200&h=700&fit=crop')` }}></div>
-                <div className="relative z-10 text-center space-y-4">
-                  <div className="w-16 h-16 rounded-full bg-emerald-600/90 text-white flex items-center justify-center mx-auto shadow-lg animate-pulse">
-                    <Sparkles className="w-8 h-8" />
-                  </div>
-                  <h3 className="text-xl font-bold tracking-tight">Playing Promotional Explainer Video (1080p HD)</h3>
-                  <p className="text-xs text-slate-300 max-w-md mx-auto">Custom puppet character rigging, professional voiceover, and dynamic motion graphics.</p>
-                  
-                  <div className="w-full max-w-md bg-white/10 backdrop-blur-md rounded-2xl p-3 flex items-center gap-4 mt-6">
-                    <button onClick={() => setIsPuppetVideoPlaying(false)} className="px-3 py-1 bg-white text-fiverr-dark font-bold rounded-lg text-xs hover:bg-slate-100 cursor-pointer">Pause</button>
-                    <div className="flex-1 h-2 bg-white/20 rounded-full overflow-hidden">
-                      <div className="w-3/5 h-full bg-emerald-500 animate-pulse"></div>
-                    </div>
-                    <span className="text-[10px] font-mono">01:14 / 02:00</span>
+        {/* ========================================================= */}
+        {/* LEFT COLUMN: Main Showcase & Details (8 Columns)          */}
+        {/* ========================================================= */}
+        <div className="lg:col-span-8 space-y-8">
+          
+          {/* Bold H1 Title */}
+          <div>
+            <h1 className="text-[26px] sm:text-[28px] leading-[36px] font-bold text-[#222325] tracking-tight mb-4">
+              {currentGig.title}
+            </h1>
+
+            {/* Seller Summary Bar */}
+            <div className="flex flex-wrap items-center gap-4 text-xs pb-4 border-b border-[#E4E5E7]">
+              <div className="flex items-center gap-2.5">
+                <div className="relative">
+                  <img 
+                    src={currentGig.freelancerAvatar || DEFAULT_AVATAR} 
+                    alt={currentGig.freelancerName} 
+                    className="w-10 h-10 rounded-full object-cover border border-[#E4E5E7]" 
+                  />
+                  <span className="absolute bottom-0 right-0 w-2.5 h-2.5 rounded-full bg-[#1DBF73] border-2 border-white" />
+                </div>
+                <div>
+                  <a 
+                    href={`/${currentGig.freelancerUsername || safeSlugify(currentGig.freelancerName)}`}
+                    onClick={(e) => navigate(`/${currentGig.freelancerUsername || safeSlugify(currentGig.freelancerName)}`, e)}
+                    className="font-bold text-[#222325] hover:text-[#1DBF73] text-[14px] transition-colors"
+                  >
+                    {currentGig.freelancerName}
+                  </a>
+                  <div className="flex items-center gap-1.5 text-[11px] text-[#74767E]">
+                    <span className="font-semibold text-[#404145]">Level 2 Seller</span>
+                    <span>|</span>
+                    <span className="text-[#1DBF73] font-semibold">100% Escrow Verified</span>
                   </div>
                 </div>
               </div>
-            ) : (
-              <div className="relative aspect-video bg-slate-900 flex items-center justify-center group cursor-pointer" onClick={() => setIsPuppetVideoPlaying(true)}>
-                <img 
-                  src={currentGig.image || DEFAULT_GIG_IMAGE} 
-                  alt={currentGig.title} 
-                  referrerPolicy="no-referrer"
-                  onError={(e) => {
-                    (e.target as HTMLImageElement).src = DEFAULT_GIG_IMAGE;
-                  }}
-                  className="w-full h-full object-cover opacity-80 group-hover:opacity-90 transition-opacity" 
-                />
-                <div className="absolute inset-0 bg-gradient-to-t from-slate-950/80 via-slate-950/20 to-transparent flex flex-col justify-between p-6">
-                  <div className="flex items-center justify-between">
-                    <span className="bg-emerald-500 text-white text-[10px] font-bold uppercase tracking-widest px-3 py-1 rounded-full shadow-md">
-                      🎬 Promotional Explainer Video
-                    </span>
-                    <span className="bg-black/60 backdrop-blur-md text-white text-[10px] font-mono px-2.5 py-1 rounded-lg">02:00 HD</span>
-                  </div>
 
-                  <div className="text-center">
-                    <div className="w-20 h-20 rounded-full bg-emerald-600 text-white flex items-center justify-center mx-auto shadow-2xl group-hover:scale-110 transition-transform mb-3 border-4 border-white/20">
-                      <svg className="w-8 h-8 fill-current ml-1" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-                    </div>
-                    <span className="text-white font-bold text-sm drop-shadow-md">Click to Play Promotional Explainer Video</span>
-                  </div>
+              <div className="h-4 w-px bg-[#E4E5E7] hidden sm:block" />
 
-                  <div className="flex items-center justify-between text-[11px] text-slate-300 font-medium">
-                    <span>Directed by {currentGig.freelancerName}</span>
-                    <span>Puppet Animation & Character Rigging</span>
-                  </div>
+              {/* Star Rating Badge */}
+              <div className="flex items-center gap-1 text-[13px]">
+                <div className="flex items-center">
+                  {[...Array(5)].map((_, i) => (
+                    <Star key={i} className="w-3.5 h-3.5 fill-[#222325] text-[#222325]" />
+                  ))}
                 </div>
+                <span className="font-bold text-[#222325] ml-1">{currentGig.rating.toFixed(1)}</span>
+                <span className="text-[#74767E]">({currentGig.reviewsCount || 0} reviews)</span>
               </div>
-            )}
-          </div>
 
-          {/* About This Gig */}
-          <div className="bg-white rounded-3xl border border-slate-200 p-8 shadow-xs space-y-4">
-            <h2 className="text-xl font-bold text-fiverr-dark border-b border-slate-100 pb-3">About This Gig</h2>
-            <p className="text-base text-fiverr-dark leading-body whitespace-pre-line font-normal">
-              {currentGig.description}
-            </p>
+              <div className="h-4 w-px bg-[#E4E5E7] hidden sm:block" />
 
-            <div className="pt-4 border-t border-slate-100 grid grid-cols-2 gap-4 text-xs text-fiverr-dark">
-              <div>
-                <span className="font-bold text-fiverr-dark block mb-1">Service Category</span>
-                <span>{currentGig.category}</span>
-              </div>
-              <div>
-                <span className="font-bold text-fiverr-dark block mb-1">Subcategory</span>
-                <span>{currentGig.subcategory || 'General'}</span>
+              <div className="text-xs text-[#74767E]">
+                <span>2 Orders in Queue</span>
               </div>
             </div>
           </div>
 
-          {/* About The Seller */}
-          <div className="bg-white rounded-3xl border border-slate-200 p-8 shadow-xs space-y-6">
-            <h2 className="text-xl font-bold text-fiverr-dark border-b border-slate-100 pb-3">About The Seller</h2>
+          {/* 16:10 Main Image */}
+          <div className="aspect-[16/10] bg-[#F7F7F7] rounded-lg overflow-hidden border border-[#E4E5E7]">
+            <img 
+              src={currentGig.image || DEFAULT_GIG_IMAGE} 
+              alt={currentGig.title} 
+              className="w-full h-full object-cover"
+              onError={(e) => {
+                (e.target as HTMLImageElement).src = DEFAULT_GIG_IMAGE;
+              }}
+            />
+          </div>
+
+          {/* About This Gig Section */}
+          <div className="space-y-4 pt-4 border-t border-[#E4E5E7]">
+            <h2 className="text-[20px] font-bold text-[#222325]">About This Gig</h2>
+            <div className="text-[15px] leading-relaxed text-[#404145] whitespace-pre-line space-y-3 font-normal">
+              {currentGig.description}
+            </div>
+
+            {/* Deliverable Highlights */}
+            <div className="bg-[#F7F7F7] border border-[#E4E5E7] rounded-lg p-5 mt-4 space-y-3">
+              <h3 className="text-xs font-bold text-[#222325] uppercase tracking-wider">What you will receive</h3>
+              <ul className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs text-[#404145]">
+                <li className="flex items-center gap-2">
+                  <Check className="w-4 h-4 text-[#1DBF73] shrink-0" />
+                  <span>Production-Ready Final Deliverables</span>
+                </li>
+                <li className="flex items-center gap-2">
+                  <Check className="w-4 h-4 text-[#1DBF73] shrink-0" />
+                  <span>Full Commercial & Usage Rights</span>
+                </li>
+                <li className="flex items-center gap-2">
+                  <Check className="w-4 h-4 text-[#1DBF73] shrink-0" />
+                  <span>Editable Source Files & High-Res Exports</span>
+                </li>
+                <li className="flex items-center gap-2">
+                  <Check className="w-4 h-4 text-[#1DBF73] shrink-0" />
+                  <span>100% Escrow Milestone Protection</span>
+                </li>
+              </ul>
+            </div>
+          </div>
+
+          {/* About The Seller Bio Card */}
+          <div className="bg-white border border-[#E4E5E7] rounded-lg p-6 space-y-6">
+            <h2 className="text-[20px] font-bold text-[#222325]">About The Seller</h2>
             
-            <div className="flex items-center gap-4">
+            <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4">
               <img 
                 src={currentGig.freelancerAvatar || DEFAULT_AVATAR} 
-                alt={currentGig.freelancerName} 
-                className="w-16 h-16 rounded-full object-cover ring-4 ring-slate-100" 
-                onError={(e) => { (e.target as HTMLImageElement).src = DEFAULT_AVATAR; }}
+                alt={currentGig.freelancerName}
+                className="w-16 h-16 rounded-full object-cover border border-[#E4E5E7]" 
               />
-              <div>
-                <h3 className="text-base font-bold text-fiverr-dark">{currentGig.freelancerName}</h3>
-                <p className="text-xs text-fiverr-muted font-mono">@{currentGig.freelancerUsername || safeSlugify(currentGig.freelancerName)}</p>
-                <div className="flex items-center gap-2 mt-1">
-                  <span className="text-xs font-bold text-amber-500 flex items-center gap-1">
-                    <Star className="w-3.5 h-3.5 fill-amber-500" /> {currentGig.rating}
-                  </span>
-                  <span className="text-xs text-slate-400">({currentGig.reviewsCount} reviews)</span>
+              <div className="space-y-1">
+                <a 
+                  href={`/${currentGig.freelancerUsername || safeSlugify(currentGig.freelancerName)}`}
+                  onClick={(e) => navigate(`/${currentGig.freelancerUsername || safeSlugify(currentGig.freelancerName)}`, e)}
+                  className="font-bold text-[18px] text-[#222325] hover:text-[#1DBF73] transition-colors"
+                >
+                  {currentGig.freelancerName}
+                </a>
+                <p className="text-xs text-[#74767E]">Professional Digital Creator & Verified Expert</p>
+                <div className="flex items-center gap-1.5 text-xs">
+                  <Star className="w-3.5 h-3.5 fill-[#FFBE5B] text-[#FFBE5B]" />
+                  <span className="font-bold text-[#222325]">{currentGig.rating.toFixed(1)}</span>
+                  <span className="text-[#74767E]">({currentGig.reviewsCount || 0} reviews)</span>
                 </div>
               </div>
             </div>
 
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 p-4 bg-slate-50 rounded-2xl border border-slate-100 text-xs">
+            {/* Seller Quick Stats */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 p-4 bg-[#F7F7F7] rounded-lg border border-[#E4E5E7] text-xs">
               <div>
-                <span className="text-slate-400 block mb-1">From</span>
-                <span className="font-bold text-slate-800">United States</span>
+                <span className="text-[#74767E] block mb-0.5">From</span>
+                <strong className="text-[#222325] font-bold">United States</strong>
               </div>
               <div>
-                <span className="text-slate-400 block mb-1">Member since</span>
-                <span className="font-bold text-slate-800">Jan 2024</span>
+                <span className="text-[#74767E] block mb-0.5">Member since</span>
+                <strong className="text-[#222325] font-bold">2026</strong>
               </div>
               <div>
-                <span className="text-slate-400 block mb-1">Avg. response time</span>
-                <span className="font-bold text-slate-800">1 hour</span>
+                <span className="text-[#74767E] block mb-0.5">Avg. response time</span>
+                <strong className="text-[#222325] font-bold">1 hour</strong>
               </div>
               <div>
-                <span className="text-slate-400 block mb-1">Last delivery</span>
-                <span className="font-bold text-slate-800">about 2 hours</span>
+                <span className="text-[#74767E] block mb-0.5">Last delivery</span>
+                <strong className="text-[#222325] font-bold">About 12 hours</strong>
+              </div>
+            </div>
+          </div>
+
+          {/* Gig Reviews Section */}
+          <div className="pt-6 border-t border-[#E4E5E7]">
+            <Reviews currentGig={currentGig} allReviews={reviews} allOrders={orders} currentUser={currentUser} />
+          </div>
+        </div>
+
+        {/* ========================================================= */}
+        {/* RIGHT COLUMN: Sticky Order / Purchase Widget (4 Columns)  */}
+        {/* ========================================================= */}
+        <div className="lg:col-span-4 sticky top-28 space-y-4">
+          <div className="bg-white border border-[#E4E5E7] rounded-lg shadow-sm overflow-hidden">
+            {/* Widget Header */}
+            <div className="p-6 border-b border-[#E4E5E7] bg-[#F7F7F7]">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <span className="text-[11px] font-extrabold uppercase tracking-wider text-[#74767E] block">
+                    Service Price
+                  </span>
+                  <h3 className="text-[15px] font-bold text-[#222325] mt-0.5">
+                    Order Deliverable
+                  </h3>
+                </div>
+                <div className="text-[28px] font-bold text-[#222325] leading-none shrink-0 font-mono">
+                  ${currentGig.price}
+                </div>
               </div>
             </div>
 
-            <button 
-              onClick={() => handleContactSeller(currentGig.freelancerId, currentGig.freelancerName, currentGig.title, currentGig.id)}
-              className="w-full sm:w-auto px-6 py-2.5 border-2 border-slate-900 text-fiverr-dark font-bold rounded-xl text-xs hover:bg-slate-900 hover:text-white transition-colors flex items-center justify-center gap-2"
-            >
-              <MessageSquare className="w-4 h-4 text-emerald-600" />
-              <span>Contact Seller ({currentGig.freelancerName})</span>
-            </button>
-          </div>
+            {/* Widget Body */}
+            <div className="p-6 space-y-5">
+              {/* Delivery Time & Revisions */}
+              <div className="flex items-center gap-6 text-xs font-bold text-[#222325]">
+                <div className="flex items-center gap-1.5">
+                  <Clock className="w-4 h-4 text-[#74767E]" />
+                  <span>{currentGig.deliveryDays || 3} Days Delivery</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <RefreshCw className="w-4 h-4 text-[#74767E]" />
+                  <span>Revisions Included</span>
+                </div>
+              </div>
 
-          {/* GIG REVIEWS SECTION */}
-          <div className="bg-white rounded-3xl border border-slate-200 p-8 shadow-xs">
-            <Reviews currentGig={currentGig} allReviews={reviews} allOrders={orders} currentUser={currentUser} />
-          </div>
+              {/* Checklist with Green Checkmarks */}
+              <ul className="space-y-2 text-xs text-[#404145]">
+                <li className="flex items-center gap-2">
+                  <Check className="w-4 h-4 text-[#1DBF73] shrink-0" />
+                  <span>Complete Core Deliverable</span>
+                </li>
+                <li className="flex items-center gap-2">
+                  <Check className="w-4 h-4 text-[#1DBF73] shrink-0" />
+                  <span>High-Resolution Export & Source Files</span>
+                </li>
+                <li className="flex items-center gap-2">
+                  <Check className="w-4 h-4 text-[#1DBF73] shrink-0" />
+                  <span>Rounds of Iterative Revisions</span>
+                </li>
+                <li className="flex items-center gap-2">
+                  <Check className="w-4 h-4 text-[#1DBF73] shrink-0" />
+                  <span>100% Escrow Milestone Protection</span>
+                </li>
+              </ul>
 
-        </div>
-
-        {/* RIGHT COLUMN: Simple Order Box with Optional Extras */}
-        <div className="lg:col-span-1 sticky top-24">
-          <div className="bg-white rounded-3xl border border-slate-200 shadow-xl overflow-hidden p-6 space-y-6">
-            {(() => {
-              const extrasList = currentGig.extras || [];
-              const selectedExtrasObjects = extrasList.filter(e => selectedExtras.includes(e.id));
-              const extrasTotalUSD = selectedExtrasObjects.reduce((sum, e) => sum + e.price, 0);
-              const totalUSD = currentGig.price + extrasTotalUSD;
-
-              return (
-                <>
-                  <div className="flex items-center justify-between pb-4 border-b border-slate-100">
-                    <div>
-                      <span className="text-xs font-normal text-fiverr-muted uppercase tracking-wider block">Gig Base Price</span>
-                      <span className="text-[19px] font-bold text-fiverr-dark">${currentGig.price.toLocaleString()}</span>
-                    </div>
-                    <span className="text-xs font-semibold bg-emerald-100 text-emerald-800 px-2.5 py-1 rounded-lg">
-                      USD ($)
-                    </span>
-                  </div>
-
-                  <div className="flex items-center justify-between text-xs font-bold text-fiverr-dark">
-                    <div className="flex items-center gap-1.5">
-                      <Clock className="w-4 h-4 text-fiverr-muted" />
-                      <span>{currentGig.deliveryDays} Days Delivery</span>
-                    </div>
-                    <div className="flex items-center gap-1.5">
-                      <RefreshCw className="w-4 h-4 text-fiverr-muted" />
-                      <span>Unlimited Revisions</span>
-                    </div>
-                  </div>
-
-                  {/* Optional Gig Extras Section */}
-                  {extrasList.length > 0 && (
-                    <div className="space-y-3 pt-4 border-t border-slate-100">
-                      <h4 className="text-xs font-bold text-fiverr-dark uppercase tracking-wider">
-                        Upgrade Your Order with Extras:
-                      </h4>
-                      <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
-                        {extrasList.map(extra => {
-                          const isChecked = selectedExtras.includes(extra.id);
-                          return (
-                            <label 
-                              key={extra.id} 
-                              className={`flex items-start gap-3 p-3 rounded-2xl border text-xs cursor-pointer transition-all ${isChecked ? 'bg-emerald-50/60 border-emerald-300 text-fiverr-dark font-semibold' : 'bg-slate-50 border-slate-200 text-fiverr-dark hover:bg-slate-100'}`}
-                            >
-                              <input 
-                                type="checkbox"
-                                checked={isChecked}
-                                onChange={(e) => {
-                                  if (e.target.checked) {
-                                    setSelectedExtras(prev => [...prev, extra.id]);
-                                  } else {
-                                    setSelectedExtras(prev => prev.filter(id => id !== extra.id));
-                                  }
-                                }}
-                                className="mt-0.5 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500 w-4 h-4 shrink-0"
-                              />
-                              <div className="flex-1 flex items-center justify-between gap-2">
-                                <span>{extra.title}</span>
-                                <span className="font-bold text-fiverr-dark shrink-0">+${extra.price.toLocaleString()}</span>
-                              </div>
-                            </label>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Price breakdown and Total Summary */}
-                  {(() => {
-                    const q = quote && Math.abs(quote.gigPrice - totalUSD) < 0.005 ? quote : null;
-                    const money = (n: number) => `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-                    return (
-                      <>
-                        {q && (
-                          <div className="pt-4 border-t border-slate-100 space-y-1.5 text-xs text-fiverr-muted">
-                            <div className="flex justify-between"><span>Order{selectedExtras.length > 0 ? ' + extras' : ''}</span><span>{money(q.gigPrice)}</span></div>
-                            <div className="flex justify-between"><span>Service fee ({q.config?.buyerFeePercent ?? 5.5}%)</span><span>{money(q.serviceFee)}</span></div>
-                            {q.smallOrderFee > 0 && (
-                              <div className="flex justify-between"><span>Small order fee (under ${q.config?.smallOrderThreshold ?? 200})</span><span>{money(q.smallOrderFee)}</span></div>
-                            )}
+              {/* Optional Gig Extras Section */}
+              {extrasList.length > 0 && (
+                <div className="space-y-2.5 pt-4 border-t border-[#E4E5E7]">
+                  <span className="text-[11px] font-bold text-[#74767E] uppercase tracking-wide block">
+                    Upgrade with Extras:
+                  </span>
+                  <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1 scrollbar-none">
+                    {extrasList.map(extra => {
+                      const isChecked = selectedExtras.includes(extra.id);
+                      return (
+                        <label 
+                          key={extra.id} 
+                          className={`flex items-start gap-2.5 p-2.5 rounded-md border text-xs cursor-pointer transition ${
+                            isChecked ? 'bg-[#F7F7F7] border-[#1DBF73] text-[#222325] font-semibold' : 'bg-white border-[#E4E5E7] text-[#404145] hover:bg-[#F7F7F7]'
+                          }`}
+                        >
+                          <input 
+                            type="checkbox"
+                            checked={isChecked}
+                            onChange={(e) => {
+                              if (e.target.checked) {
+                                setSelectedExtras(prev => [...prev, extra.id]);
+                              } else {
+                                setSelectedExtras(prev => prev.filter(id => id !== extra.id));
+                              }
+                            }}
+                            className="mt-0.5 rounded border-[#E4E5E7] text-[#1DBF73] focus:ring-[#1DBF73] w-4 h-4 shrink-0"
+                          />
+                          <div className="flex-1 flex items-center justify-between gap-2">
+                            <span>{extra.title}</span>
+                            <span className="font-bold text-[#222325] shrink-0">+${extra.price}</span>
                           </div>
-                        )}
-                        <div className="pt-4 border-t border-slate-100 flex items-center justify-between">
-                          <div>
-                            <span className="text-xs text-fiverr-muted block font-normal">{q ? 'Total you pay' : 'Order amount (fees added at checkout)'}</span>
-                            {selectedExtras.length > 0 && (
-                              <span className="text-xs text-emerald-600 font-bold block">Includes {selectedExtras.length} selected extra(s)</span>
-                            )}
-                          </div>
-                          <span className="text-[19px] font-bold text-fiverr-dark">{q ? money(q.clientTotal) : `$${totalUSD.toLocaleString()}`}</span>
-                        </div>
-                      </>
-                    );
-                  })()}
-
-                  <div className="bg-emerald-50 border border-emerald-200/60 rounded-2xl p-3 flex items-start gap-2.5 text-[11px] text-emerald-900">
-                    <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                    <span>100% Escrow Protection. Funds are safely held until work is delivered and approved.</span>
+                        </label>
+                      );
+                    })}
                   </div>
+                </div>
+              )}
 
-                  {orderFeedback && (
-                    <div
-                      className={`p-3.5 rounded-2xl border text-xs flex items-start justify-between gap-2.5 ${
-                        orderFeedback.type === 'success'
-                          ? 'bg-emerald-50 border-emerald-300 text-emerald-900'
-                          : 'bg-rose-50 border-rose-300 text-rose-900'
-                      }`}
-                    >
-                      <div className="flex items-start gap-2">
-                        {orderFeedback.type === 'success' ? (
-                          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                        ) : (
-                          <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
-                        )}
-                        <div className="space-y-1">
-                          <span className="font-semibold block">{orderFeedback.message}</span>
-                          {orderFeedback.orderId && (
-                            <button
-                              type="button"
-                              onClick={(e) => navigate(`/messages/${orderFeedback.orderId}`, e)}
-                              className="underline font-bold text-emerald-700 hover:text-emerald-900 cursor-pointer"
-                            >
-                              Open Workstream #{orderFeedback.orderId} →
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                      {onDismissOrderFeedback && (
+              {/* Price summary & Escrow badge */}
+              <div className="pt-3 border-t border-[#E4E5E7] space-y-2">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-[#74767E]">Total due now</span>
+                  <span className="text-[22px] font-bold text-[#222325] font-mono">${totalOrderPrice}</span>
+                </div>
+
+                <div className="p-3 bg-[#0A4226]/5 rounded-md border border-[#0A4226]/15 flex items-center gap-2.5 text-[11px] text-[#0A4226]">
+                  <ShieldCheck className="w-4 h-4 text-[#1DBF73] shrink-0" />
+                  <span><strong>100% Escrow Protected:</strong> Funds are locked safely until you approve work.</span>
+                </div>
+              </div>
+
+              {/* Order Feedback Alert */}
+              {orderFeedback && (
+                <div
+                  className={`p-3 rounded-md border text-xs flex items-start justify-between gap-2 ${
+                    orderFeedback.type === 'success'
+                      ? 'bg-emerald-50 border-emerald-300 text-emerald-950'
+                      : 'bg-rose-50 border-rose-300 text-rose-950'
+                  }`}
+                >
+                  <div className="flex items-start gap-2">
+                    {orderFeedback.type === 'success' ? (
+                      <CheckCircle2 className="w-4 h-4 text-[#1DBF73] shrink-0 mt-0.5" />
+                    ) : (
+                      <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                    )}
+                    <div className="space-y-1">
+                      <span className="font-semibold block">{orderFeedback.message}</span>
+                      {orderFeedback.orderId && (
                         <button
                           type="button"
-                          onClick={onDismissOrderFeedback}
-                          className="text-slate-400 hover:text-slate-700 cursor-pointer shrink-0"
-                          aria-label="Dismiss message"
+                          onClick={(e) => navigate(`/messages/${orderFeedback.orderId}`, e)}
+                          className="underline font-bold text-[#1DBF73] hover:text-[#19A463] cursor-pointer"
                         >
-                          <X className="w-3.5 h-3.5" />
+                          Open WorkStream #{orderFeedback.orderId} →
                         </button>
                       )}
                     </div>
-                  )}
-
-                  {currentGig.status === 'paused' ? (
-                    <div className="p-4 bg-amber-50 border border-amber-300 rounded-2xl text-center space-y-1">
-                      <div className="flex items-center justify-center gap-2 text-amber-900 font-bold text-xs">
-                        <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
-                        <span>This gig has been paused and cannot be purchased</span>
-                      </div>
-                      <p className="text-[11px] text-amber-700">The seller has temporarily paused orders for this service.</p>
-                    </div>
-                  ) : (
-                    <button 
-                      disabled={isCreatingOrder}
-                      onClick={() => handleCreateOrder(
-                        `${currentGig.title}${selectedExtrasObjects.length > 0 ? ` (with ${selectedExtrasObjects.length} extra add-ons)` : ''}`, 
-                        totalUSD, 
-                        currentGig.freelancerId,
-                        currentGig.id,
-                        selectedExtras
-                      )}
-                      className={`w-full py-4 font-bold rounded-2xl transition-colors shadow-md text-xs flex items-center justify-center gap-2 ${
-                        isCreatingOrder
-                          ? 'bg-emerald-300 text-slate-800 cursor-wait'
-                          : 'bg-emerald-500 text-slate-950 hover:bg-emerald-400 cursor-pointer'
-                      }`}
+                  </div>
+                  {onDismissOrderFeedback && (
+                    <button
+                      type="button"
+                      onClick={onDismissOrderFeedback}
+                      className="text-[#74767E] hover:text-[#222325] cursor-pointer"
                     >
-                      {isCreatingOrder ? (
-                        <>
-                          <Loader2 className="w-4 h-4 animate-spin" />
-                          <span>Processing Escrow Order...</span>
-                        </>
-                      ) : (
-                        <>
-                          <Lock className="w-4 h-4" />
-                          <span>Fund in Escrow & Order Now</span>
-                        </>
-                      )}
+                      <X className="w-3.5 h-3.5" />
                     </button>
                   )}
-                </>
-              );
-            })()}
+                </div>
+              )}
+
+              {/* Action Buttons: Continue Button & Contact Seller */}
+              <div className="space-y-2.5 pt-1">
+                {currentGig.status === 'paused' ? (
+                  <div className="p-3 bg-amber-50 border border-amber-300 rounded text-center text-xs font-bold text-amber-900">
+                    This gig has been paused by the seller.
+                  </div>
+                ) : (
+                  <button 
+                    disabled={isCreatingOrder}
+                    onClick={() => handleCreateOrder(
+                      `${currentGig.title}${selectedExtrasObjects.length > 0 ? ` (+${selectedExtrasObjects.length} extras)` : ''}`, 
+                      totalOrderPrice, 
+                      currentGig.freelancerId,
+                      currentGig.id,
+                      selectedExtras
+                    )}
+                    className={`w-full py-3.5 font-bold rounded-md transition-all text-sm flex items-center justify-center gap-2 cursor-pointer shadow-xs ${
+                      isCreatingOrder
+                        ? 'bg-[#1DBF73]/50 text-white cursor-wait'
+                        : 'bg-[#1DBF73] hover:bg-[#19A463] text-white'
+                    }`}
+                  >
+                    {isCreatingOrder ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        <span>Securing Escrow Funds...</span>
+                      </>
+                    ) : (
+                      <>
+                        <span>Continue (${totalOrderPrice})</span>
+                        <ArrowRight className="w-4 h-4" />
+                      </>
+                    )}
+                  </button>
+                )}
+
+                <button 
+                  type="button"
+                  onClick={() => handleContactSeller(currentGig.freelancerId, currentGig.freelancerName, currentGig.title, currentGig.id)}
+                  className="w-full py-2.5 border border-[#E4E5E7] hover:border-[#222325] text-[#222325] font-bold rounded-md text-xs transition flex items-center justify-center gap-1.5 cursor-pointer bg-white"
+                >
+                  <MessageSquare className="w-3.5 h-3.5 text-[#74767E]" />
+                  <span>Contact Seller</span>
+                </button>
+              </div>
+            </div>
           </div>
         </div>
 
       </div>
 
-      {/* RELATED & SIMILAR GIGS SECTION */}
-      <RelatedGigsSection
-        currentGig={currentGig}
-        allGigs={gigs}
-        onNavigate={navigate}
-        maxItems={4}
-      />
+      {/* RELATED GIGS SECTION */}
+      <div className="mt-12 pt-8 border-t border-[#E4E5E7]">
+        <RelatedGigsSection
+          currentGig={currentGig}
+          allGigs={gigs}
+          onNavigate={navigate}
+          maxItems={4}
+        />
+      </div>
     </div>
   );
 };

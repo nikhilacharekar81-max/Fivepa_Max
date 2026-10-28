@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   ChevronLeft, ShieldCheck, Clock, CheckCircle2, AlertCircle, 
-  RotateCcw, Activity, FolderOpen, Send, Sparkles, MessageSquare, Video, Star, Receipt
+  RotateCcw, Activity, FolderOpen, Send, Sparkles, MessageSquare, Video, Star, Receipt, Check
 } from 'lucide-react';
 import { WorkstreamItem, WorkstreamMessage, SharedFileItem, WorkstreamSubTab } from './types';
 import { UserAccount, Order } from '../../types';
@@ -477,20 +477,116 @@ export const WorkstreamWorkspace: React.FC<WorkstreamWorkspaceProps> = ({
         </div>
       )}
 
+      {/* FIVERR HORIZONTAL ESCROW STEPPER */}
+      <div className="bg-white border border-[#E4E5E7] rounded-xl p-4 sm:p-5 shadow-xs">
+        <div className="max-w-4xl mx-auto">
+          <div className="flex items-center justify-between relative">
+            {/* Connecting Progress Track */}
+            <div className="absolute top-4 left-6 right-6 h-0.5 bg-[#E4E5E7] -z-0">
+              <div 
+                className="h-full bg-[#1DBF73] transition-all duration-500"
+                style={{
+                  width: order.status === 'completed' 
+                    ? '100%' 
+                    : order.status === 'delivered' 
+                    ? '75%' 
+                    : (order.status === 'in_progress' || order.status === 'work_in_progress')
+                    ? '50%'
+                    : '25%'
+                }}
+              />
+            </div>
+
+            {/* Step 1: Order Placed */}
+            <div className="flex flex-col items-center relative z-10 text-center">
+              <div className="w-8 h-8 rounded-full bg-[#1DBF73] text-white flex items-center justify-center font-bold text-xs ring-4 ring-white shadow-xs">
+                <Check className="w-4 h-4 stroke-[3]" />
+              </div>
+              <span className="text-[12px] font-bold text-[#222325] mt-2">Order Placed</span>
+              <span className="text-[10px] text-[#1DBF73] font-semibold">100% Escrow Funded</span>
+            </div>
+
+            {/* Step 2: Requirements */}
+            <div className="flex flex-col items-center relative z-10 text-center">
+              <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-xs ring-4 ring-white shadow-xs ${
+                order.status !== 'payment_pending'
+                  ? 'bg-[#1DBF73] text-white'
+                  : 'bg-white border-2 border-[#1DBF73] text-[#1DBF73]'
+              }`}>
+                {order.status !== 'payment_pending' ? <Check className="w-4 h-4 stroke-[3]" /> : '2'}
+              </div>
+              <span className="text-[12px] font-bold text-[#222325] mt-2">Requirements</span>
+              <span className="text-[10px] text-[#74767E]">Specs Submitted</span>
+            </div>
+
+            {/* Step 3: Work in Progress */}
+            <div className="flex flex-col items-center relative z-10 text-center">
+              <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-xs ring-4 ring-white shadow-xs ${
+                order.status === 'completed' || order.status === 'delivered'
+                  ? 'bg-[#1DBF73] text-white'
+                  : (order.status === 'in_progress' || order.status === 'work_in_progress')
+                  ? 'bg-[#1DBF73] text-white animate-pulse'
+                  : 'bg-white border-2 border-[#E4E5E7] text-[#74767E]'
+              }`}>
+                {order.status === 'completed' || order.status === 'delivered' ? (
+                  <Check className="w-4 h-4 stroke-[3]" />
+                ) : (
+                  '3'
+                )}
+              </div>
+              <span className="text-[12px] font-bold text-[#222325] mt-2">In Progress</span>
+              <span className="text-[10px] text-[#74767E]">Active Collaboration</span>
+            </div>
+
+            {/* Step 4: Delivery */}
+            <div className="flex flex-col items-center relative z-10 text-center">
+              <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-xs ring-4 ring-white shadow-xs ${
+                order.status === 'completed'
+                  ? 'bg-[#1DBF73] text-white'
+                  : order.status === 'delivered'
+                  ? 'bg-[#1DBF73] text-white ring-2 ring-[#1DBF73]/30'
+                  : 'bg-white border-2 border-[#E4E5E7] text-[#74767E]'
+              }`}>
+                {order.status === 'completed' ? (
+                  <Check className="w-4 h-4 stroke-[3]" />
+                ) : (
+                  '4'
+                )}
+              </div>
+              <span className="text-[12px] font-bold text-[#222325] mt-2">Delivered</span>
+              <span className="text-[10px] text-[#74767E]">Review & Inspect</span>
+            </div>
+
+            {/* Step 5: Completed */}
+            <div className="flex flex-col items-center relative z-10 text-center">
+              <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-xs ring-4 ring-white shadow-xs ${
+                order.status === 'completed'
+                  ? 'bg-[#1DBF73] text-white'
+                  : 'bg-white border-2 border-[#E4E5E7] text-[#74767E]'
+              }`}>
+                {order.status === 'completed' ? <Check className="w-4 h-4 stroke-[3]" /> : '5'}
+              </div>
+              <span className="text-[12px] font-bold text-[#222325] mt-2">Completed</span>
+              <span className="text-[10px] text-[#74767E]">Escrow Released</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
       {/* WORKSTREAM HEADER */}
-      <div className="bg-white border border-slate-200 rounded-3xl p-5 sm:p-6 shadow-xs flex flex-col gap-4">
+      <div className="bg-white border border-[#E4E5E7] rounded-xl p-5 sm:p-6 shadow-xs flex flex-col gap-4">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div className="flex items-center gap-3">
             <button
               onClick={onBack}
-              className="p-2 hover:bg-slate-100 rounded-xl text-slate-500 transition-colors cursor-pointer"
+              className="p-2 hover:bg-[#F5F5F5] rounded-lg text-[#74767E] transition-colors cursor-pointer"
               title="Back to All Workstreams"
             >
               <ChevronLeft className="w-5 h-5" />
             </button>
             <div>
               <div className="flex items-center gap-2 flex-wrap">
-                <h1 className="text-lg sm:text-xl font-bold text-fiverr-dark tracking-tight">
+                <h1 className="text-lg sm:text-xl font-bold text-[#222325] tracking-tight">
                   {order.title}
                 </h1>
                 {getStatusBadge()}
@@ -506,10 +602,10 @@ export const WorkstreamWorkspace: React.FC<WorkstreamWorkspaceProps> = ({
                   );
                 })()}
               </div>
-              <p className="text-xs text-slate-400 mt-0.5">
-                WorkStream #{order.id} • Partner: <strong className="text-fiverr-dark font-medium">{partner?.name || 'Collaborator'}</strong>
+              <p className="text-xs text-[#74767E] mt-0.5">
+                WorkStream #{order.id} • Partner: <strong className="text-[#222325] font-semibold">{partner?.name || 'Collaborator'}</strong>
                 {totalReleased > 0 && (
-                  <span className="ml-2 text-emerald-600 font-semibold">
+                  <span className="ml-2 text-[#1DBF73] font-bold">
                     • Paid: {currencySymbol}{totalReleased.toLocaleString()}
                   </span>
                 )}
@@ -521,7 +617,7 @@ export const WorkstreamWorkspace: React.FC<WorkstreamWorkspaceProps> = ({
             {isBuyer && activeEscrow > 0 && (order.status === 'delivered' || !!pendingInvoice) && (
               <button
                 onClick={() => setIsReleaseModalOpen(true)}
-                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-xs transition cursor-pointer"
+                className="px-4 py-2 bg-[#1DBF73] hover:bg-[#19A463] text-white font-bold rounded-lg text-xs flex items-center gap-1.5 shadow-xs transition cursor-pointer"
               >
                 <ShieldCheck className="w-4 h-4" />
                 <span>{pendingInvoice ? `Pay Invoice (${pendingInvoice.number})` : 'Release Escrow'}</span>
@@ -531,9 +627,9 @@ export const WorkstreamWorkspace: React.FC<WorkstreamWorkspaceProps> = ({
             {isBuyer && (invoiceAlreadyPaid || order.status === 'cancelled') && !order.review && (
               <button
                 onClick={() => setIsReviewModalOpen(true)}
-                className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-xs transition cursor-pointer"
+                className="px-4 py-2 bg-[#FFBE5B] hover:bg-[#f5b24b] text-[#222325] font-bold rounded-lg text-xs flex items-center gap-1.5 shadow-xs transition cursor-pointer"
               >
-                <Star className="w-4 h-4 fill-white" />
+                <Star className="w-4 h-4 fill-[#222325]" />
                 <span>Review Seller</span>
               </button>
             )}
@@ -541,9 +637,9 @@ export const WorkstreamWorkspace: React.FC<WorkstreamWorkspaceProps> = ({
             {isSeller && (invoiceAlreadyPaid || order.status === 'cancelled') && !sellerReview && (
               <button
                 onClick={() => setIsReviewModalOpen(true)}
-                className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-xs transition cursor-pointer"
+                className="px-4 py-2 bg-[#FFBE5B] hover:bg-[#f5b24b] text-[#222325] font-bold rounded-lg text-xs flex items-center gap-1.5 shadow-xs transition cursor-pointer"
               >
-                <Star className="w-4 h-4 fill-white" />
+                <Star className="w-4 h-4 fill-[#222325]" />
                 <span>Review Buyer</span>
               </button>
             )}
@@ -551,18 +647,18 @@ export const WorkstreamWorkspace: React.FC<WorkstreamWorkspaceProps> = ({
             {isSeller && activeEscrow > 0 && order.status !== 'cancelled' && (
               <button
                 onClick={() => setIsDeliverModalOpen(true)}
-                className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-xs transition cursor-pointer"
+                className="px-4 py-2 bg-[#222325] hover:bg-black text-white font-bold rounded-lg text-xs flex items-center gap-1.5 shadow-xs transition cursor-pointer"
               >
-                <Receipt className="w-3.5 h-3.5 text-emerald-400" />
+                <Receipt className="w-3.5 h-3.5 text-[#1DBF73]" />
                 <span>Raise Invoice & Deliver</span>
               </button>
             )}
             {isSeller && order.status !== 'cancelled' && order.status !== 'completed' && !order.freeExtensionUsed && !order.extensionRequests?.some(r => r.status === 'pending') && (
               <button
                 onClick={() => setIsExtensionModalOpen(true)}
-                className="px-4 py-2 bg-white hover:bg-slate-50 text-slate-900 border border-slate-200 font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-xs transition cursor-pointer"
+                className="px-4 py-2 bg-white hover:bg-[#F5F5F5] text-[#222325] border border-[#E4E5E7] font-bold rounded-lg text-xs flex items-center gap-1.5 shadow-xs transition cursor-pointer"
               >
-                <Clock className="w-3.5 h-3.5 text-slate-400" />
+                <Clock className="w-3.5 h-3.5 text-[#74767E]" />
                 <span>Request more time</span>
               </button>
             )}

@@ -1129,7 +1129,7 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col font-sans text-slate-800 antialiased selection:bg-emerald-500 selection:text-white">
+    <div className="min-h-screen bg-[#FFFFFF] flex flex-col font-sans text-[#404145] antialiased selection:bg-[#1DBF73] selection:text-white">
       {/* Impersonation Banner for Super Admin */}
       <ImpersonationBanner
         impersonatedUser={impersonatedUser}
@@ -1156,6 +1156,8 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
         onOpenLogin={() => setIsLoginModalOpen(true)}
         onOpenSignup={() => setIsSignupModalOpen(true)}
         onOpenSwitchUser={() => setIsUserSwitchModalOpen(true)}
+        searchQuery={searchQuery}
+        setSearchQuery={setSearchQuery}
       />
 
       {/* Order Purchase Status Banner */}
