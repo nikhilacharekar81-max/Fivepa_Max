@@ -24,6 +24,44 @@ import type { Gig } from '../../src/types.js';
 
 export const gigRouter = Router();
 
+export function parseAndValidateExtraDeliveryDays(rawDays: any): { valid: boolean; value: number; error?: string } {
+  if (rawDays === undefined || rawDays === '') {
+    return { valid: true, value: 0 };
+  }
+
+  if (typeof rawDays === 'string' && rawDays.trim() === '') {
+    return { valid: true, value: 0 };
+  }
+
+  if (typeof rawDays === 'boolean' || rawDays === null || typeof rawDays === 'object') {
+    return {
+      valid: false,
+      value: 0,
+      error: 'Extra delivery days must be a whole number between 0 and 365.'
+    };
+  }
+
+  const num = Number(rawDays);
+
+  if (!Number.isFinite(num) || !Number.isInteger(num)) {
+    return {
+      valid: false,
+      value: 0,
+      error: 'Extra delivery days must be a whole number between 0 and 365.'
+    };
+  }
+
+  if (num < 0 || num > 365) {
+    return {
+      valid: false,
+      value: 0,
+      error: 'Extra delivery days must be a whole number between 0 and 365.'
+    };
+  }
+
+  return { valid: true, value: num };
+}
+
 // Public gigs list
 gigRouter.get('/gigs', async (req: Request, res: Response) => {
   try {
@@ -126,12 +164,21 @@ gigRouter.post('/gigs', requireAuth, requireActiveStatus, async (req: Request, r
   const image = (typeof rawImage === 'string' && !/^\s*(javascript:|vbscript:|data:(?!image\/))/i.test(rawImage)) ? rawImage : defaultImage;
   let extras: { id: string; title: string; price: number; deliveryDays: number }[] = [];
   if (Array.isArray(req.body.extras)) {
-    extras = req.body.extras.slice(0, 20).map((ex: any, idx: number) => ({
-      id: String(ex?.id || `extra_${Date.now()}_${idx}`),
-      title: String(ex?.title || '').slice(0, 200),
-      price: Math.round(Math.min(100000, Math.max(0, Number(ex?.price) || 0)) * 100) / 100,
-      deliveryDays: Math.min(365, Math.max(0, Math.round(Number(ex?.deliveryDays ?? ex?.delivery_days)) || 0))
-    }));
+    const rawExtras = req.body.extras.slice(0, 20);
+    for (let idx = 0; idx < rawExtras.length; idx++) {
+      const ex = rawExtras[idx];
+      const rawDays = ex?.deliveryDays !== undefined ? ex.deliveryDays : ex?.delivery_days;
+      const daysCheck = parseAndValidateExtraDeliveryDays(rawDays);
+      if (!daysCheck.valid) {
+        return res.status(400).json({ error: daysCheck.error || 'Extra delivery days must be a whole number between 0 and 365.' });
+      }
+      extras.push({
+        id: String(ex?.id || `extra_${Date.now()}_${idx}`),
+        title: String(ex?.title || '').slice(0, 200),
+        price: Math.round(Math.min(100000, Math.max(0, Number(ex?.price) || 0)) * 100) / 100,
+        deliveryDays: daysCheck.value
+      });
+    }
   }
 
   const initialStatus = activeSettings.marketplace.gigModerationRequired ? 'moderation' : 'active';
@@ -225,12 +272,23 @@ const handleGigUpdate = async (req: Request, res: Response) => {
       updates.deliveryDays = Math.min(365, Math.max(1, Math.round(Number(req.body.deliveryDays)) || 7));
     }
     if (req.body.extras !== undefined && Array.isArray(req.body.extras)) {
-      updates.extras = req.body.extras.slice(0, 20).map((ex: any, idx: number) => ({
-        id: String(ex?.id || `extra_${Date.now()}_${idx}`),
-        title: String(ex?.title || '').slice(0, 200),
-        price: Math.round(Math.min(100000, Math.max(0, Number(ex?.price) || 0)) * 100) / 100,
-        deliveryDays: Math.min(365, Math.max(0, Math.round(Number(ex?.deliveryDays ?? ex?.delivery_days)) || 0))
-      }));
+      const parsedExtras: { id: string; title: string; price: number; deliveryDays: number }[] = [];
+      const rawExtras = req.body.extras.slice(0, 20);
+      for (let idx = 0; idx < rawExtras.length; idx++) {
+        const ex = rawExtras[idx];
+        const rawDays = ex?.deliveryDays !== undefined ? ex.deliveryDays : ex?.delivery_days;
+        const daysCheck = parseAndValidateExtraDeliveryDays(rawDays);
+        if (!daysCheck.valid) {
+          return res.status(400).json({ error: daysCheck.error || 'Extra delivery days must be a whole number between 0 and 365.' });
+        }
+        parsedExtras.push({
+          id: String(ex?.id || `extra_${Date.now()}_${idx}`),
+          title: String(ex?.title || '').slice(0, 200),
+          price: Math.round(Math.min(100000, Math.max(0, Number(ex?.price) || 0)) * 100) / 100,
+          deliveryDays: daysCheck.value
+        });
+      }
+      updates.extras = parsedExtras;
     }
     if (req.body.image !== undefined && typeof req.body.image === 'string') {
       const defaultImage = 'https://images.unsplash.com/photo-1498050108023-c5249f4df085?w=800&h=500&fit=crop';
