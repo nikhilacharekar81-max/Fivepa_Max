@@ -741,15 +741,19 @@ export class PostgresAsyncStore implements StoreInterface {
       );
     };
 
+    const isSlugConflict = (err: any) =>
+      err?.code === '23505' &&
+      (err?.constraint === 'idx_gigs_unique_slug' || String(err?.message || '').includes('idx_gigs_unique_slug'));
+
     try {
       await executeInsert(slug);
     } catch (err: any) {
-      if (err?.code === '23505' && (err?.constraint === 'idx_gigs_unique_slug' || String(err?.message || '').includes('slug'))) {
+      if (isSlugConflict(err)) {
         const fallbackSlug = `${slug}-${g.id}`;
         try {
           await executeInsert(fallbackSlug);
         } catch (retryErr: any) {
-          if (retryErr?.code === '23505' && (retryErr?.constraint === 'idx_gigs_unique_slug' || String(retryErr?.message || '').includes('slug'))) {
+          if (isSlugConflict(retryErr)) {
             await executeInsert(`${fallbackSlug}-${Date.now().toString(36)}`);
           } else {
             throw retryErr;
@@ -844,14 +848,18 @@ export class PostgresAsyncStore implements StoreInterface {
       if (res.rows.length === 0) return null;
       return mapGigRow(res.rows[0]);
     } catch (err: any) {
-      if (err?.code === '23505' && (err?.constraint === 'idx_gigs_unique_slug' || String(err?.message || '').includes('slug')) && updates.slug) {
+      const isSlugConflict = (e: any) =>
+        e?.code === '23505' &&
+        (e?.constraint === 'idx_gigs_unique_slug' || String(e?.message || '').includes('idx_gigs_unique_slug'));
+
+      if (isSlugConflict(err) && updates.slug) {
         const fallbackSlug = `${updates.slug}-${id}`;
         try {
           const res = await runUpdate(fallbackSlug);
           if (res.rows.length === 0) return null;
           return mapGigRow(res.rows[0]);
         } catch (retryErr: any) {
-          if (retryErr?.code === '23505' && (retryErr?.constraint === 'idx_gigs_unique_slug' || String(retryErr?.message || '').includes('slug'))) {
+          if (isSlugConflict(retryErr)) {
             const res = await runUpdate(`${fallbackSlug}-${Date.now().toString(36)}`);
             if (res.rows.length === 0) return null;
             return mapGigRow(res.rows[0]);

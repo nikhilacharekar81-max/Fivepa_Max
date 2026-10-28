@@ -107,16 +107,33 @@ export class MarketplaceRepo {
             );
           };
 
+          let savepointSeq = 0;
+          const attemptInsertWithSavepoint = async (targetSlug: string): Promise<void> => {
+            const spName = `sp_gig_${savepointSeq++}`;
+            await client.query(`SAVEPOINT ${spName}`);
+            try {
+              await executeRowInsert(targetSlug);
+              await client.query(`RELEASE SAVEPOINT ${spName}`);
+            } catch (err) {
+              await client.query(`ROLLBACK TO SAVEPOINT ${spName}`);
+              throw err;
+            }
+          };
+
+          const isSlugConflict = (err: any) =>
+            err?.code === '23505' &&
+            (err?.constraint === 'idx_gigs_unique_slug' || String(err?.message || '').includes('idx_gigs_unique_slug'));
+
           try {
-            await executeRowInsert(slug);
+            await attemptInsertWithSavepoint(slug);
           } catch (insertErr: any) {
-            if (insertErr?.code === '23505' && (insertErr?.constraint === 'idx_gigs_unique_slug' || String(insertErr?.message || '').includes('slug'))) {
+            if (isSlugConflict(insertErr)) {
               const fallbackSlug = `${slug}-${g.id}`;
               try {
-                await executeRowInsert(fallbackSlug);
+                await attemptInsertWithSavepoint(fallbackSlug);
               } catch (retryErr: any) {
-                if (retryErr?.code === '23505' && (retryErr?.constraint === 'idx_gigs_unique_slug' || String(retryErr?.message || '').includes('slug'))) {
-                  await executeRowInsert(`${fallbackSlug}-${Date.now().toString(36)}`);
+                if (isSlugConflict(retryErr)) {
+                  await attemptInsertWithSavepoint(`${fallbackSlug}-${Date.now().toString(36)}`);
                 } else {
                   throw retryErr;
                 }
@@ -220,14 +237,14 @@ export class MarketplaceRepo {
         if (res.rows.length === 0) return null;
         return mapGigRow(res.rows[0]);
       } catch (err: any) {
-        if (err?.code === '23505' && (err?.constraint === 'idx_gigs_unique_slug' || String(err?.message || '').includes('slug')) && updates.slug) {
+        if (err?.code === '23505' && (err?.constraint === 'idx_gigs_unique_slug' || String(err?.message || '').includes('idx_gigs_unique_slug')) && updates.slug) {
           const fallbackSlug = `${updates.slug}-${id}`;
           try {
             const res = await runUpdate(fallbackSlug);
             if (res.rows.length === 0) return null;
             return mapGigRow(res.rows[0]);
           } catch (retryErr: any) {
-            if (retryErr?.code === '23505' && (retryErr?.constraint === 'idx_gigs_unique_slug' || String(retryErr?.message || '').includes('slug'))) {
+            if (retryErr?.code === '23505' && (retryErr?.constraint === 'idx_gigs_unique_slug' || String(retryErr?.message || '').includes('idx_gigs_unique_slug'))) {
               const res = await runUpdate(`${fallbackSlug}-${Date.now().toString(36)}`);
               if (res.rows.length === 0) return null;
               return mapGigRow(res.rows[0]);
