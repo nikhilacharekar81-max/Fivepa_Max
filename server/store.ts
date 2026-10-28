@@ -329,12 +329,13 @@ export function mapGigRow(r: any): Gig {
       if (st === 'moderation') return 'moderation';
       return 'active';
     })(),
-    featured: Boolean(r.featured),
+    featured: Boolean(r.featured || r.is_featured),
+    isFeatured: Boolean(r.is_featured || r.featured),
     featuredUntil: r.featured_until || undefined,
     extras: typeof r.extras === 'string' ? JSON.parse(r.extras) : (r.extras || []),
     moderationStatus: r.moderation_status || 'approved',
     moderationNotes: r.moderation_notes || undefined
-  };
+  } as any;
 }
 
 export function mapProjectRow(r: any): Project {
@@ -661,9 +662,9 @@ export class PostgresAsyncStore implements StoreInterface {
       `INSERT INTO gigs (
         id, freelancer_id, freelancer_name, freelancer_username, freelancer_avatar, freelancer_level,
         title, slug, category, subcategory, description, price, delivery_days, rating, reviews_count,
-        image, cover_image, gallery, tags, status, featured, extras, moderation_status, moderation_notes
+        image, cover_image, gallery, tags, status, featured, is_featured, featured_until, extras, moderation_status, moderation_notes
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26
       )
       ON CONFLICT (id) DO UPDATE SET
         freelancer_id = EXCLUDED.freelancer_id,
@@ -686,13 +687,16 @@ export class PostgresAsyncStore implements StoreInterface {
         tags = EXCLUDED.tags,
         status = EXCLUDED.status,
         featured = EXCLUDED.featured,
+        is_featured = EXCLUDED.is_featured,
+        featured_until = COALESCE(EXCLUDED.featured_until, gigs.featured_until),
         extras = EXCLUDED.extras,
         moderation_status = EXCLUDED.moderation_status,
         moderation_notes = EXCLUDED.moderation_notes`,
       [
         g.id, g.freelancerId, g.freelancerName, g.freelancerUsername || null, g.freelancerAvatar || null, g.freelancerLevel || null,
         g.title, slug, g.category, g.subcategory || null, g.description || '', g.price, g.deliveryDays, g.rating ?? 5.0, g.reviewsCount ?? 0,
-        g.image || null, g.coverImage || null, g.gallery || [], g.tags || [], g.status || 'active', Boolean(g.featured),
+        g.image || null, g.coverImage || null, g.gallery || [], g.tags || [], g.status || 'active',
+        Boolean(g.featured), Boolean(g.featured || (g as any).isFeatured), (g as any).featuredUntil || null,
         JSON.stringify(g.extras || []), g.moderationStatus || 'approved', g.moderationNotes || null
       ]
     );

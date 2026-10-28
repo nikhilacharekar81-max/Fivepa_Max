@@ -283,6 +283,11 @@ router.put('/reviews/:id', requireAuth, async (req: Request, res: Response) => {
       recalculateUserRating(review.targetUserId);
     }
 
+    const targetGigId = review.gigId || (review.orderId ? (await store.getOrder(review.orderId))?.gigId : undefined);
+    if (targetGigId) {
+      await recalculateGigRating(targetGigId);
+    }
+
     if (review.orderId) {
       const order = await store.getOrder(review.orderId);
       if (order && order.review && order.review.id === review.id) {
