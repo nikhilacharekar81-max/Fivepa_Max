@@ -35,75 +35,96 @@ export class MarketplaceRepo {
             }
           } catch {}
 
-          await client.query(
-            `INSERT INTO gigs (
-              id, freelancer_id, freelancer_name, freelancer_username, freelancer_avatar, 
-              freelancer_level, title, slug, category, subcategory, description, price, 
-              delivery_days, rating, reviews_count, image, cover_image, gallery, tags, 
-              status, featured, is_featured, featured_until, extras, moderation_status, moderation_notes
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
-            ON CONFLICT (id) DO UPDATE SET
-              freelancer_id = EXCLUDED.freelancer_id,
-              freelancer_name = EXCLUDED.freelancer_name,
-              freelancer_username = EXCLUDED.freelancer_username,
-              freelancer_avatar = EXCLUDED.freelancer_avatar,
-              freelancer_level = EXCLUDED.freelancer_level,
-              title = EXCLUDED.title,
-              slug = EXCLUDED.slug,
-              category = EXCLUDED.category,
-              subcategory = EXCLUDED.subcategory,
-              description = EXCLUDED.description,
-              price = EXCLUDED.price,
-              delivery_days = EXCLUDED.delivery_days,
-              rating = COALESCE(gigs.rating, EXCLUDED.rating),
-              reviews_count = COALESCE(gigs.reviews_count, EXCLUDED.reviews_count),
-              image = EXCLUDED.image,
-              cover_image = EXCLUDED.cover_image,
-              gallery = EXCLUDED.gallery,
-              tags = EXCLUDED.tags,
-              status = CASE 
-                WHEN gigs.status = 'deleted' THEN 'deleted' 
-                WHEN gigs.moderation_status IN ('rejected', 'flagged') AND EXCLUDED.status = 'active' THEN gigs.status 
-                ELSE EXCLUDED.status 
-              END,
-              featured = (
-                CASE 
-                  WHEN (EXCLUDED.featured_until IS NOT NULL AND EXCLUDED.featured_until::timestamptz > NOW()) THEN TRUE
-                  WHEN (gigs.featured_until IS NOT NULL AND gigs.featured_until::timestamptz > NOW()) THEN TRUE
-                  ELSE FALSE
-                END
-              ),
-              is_featured = (
-                CASE 
-                  WHEN (EXCLUDED.featured_until IS NOT NULL AND EXCLUDED.featured_until::timestamptz > NOW()) THEN TRUE
-                  WHEN (gigs.featured_until IS NOT NULL AND gigs.featured_until::timestamptz > NOW()) THEN TRUE
-                  ELSE FALSE
-                END
-              ),
-              featured_until = (
-                CASE
-                  WHEN EXCLUDED.featured_until IS NOT NULL AND gigs.featured_until IS NOT NULL THEN
-                    CASE WHEN EXCLUDED.featured_until::timestamptz > gigs.featured_until::timestamptz THEN EXCLUDED.featured_until ELSE gigs.featured_until END
-                  WHEN EXCLUDED.featured_until IS NOT NULL THEN EXCLUDED.featured_until
-                  ELSE gigs.featured_until
-                END
-              ),
-              extras = EXCLUDED.extras,
-              moderation_status = CASE 
-                WHEN gigs.moderation_status IN ('rejected', 'flagged') AND EXCLUDED.moderation_status NOT IN ('rejected', 'flagged') THEN gigs.moderation_status 
-                ELSE EXCLUDED.moderation_status 
-              END,
-              moderation_notes = COALESCE(EXCLUDED.moderation_notes, gigs.moderation_notes)`,
-            [
-              g.id, g.freelancerId, g.freelancerName, g.freelancerUsername || null, g.freelancerAvatar || null,
-              g.freelancerLevel || null, g.title, slug, g.category, g.subcategory || null,
-              g.description || null, g.price, g.deliveryDays, g.rating ?? 5.0, g.reviewsCount ?? 0,
-              g.image || null, g.coverImage || null, g.gallery || [], g.tags || [],
-              g.status || 'active', !!g.featured, !!g.featured || !!(g as any).isFeatured, (g as any).featuredUntil || null,
-              JSON.stringify(g.extras || []),
-              g.moderationStatus || 'approved', g.moderationNotes || null
-            ]
-          );
+          const executeRowInsert = async (targetSlug: string) => {
+            await client.query(
+              `INSERT INTO gigs (
+                id, freelancer_id, freelancer_name, freelancer_username, freelancer_avatar, 
+                freelancer_level, title, slug, category, subcategory, description, price, 
+                delivery_days, rating, reviews_count, image, cover_image, gallery, tags, 
+                status, featured, is_featured, featured_until, extras, moderation_status, moderation_notes
+              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
+              ON CONFLICT (id) DO UPDATE SET
+                freelancer_id = EXCLUDED.freelancer_id,
+                freelancer_name = EXCLUDED.freelancer_name,
+                freelancer_username = EXCLUDED.freelancer_username,
+                freelancer_avatar = EXCLUDED.freelancer_avatar,
+                freelancer_level = EXCLUDED.freelancer_level,
+                title = EXCLUDED.title,
+                slug = EXCLUDED.slug,
+                category = EXCLUDED.category,
+                subcategory = EXCLUDED.subcategory,
+                description = EXCLUDED.description,
+                price = EXCLUDED.price,
+                delivery_days = EXCLUDED.delivery_days,
+                rating = COALESCE(gigs.rating, EXCLUDED.rating),
+                reviews_count = COALESCE(gigs.reviews_count, EXCLUDED.reviews_count),
+                image = EXCLUDED.image,
+                cover_image = EXCLUDED.cover_image,
+                gallery = EXCLUDED.gallery,
+                tags = EXCLUDED.tags,
+                status = CASE 
+                  WHEN gigs.status = 'deleted' THEN 'deleted' 
+                  WHEN gigs.moderation_status IN ('rejected', 'flagged') AND EXCLUDED.status = 'active' THEN gigs.status 
+                  ELSE EXCLUDED.status 
+                END,
+                featured = (
+                  CASE 
+                    WHEN (EXCLUDED.featured_until IS NOT NULL AND EXCLUDED.featured_until::timestamptz > NOW()) THEN TRUE
+                    WHEN (gigs.featured_until IS NOT NULL AND gigs.featured_until::timestamptz > NOW()) THEN TRUE
+                    ELSE FALSE
+                  END
+                ),
+                is_featured = (
+                  CASE 
+                    WHEN (EXCLUDED.featured_until IS NOT NULL AND EXCLUDED.featured_until::timestamptz > NOW()) THEN TRUE
+                    WHEN (gigs.featured_until IS NOT NULL AND gigs.featured_until::timestamptz > NOW()) THEN TRUE
+                    ELSE FALSE
+                  END
+                ),
+                featured_until = (
+                  CASE
+                    WHEN EXCLUDED.featured_until IS NOT NULL AND gigs.featured_until IS NOT NULL THEN
+                      CASE WHEN EXCLUDED.featured_until::timestamptz > gigs.featured_until::timestamptz THEN EXCLUDED.featured_until ELSE gigs.featured_until END
+                    WHEN EXCLUDED.featured_until IS NOT NULL THEN EXCLUDED.featured_until
+                    ELSE gigs.featured_until
+                  END
+                ),
+                extras = EXCLUDED.extras,
+                moderation_status = CASE 
+                  WHEN gigs.moderation_status IN ('rejected', 'flagged') AND EXCLUDED.moderation_status NOT IN ('rejected', 'flagged') THEN gigs.moderation_status 
+                  ELSE EXCLUDED.moderation_status 
+                END,
+                moderation_notes = COALESCE(EXCLUDED.moderation_notes, gigs.moderation_notes)`,
+              [
+                g.id, g.freelancerId, g.freelancerName, g.freelancerUsername || null, g.freelancerAvatar || null,
+                g.freelancerLevel || null, g.title, targetSlug, g.category, g.subcategory || null,
+                g.description || null, g.price, g.deliveryDays, g.rating ?? 5.0, g.reviewsCount ?? 0,
+                g.image || null, g.coverImage || null, g.gallery || [], g.tags || [],
+                g.status || 'active', !!g.featured, !!g.featured || !!(g as any).isFeatured, (g as any).featuredUntil || null,
+                JSON.stringify(g.extras || []),
+                g.moderationStatus || 'approved', g.moderationNotes || null
+              ]
+            );
+          };
+
+          try {
+            await executeRowInsert(slug);
+          } catch (insertErr: any) {
+            if (insertErr?.code === '23505' && (insertErr?.constraint === 'idx_gigs_unique_slug' || String(insertErr?.message || '').includes('slug'))) {
+              const fallbackSlug = `${slug}-${g.id}`;
+              try {
+                await executeRowInsert(fallbackSlug);
+              } catch (retryErr: any) {
+                if (retryErr?.code === '23505' && (retryErr?.constraint === 'idx_gigs_unique_slug' || String(retryErr?.message || '').includes('slug'))) {
+                  await executeRowInsert(`${fallbackSlug}-${Date.now().toString(36)}`);
+                } else {
+                  throw retryErr;
+                }
+              }
+            } else {
+              throw insertErr;
+            }
+          }
         }
         await client.query('COMMIT');
       } catch (e) {
@@ -172,16 +193,50 @@ export class MarketplaceRepo {
         idx++;
       }
 
-      const query = `
-        UPDATE gigs
-        SET ${setClauses.join(', ')}
-        ${whereClause}
-        RETURNING *
-      `;
+      const runUpdate = async (overrideSlug?: string) => {
+        const localClauses = [...setClauses];
+        const localValues = [...values];
+        if (overrideSlug !== undefined) {
+          const slugIdx = localClauses.findIndex(c => c.startsWith('slug = '));
+          if (slugIdx >= 0) {
+            const match = localClauses[slugIdx].match(/\$(\d+)/);
+            if (match) {
+              const paramNum = parseInt(match[1], 10);
+              localValues[paramNum - 1] = overrideSlug;
+            }
+          }
+        }
+        const query = `
+          UPDATE gigs
+          SET ${localClauses.join(', ')}
+          ${whereClause}
+          RETURNING *
+        `;
+        return await this.ctx.getPool().query(query, localValues);
+      };
 
-      const res = await this.ctx.getPool().query(query, values);
-      if (res.rows.length === 0) return null;
-      return mapGigRow(res.rows[0]);
+      try {
+        const res = await runUpdate();
+        if (res.rows.length === 0) return null;
+        return mapGigRow(res.rows[0]);
+      } catch (err: any) {
+        if (err?.code === '23505' && (err?.constraint === 'idx_gigs_unique_slug' || String(err?.message || '').includes('slug')) && updates.slug) {
+          const fallbackSlug = `${updates.slug}-${id}`;
+          try {
+            const res = await runUpdate(fallbackSlug);
+            if (res.rows.length === 0) return null;
+            return mapGigRow(res.rows[0]);
+          } catch (retryErr: any) {
+            if (retryErr?.code === '23505' && (retryErr?.constraint === 'idx_gigs_unique_slug' || String(retryErr?.message || '').includes('slug'))) {
+              const res = await runUpdate(`${fallbackSlug}-${Date.now().toString(36)}`);
+              if (res.rows.length === 0) return null;
+              return mapGigRow(res.rows[0]);
+            }
+            throw retryErr;
+          }
+        }
+        throw err;
+      }
     });
   }
 
@@ -199,10 +254,10 @@ export class MarketplaceRepo {
   }
 
   async getGig(idOrSlug: string): Promise<Gig | null> {
-    let res = await this.ctx.getPool().query('SELECT * FROM gigs WHERE id = $1 OR slug = $1', [idOrSlug]);
+    let res = await this.ctx.getPool().query('SELECT * FROM gigs WHERE id = $1 OR slug = $1 ORDER BY (CASE WHEN id = $1 THEN 0 ELSE 1 END) ASC LIMIT 1', [idOrSlug]);
     if (res.rows.length === 0) {
       await seedDefaultGigsIfNeeded(this.ctx.getPool());
-      res = await this.ctx.getPool().query('SELECT * FROM gigs WHERE id = $1 OR slug = $1', [idOrSlug]);
+      res = await this.ctx.getPool().query('SELECT * FROM gigs WHERE id = $1 OR slug = $1 ORDER BY (CASE WHEN id = $1 THEN 0 ELSE 1 END) ASC LIMIT 1', [idOrSlug]);
     }
     return res.rows.length > 0 ? mapGigRow(res.rows[0]) : null;
   }

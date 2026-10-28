@@ -595,7 +595,10 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
       setIsCreatingOrder(true);
       setOrderFeedback(null);
 
-      const payloadKey = `fivepa_patt_${activeUser.id}_${sellerId}_${gigId || 'custom'}_${encodeURIComponent(orderTitle)}_${priceUSD}_${Array.isArray(extraIds) ? [...extraIds].sort().join(',') : ''}`;
+      const normalizedExtraIds = Array.isArray(extraIds)
+        ? Array.from(new Set(extraIds.map(String).filter(Boolean))).sort()
+        : [];
+      const payloadKey = `fivepa_patt_${activeUser.id}_${sellerId}_${gigId || 'custom'}_${encodeURIComponent(orderTitle)}_${priceUSD}_${normalizedExtraIds.join(',')}`;
       let clientRequestId = '';
       try {
         clientRequestId = sessionStorage.getItem(payloadKey) || '';
@@ -637,7 +640,7 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
               buyerId: activeUser.id,
               sellerId,
               gigId,
-              extraIds
+              extraIds: normalizedExtraIds
             })
           });
 
@@ -666,7 +669,7 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
         } else {
           const errData = await res.json().catch(() => ({}));
           const errMsg = errData.error || errData.message || `Failed to place order (HTTP ${res.status})`;
-          if (res.status === 400 || res.status === 403 || res.status === 422) {
+          if (res.status === 400 || res.status === 403 || res.status === 409 || res.status === 422) {
             try { sessionStorage.removeItem(payloadKey); } catch {}
           }
           setOrderFeedback({

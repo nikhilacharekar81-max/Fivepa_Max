@@ -187,21 +187,25 @@ const handleGigUpdate = async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Deleted gigs cannot be edited or restored.' });
     }
 
-    let title = g.title;
-    let category = g.category;
-    let subcategory = g.subcategory;
-    let description = g.description;
-    let price = g.price;
-    let deliveryDays = g.deliveryDays;
-    let extras = g.extras;
-    let image = g.image;
-    let status: Gig['status'] = g.status;
-    let moderationStatus = g.moderationStatus;
+    const updates: Record<string, any> = {};
 
-    if (req.body.title !== undefined) title = String(req.body.title).trim().slice(0, 300);
-    if (req.body.category !== undefined && typeof req.body.category === 'string') category = req.body.category.trim().slice(0, 100);
-    if (req.body.subcategory !== undefined && typeof req.body.subcategory === 'string') subcategory = req.body.subcategory.trim().slice(0, 100);
-    if (req.body.description !== undefined) description = String(req.body.description).trim();
+    if (req.body.title !== undefined) {
+      const newTitle = String(req.body.title).trim().slice(0, 300);
+      updates.title = newTitle;
+      const candidateSlug = newTitle.toLowerCase().replace(/[^\w\s-]/g, '').replace(/[\s_-]+/g, '-').replace(/^-+|-+$/g, '') || `gig-${g.id}`;
+      if (candidateSlug !== g.slug) {
+        updates.slug = candidateSlug;
+      }
+    }
+    if (req.body.category !== undefined && typeof req.body.category === 'string') {
+      updates.category = req.body.category.trim().slice(0, 100);
+    }
+    if (req.body.subcategory !== undefined && typeof req.body.subcategory === 'string') {
+      updates.subcategory = req.body.subcategory.trim().slice(0, 100);
+    }
+    if (req.body.description !== undefined) {
+      updates.description = String(req.body.description).trim();
+    }
     if (req.body.price !== undefined) {
       const newPrice = Number(req.body.price);
       if (!Number.isFinite(newPrice)) return res.status(400).json({ error: 'Gig price must be a valid number.' });
@@ -214,13 +218,13 @@ const handleGigUpdate = async (req: Request, res: Response) => {
       if (newPrice > maxGigPrice) {
         return res.status(400).json({ error: `Gig price ($${newPrice}) cannot exceed the platform maximum of $${maxGigPrice}.` });
       }
-      price = newPrice;
+      updates.price = newPrice;
     }
     if (req.body.deliveryDays !== undefined) {
-      deliveryDays = Math.min(365, Math.max(1, Math.round(Number(req.body.deliveryDays)) || 7));
+      updates.deliveryDays = Math.min(365, Math.max(1, Math.round(Number(req.body.deliveryDays)) || 7));
     }
     if (req.body.extras !== undefined && Array.isArray(req.body.extras)) {
-      extras = req.body.extras.slice(0, 20).map((ex: any, idx: number) => ({
+      updates.extras = req.body.extras.slice(0, 20).map((ex: any, idx: number) => ({
         id: String(ex?.id || `extra_${Date.now()}_${idx}`),
         title: String(ex?.title || '').slice(0, 200),
         price: Math.round(Math.min(100000, Math.max(0, Number(ex?.price) || 0)) * 100) / 100
@@ -228,8 +232,14 @@ const handleGigUpdate = async (req: Request, res: Response) => {
     }
     if (req.body.image !== undefined && typeof req.body.image === 'string') {
       const defaultImage = 'https://images.unsplash.com/photo-1498050108023-c5249f4df085?w=800&h=500&fit=crop';
-      image = /^\s*(javascript:|vbscript:|data:(?!image\/))/i.test(req.body.image) ? defaultImage : req.body.image;
+      updates.image = /^\s*(javascript:|vbscript:|data:(?!image\/))/i.test(req.body.image) ? defaultImage : req.body.image;
     }
+
+    const activeSettings = siteSettings.getSettings();
+    const isMaterialEdit = (updates.title !== undefined && updates.title !== g.title) ||
+      (updates.description !== undefined && updates.description !== g.description) ||
+      (updates.image !== undefined && updates.image !== g.image) ||
+      (updates.price !== undefined && updates.price !== g.price);
 
     if (req.body.status !== undefined) {
       const requestedStatus = String(req.body.status).toLowerCase().trim();
@@ -237,53 +247,30 @@ const handleGigUpdate = async (req: Request, res: Response) => {
         return res.status(400).json({ error: 'Invalid status. Sellers can only set status to active, paused, or deleted.' });
       }
 
-      const activeSettings = siteSettings.getSettings();
-
       if (requestedStatus === 'active') {
-        if (moderationStatus === 'rejected' || moderationStatus === 'flagged') {
+        if (g.moderationStatus === 'rejected' || g.moderationStatus === 'flagged') {
           return res.status(400).json({ error: 'This gig has been rejected or flagged by moderators and cannot be activated until reviewed and approved by an administrator.' });
         }
 
-        if (activeSettings.marketplace?.gigModerationRequired && moderationStatus !== 'approved') {
-          status = 'moderation';
-          moderationStatus = 'pending';
+        if (activeSettings.marketplace?.gigModerationRequired && g.moderationStatus !== 'approved') {
+          updates.status = 'moderation';
+          updates.moderationStatus = 'pending';
         } else {
-          status = 'active';
+          updates.status = 'active';
         }
       } else if (requestedStatus === 'paused') {
-        status = 'paused';
+        updates.status = 'paused';
       } else if (requestedStatus === 'deleted') {
-        status = 'deleted';
+        updates.status = 'deleted';
       }
-    } else {
-      // Editing details preserves existing status
-      status = g.status;
-    }
-
-    const isMaterialEdit = title !== g.title || description !== g.description || image !== g.image || price !== g.price;
-    const activeSettings = siteSettings.getSettings();
-    if (isMaterialEdit && activeSettings.marketplace?.gigModerationRequired) {
-      moderationStatus = 'pending';
-      if (status === 'active') {
-        status = 'moderation';
+    } else if (isMaterialEdit && activeSettings.marketplace?.gigModerationRequired) {
+      updates.moderationStatus = 'pending';
+      if (g.status === 'active') {
+        updates.status = 'moderation';
       }
     }
 
-    const updatedSlug = req.body.title ? (String(req.body.title).toLowerCase().trim().replace(/[^\w\s-]/g, '').replace(/[\s_-]+/g, '-').replace(/^-+|-+$/g, '') || `gig-${g.id}`) : g.slug;
-
-    const updatedGig = await store.updateGig(g.id, {
-      title,
-      slug: updatedSlug,
-      category,
-      subcategory,
-      description,
-      price,
-      deliveryDays,
-      extras,
-      image,
-      status,
-      moderationStatus
-    }, caller.id);
+    const updatedGig = await store.updateGig(g.id, updates, caller.id);
 
     if (!updatedGig) {
       return res.status(404).json({ error: 'Gig not found or cannot be updated.' });
@@ -294,8 +281,8 @@ const handleGigUpdate = async (req: Request, res: Response) => {
       actor: caller.name,
       role: caller.role,
       action: 'GIG_UPDATED',
-      target: `Gig "${title}"`,
-      details: `Updated gig details/status to "${status}" (moderation: ${moderationStatus || 'approved'})`,
+      target: `Gig "${updatedGig.title}"`,
+      details: `Updated gig fields: ${Object.keys(updates).join(', ')}`,
       timestamp: new Date().toLocaleString()
     });
 

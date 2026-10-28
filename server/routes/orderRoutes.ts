@@ -234,11 +234,15 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
       : 'ord_' + randomUUID().slice(0, 12);
     const today = new Date().toISOString().split('T')[0];
 
+    const normalizedExtraIds = Array.isArray(req.body?.extraIds)
+      ? Array.from(new Set(req.body.extraIds.map(String).filter(Boolean))).sort()
+      : [];
+
     let resolvedGigRow: any = null;
     let selectedExtrasDetails: any[] = [];
     if (req.body?.gigId) {
       if (!isInquiry) {
-        const { gig: gigRow, gigPrice, selectedExtrasDetails: resolvedExtras } = await resolveGigOrderPrice(req.body.gigId, req.body?.extraIds);
+        const { gig: gigRow, gigPrice, selectedExtrasDetails: resolvedExtras } = await resolveGigOrderPrice(req.body.gigId, normalizedExtraIds);
         resolvedGigRow = gigRow;
         selectedExtrasDetails = resolvedExtras || [];
         if (gigRow.freelancer_id !== sellerId) {
@@ -295,7 +299,7 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
       gigId: req.body?.gigId || null,
       projectId: req.body?.projectId || null,
       proposalId: req.body?.proposalId || null,
-      extraIds: Array.isArray(req.body?.extraIds) ? [...req.body.extraIds].map(String).sort() : null,
+      extraIds: normalizedExtraIds,
       amount: isInquiry ? 0 : rawAmount,
       isInquiry
     };
