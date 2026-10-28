@@ -827,25 +827,8 @@ router.post('/orders/:id/deliverable', requireAuth, requireActiveStatus, async (
   if (!tryAcquireOrderLock(orderId, res)) return;
 
   try {
-    const order = await store.getOrder(orderId);
-    if (!order) return res.status(404).json({ error: 'Order not found' });
     const authUserId = (req as any).authenticatedUserId;
     const caller = await store.getUser(authUserId);
-    const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin';
-    if (!isAdmin && order.sellerId !== authUserId) {
-      return res.status(403).json({ error: 'Forbidden: Only the seller or an administrator can submit deliverables.' });
-    }
-
-    const allowedStatuses = ['funded_in_escrow', 'in_progress', 'revision', 'draft_review', 'delivered', 'work_in_progress', 'late'];
-    if (!allowedStatuses.includes(order.status)) {
-      return res.status(409).json({ error: `Cannot submit a deliverable for an order in "${order.status}" status.` });
-    }
-    if (order.status === 'completed') {
-      return res.status(400).json({ error: 'Cannot submit a deliverable for a completed order.' });
-    }
-
-    if (!order.deliverableFiles) order.deliverableFiles = [];
-    if (!order.deliveryHistory) order.deliveryHistory = [];
 
     const rawFiles = Array.isArray(req.body.files) && req.body.files.length > 0 
       ? req.body.files 
@@ -863,68 +846,147 @@ router.post('/orders/:id/deliverable', requireAuth, requireActiveStatus, async (
       return res.status(400).json({ error: 'Add a file, a URL/reference, or a written completion message to submit a delivery.' });
     }
 
-    let validatedFiles: Array<{ name: string; size: string; url: string }> = [];
     if (rawFiles.length > 0) {
-      const validation = await validateStoredWorkstreamFiles(rawFiles, caller, order.id);
+      const validation = await validateStoredWorkstreamFiles(rawFiles, caller, orderId);
       if (!validation.ok) {
         return res.status((validation as any).status || 400).json({ error: (validation as any).error });
       }
-      validatedFiles = validation.files;
     }
 
-    const isDraft = Boolean(req.body.isDraft);
-    const uploadedFiles = validatedFiles.map((f: any, idx: number) => ({
-      id: 'deliv_' + Date.now() + '_' + idx,
-      name: f.name,
-      size: f.size,
-      url: f.url,
-      uploadedAt: new Date().toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }),
-      type: isDraft ? 'draft' : 'deliverable'
-    }));
+    const txResult = await postgresStore.executeInTransaction(async (client) => {
+      const orderRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+      if (orderRes.rows.length === 0) {
+        const err: any = new Error('Order not found');
+        err.status = 404;
+        throw err;
+      }
 
-    if (!isDraft) {
-      order.deliverableFiles = [...(order.deliverableFiles || []), ...uploadedFiles];
-    }
+      const orderRow = orderRes.rows[0];
+      const order = (store as any).mapOrderRow ? (store as any).mapOrderRow(orderRow) : await store.getOrder(orderId);
+      if (!order) {
+        const err: any = new Error('Order not found');
+        err.status = 404;
+        throw err;
+      }
 
-    const version = order.deliveryHistory.length + 1;
-    const deliveredAt = new Date().toISOString();
-    const projectResponseDeadline = order.orderType === 'project'
-      ? new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
-      : undefined;
+      const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin';
+      if (!isAdmin && order.sellerId !== authUserId) {
+        const err: any = new Error('Forbidden: Only the seller or an administrator can submit deliverables.');
+        err.status = 403;
+        throw err;
+      }
 
-    order.deliveryHistory.push({
-      version,
-      notes: trimmedNotes,
-      reference: trimmedReference || undefined,
-      files: uploadedFiles,
-      deliveredAt,
-      ...(projectResponseDeadline ? { responseDeadline: projectResponseDeadline } : {})
-    });
-    if (projectResponseDeadline) {
-      order.responseDeadline = projectResponseDeadline;
-    }
+      const allowedStatuses = ['funded_in_escrow', 'in_progress', 'revision', 'draft_review', 'delivered', 'work_in_progress', 'late'];
+      if (!allowedStatuses.includes(order.status)) {
+        const err: any = new Error(`Cannot submit a deliverable for an order in "${order.status}" status.`);
+        err.status = 409;
+        throw err;
+      }
+      if (order.status === 'completed') {
+        const err: any = new Error('Cannot submit a deliverable for a completed order.');
+        err.status = 400;
+        throw err;
+      }
 
-    let resolvedRevisionCount = 0;
-    if (order.revisions && order.revisions.length > 0) {
-      for (const rev of order.revisions) {
-        if (rev.status === 'requested') {
-          rev.status = 'resolved';
-          resolvedRevisionCount++;
+      if (!order.deliverableFiles) order.deliverableFiles = [];
+      if (!order.deliveryHistory) order.deliveryHistory = [];
+
+      let validatedFiles: Array<{ name: string; size: string; url: string }> = [];
+      if (rawFiles.length > 0) {
+        const validation = await validateStoredWorkstreamFiles(rawFiles, caller, order.id);
+        if (!validation.ok) {
+          const err: any = new Error((validation as any).error);
+          err.status = (validation as any).status || 400;
+          throw err;
+        }
+        validatedFiles = validation.files;
+      }
+
+      const isDraft = Boolean(req.body.isDraft);
+      const uploadedFiles = validatedFiles.map((f: any, idx: number) => ({
+        id: 'deliv_' + Date.now() + '_' + idx,
+        name: f.name,
+        size: f.size,
+        url: f.url,
+        uploadedAt: new Date().toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }),
+        type: isDraft ? 'draft' : 'deliverable'
+      }));
+
+      if (!isDraft) {
+        order.deliverableFiles = [...(order.deliverableFiles || []), ...uploadedFiles];
+      }
+
+      const version = order.deliveryHistory.length + 1;
+      const deliveredAt = new Date().toISOString();
+      const projectResponseDeadline = order.orderType === 'project'
+        ? new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
+        : undefined;
+
+      order.deliveryHistory.push({
+        version,
+        notes: trimmedNotes,
+        reference: trimmedReference || undefined,
+        files: uploadedFiles,
+        deliveredAt,
+        ...(projectResponseDeadline ? { responseDeadline: projectResponseDeadline } : {})
+      });
+      if (projectResponseDeadline) {
+        order.responseDeadline = projectResponseDeadline;
+      }
+
+      let resolvedRevisionCount = 0;
+      if (order.revisions && order.revisions.length > 0) {
+        for (const rev of order.revisions) {
+          if (rev.status === 'requested') {
+            rev.status = 'resolved';
+            resolvedRevisionCount++;
+          }
         }
       }
-    }
 
-    const success = await store.updateOrderStatus(orderId, {
-      status: isDraft ? 'draft_review' : 'delivered',
-      deliverable_files: JSON.stringify(order.deliverableFiles),
-      delivery_history: JSON.stringify(order.deliveryHistory),
-      delivery_notes: trimmedNotes,
-      delivery_reference: trimmedReference,
-      revisions: JSON.stringify(order.revisions),
-      response_deadline: order.responseDeadline || null
-    }, allowedStatuses);
+      const updateRes = await client.query(
+        `UPDATE orders 
+         SET status = $1, 
+             deliverable_files = $2, 
+             delivery_history = $3, 
+             delivery_notes = $4, 
+             delivery_reference = $5, 
+             revisions = $6, 
+             response_deadline = $7 
+         WHERE id = $8 AND status = ANY($9)`,
+        [
+          isDraft ? 'draft_review' : 'delivered',
+          JSON.stringify(order.deliverableFiles),
+          JSON.stringify(order.deliveryHistory),
+          trimmedNotes,
+          trimmedReference,
+          JSON.stringify(order.revisions),
+          order.responseDeadline || null,
+          orderId,
+          allowedStatuses
+        ]
+      );
 
-    if (!success) return res.status(409).json({ error: 'Order state changed concurrently. Please retry.' });
+      if (updateRes.rowCount === 0) {
+        const err: any = new Error('Order state changed concurrently. Please retry.');
+        err.status = 409;
+        throw err;
+      }
+
+      order.status = isDraft ? 'draft_review' : 'delivered';
+
+      return {
+        order,
+        version,
+        isDraft,
+        uploadedFiles,
+        trimmedNotes,
+        trimmedReference,
+        resolvedRevisionCount
+      };
+    });
+
+    const { order, version, isDraft, uploadedFiles, resolvedRevisionCount } = txResult;
 
     if (resolvedRevisionCount > 0) {
       await emitSystemEvent(order.id, 'revision_resolved', `📝 Revision resolved via Delivery #v${version}.`, {
@@ -1028,7 +1090,8 @@ router.post('/orders/:id/deliverable', requireAuth, requireActiveStatus, async (
 
     res.json({ success: true, files: uploadedFiles, file: uploadedFiles[0], offer: createdInvoiceOffer, order: enrichOrderWithServiceInfo(order) });
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    const status = err?.status || 400;
+    res.status(status).json({ error: err.message || 'Failed to submit deliverable' });
   } finally {
     releaseOrderLock(orderId);
   }

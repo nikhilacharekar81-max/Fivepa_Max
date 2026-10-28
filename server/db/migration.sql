@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS gigs (
 -- Canonical gig statuses: active, paused, moderation, deleted
 UPDATE gigs SET status = 'active' WHERE status = 'published';
 UPDATE gigs SET status = 'moderation' WHERE status IN ('pending', 'draft') OR (status NOT IN ('active', 'paused', 'deleted') AND moderation_status IN ('pending', 'rejected', 'flagged'));
-UPDATE gigs SET status = 'active' WHERE status NOT IN ('active', 'paused', 'moderation', 'deleted');
+UPDATE gigs SET status = 'moderation' WHERE status NOT IN ('active', 'paused', 'moderation', 'deleted');
 ALTER TABLE gigs ALTER COLUMN status SET DEFAULT 'active';
 
 CREATE TABLE IF NOT EXISTS projects (

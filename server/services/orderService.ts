@@ -323,8 +323,10 @@ export async function releaseOrderFunds(order: Order, actor: string, reason: str
   if (order.status === 'completed' && !requestKey) {
     throw new Error('Order is already completed; funds were already released.');
   }
-  assertOrderOpen(order);
-  
+  if (order.cancellationRequest && order.cancellationRequest.status === 'pending') {
+    throw new Error('Cannot release payment while a cancellation request is pending. The cancellation request must be resolved or rejected first.');
+  }
+
   const result = await financialTransactionService.releaseOrderFunds({
     orderId: order.id,
     actor,
@@ -341,10 +343,17 @@ export async function releaseOrderFunds(order: Order, actor: string, reason: str
   }
 
   await syncUserBalances([order.buyerId, order.sellerId].filter(Boolean));
-  await postgresStore.getPool().query(
-    'UPDATE orders SET status = $1, completed_at = COALESCE(completed_at, $2), accepted_version = COALESCE($3, accepted_version) WHERE id = $4 AND status != \'cancelled\'',
+  const updateRes = await postgresStore.getPool().query(
+    `UPDATE orders 
+     SET status = $1, completed_at = COALESCE(completed_at, $2), accepted_version = COALESCE($3, accepted_version) 
+     WHERE id = $4 
+       AND status NOT IN ('completed', 'cancelled')
+       AND (cancellation_request IS NULL OR cancellation_request->>'status' != 'pending')`,
     ['completed', order.completedAt, order.acceptedVersion ?? null, order.id]
   );
+  if (updateRes.rowCount === 0) {
+    throw new Error('Payment release failed: Order status changed or a cancellation request is pending.');
+  }
 
   if (approvedByBuyer) {
     await emitSystemEvent(order.id, 'deliverable_approved', `✅ Deliverables approved by buyer.`, {
@@ -448,6 +457,10 @@ export function validateOrderReleasePreconditions(order: Order, isAdmin = false,
   if (order.status === 'cancelled') {
     diagnosticService.log('security', 'orderService', 'validateOrderReleasePreconditions', 'server/services/orderService.ts', 'release_preconditions', 'INTERCEPTED', { orderId: order.id, status: order.status }, 'Order is cancelled; funds already refunded');
     return { status: 400, error: 'Order is cancelled; funds have been returned to the buyer.' };
+  }
+  if (order.cancellationRequest && order.cancellationRequest.status === 'pending') {
+    diagnosticService.log('security', 'orderService', 'validateOrderReleasePreconditions', 'server/services/orderService.ts', 'release_preconditions', 'INTERCEPTED', { orderId: order.id, cancellationRequest: order.cancellationRequest }, 'Cannot release payment while cancellation request is pending');
+    return { status: 400, error: 'Cannot release payment while a cancellation request is pending. The cancellation request must be resolved or rejected first.' };
   }
   if (!isAdmin && (order.status as string) === 'disputed') {
     diagnosticService.log('security', 'orderService', 'validateOrderReleasePreconditions', 'server/services/orderService.ts', 'release_preconditions', 'INTERCEPTED', { orderId: order.id, status: order.status }, 'Cannot release payment while dispute is open');
@@ -660,14 +673,27 @@ export async function processAutoAcceptOrders(customNow?: number): Promise<Array
 
       const requestKey = `auto_accept_${order.id}_v${latestDelivery.version}`;
       try {
+        const lockRes = await pool.query(
+          "SELECT * FROM orders WHERE id = $1 AND status = 'delivered' FOR UPDATE",
+          [order.id]
+        );
+        if (lockRes.rows.length === 0) continue;
+        const freshRow = lockRes.rows[0];
+
+        let cancelReq = freshRow.cancellation_request;
+        if (typeof cancelReq === 'string') {
+          try { cancelReq = JSON.parse(cancelReq); } catch {}
+        }
+        if (cancelReq && cancelReq.status === 'pending') continue;
+
+        let revs = freshRow.revisions;
+        if (typeof revs === 'string') {
+          try { revs = JSON.parse(revs); } catch {}
+        }
+        if (Array.isArray(revs) && revs.some((rev: any) => rev.status === 'requested')) continue;
+
         const freshOrder = await store.getOrder(order.id);
         if (!freshOrder || freshOrder.status !== 'delivered') {
-          continue;
-        }
-        if (freshOrder.cancellationRequest && freshOrder.cancellationRequest.status === 'pending') {
-          continue;
-        }
-        if (Array.isArray(freshOrder.revisions) && freshOrder.revisions.some(rev => rev.status === 'requested')) {
           continue;
         }
 
