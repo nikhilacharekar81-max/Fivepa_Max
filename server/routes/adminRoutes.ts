@@ -1133,6 +1133,18 @@ router.patch('/admin/gigs/:id', requireAdmin, async (req: Request, res: Response
     const updatedGig = await store.updateGig(gig.id, adminUpdates);
     if (!updatedGig) return res.status(404).json({ error: 'Gig not found' });
 
+    if (updatedGig.status === 'deleted') {
+      await registerAuditLog({
+        id: 'log_' + Date.now(),
+        actor: adminActor(req),
+        role: (req as any).authenticatedUser?.role || 'admin',
+        action: 'GIG_DELETED',
+        target: `Gig #${updatedGig.id} (${updatedGig.title})`,
+        details: `Administrative deletion of gig "${updatedGig.title}" (ID: ${updatedGig.id})`,
+        timestamp: new Date().toLocaleString()
+      });
+    }
+
     res.json({
       success: true,
       gig: {
