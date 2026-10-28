@@ -686,9 +686,28 @@ export class PostgresAsyncStore implements StoreInterface {
         gallery = EXCLUDED.gallery,
         tags = EXCLUDED.tags,
         status = EXCLUDED.status,
-        featured = CASE WHEN EXCLUDED.featured OR gigs.is_featured OR gigs.featured THEN TRUE ELSE EXCLUDED.featured END,
-        is_featured = CASE WHEN EXCLUDED.is_featured OR gigs.featured OR gigs.is_featured THEN TRUE ELSE EXCLUDED.is_featured END,
-        featured_until = COALESCE(EXCLUDED.featured_until, gigs.featured_until),
+        featured = (
+          CASE 
+            WHEN (EXCLUDED.featured_until IS NOT NULL AND EXCLUDED.featured_until::timestamptz > NOW()) THEN TRUE
+            WHEN (gigs.featured_until IS NOT NULL AND gigs.featured_until::timestamptz > NOW()) THEN TRUE
+            ELSE FALSE
+          END
+        ),
+        is_featured = (
+          CASE 
+            WHEN (EXCLUDED.featured_until IS NOT NULL AND EXCLUDED.featured_until::timestamptz > NOW()) THEN TRUE
+            WHEN (gigs.featured_until IS NOT NULL AND gigs.featured_until::timestamptz > NOW()) THEN TRUE
+            ELSE FALSE
+          END
+        ),
+        featured_until = (
+          CASE
+            WHEN EXCLUDED.featured_until IS NOT NULL AND gigs.featured_until IS NOT NULL THEN
+              CASE WHEN EXCLUDED.featured_until::timestamptz > gigs.featured_until::timestamptz THEN EXCLUDED.featured_until ELSE gigs.featured_until END
+            WHEN EXCLUDED.featured_until IS NOT NULL THEN EXCLUDED.featured_until
+            ELSE gigs.featured_until
+          END
+        ),
         extras = EXCLUDED.extras,
         moderation_status = EXCLUDED.moderation_status,
         moderation_notes = EXCLUDED.moderation_notes`,
