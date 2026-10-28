@@ -231,9 +231,11 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
       : 'ord_' + randomUUID().slice(0, 12);
     const today = new Date().toISOString().split('T')[0];
 
+    let resolvedGigRow: any = null;
     if (req.body?.gigId) {
       if (!isInquiry) {
         const { gig: gigRow, gigPrice } = await resolveGigOrderPrice(req.body.gigId, req.body?.extraIds);
+        resolvedGigRow = gigRow;
         if (gigRow.freelancer_id !== sellerId) {
           return res.status(400).json({ error: 'This gig does not belong to the selected seller.' });
         }
@@ -316,12 +318,10 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
     const projectOrderId = isProject ? id : undefined;
 
     let selectedExtrasDetails: any[] = [];
-    if (req.body?.gigId && Array.isArray(req.body?.extraIds)) {
-      try {
-        const { gig: gigRow } = await resolveGigOrderPrice(req.body.gigId, req.body.extraIds);
-        const gigExtras = Array.isArray(gigRow.extras) ? gigRow.extras : [];
-        selectedExtrasDetails = gigExtras.filter((ex: any) => req.body.extraIds.includes(String(ex.id)));
-      } catch {}
+    if (resolvedGigRow && Array.isArray(req.body?.extraIds)) {
+      const gigExtras = Array.isArray(resolvedGigRow.extras) ? resolvedGigRow.extras : [];
+      const requestedIds = req.body.extraIds.map(String);
+      selectedExtrasDetails = gigExtras.filter((ex: any) => requestedIds.includes(String(ex.id)));
     }
 
     const txResult = await postgresStore.executeInTransaction(async (client) => {

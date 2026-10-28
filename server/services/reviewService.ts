@@ -58,6 +58,7 @@ export async function recalculateGigRating(gigId: string): Promise<void> {
        FROM reviews r
        LEFT JOIN orders o ON r.order_id = o.id
        WHERE (r.gig_id = $1 OR o.gig_id = $1)
+         AND o.status = 'completed'
          AND r.is_cancelled_order = false
          AND (r.moderation_status = 'approved' OR r.moderation_status IS NULL)
          AND (r.reviewer_role = 'buyer' OR r.reviewer_id = o.buyer_id)`,
