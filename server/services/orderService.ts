@@ -164,7 +164,7 @@ export function syncIndexes() {
   // Clearing records are managed directly in PostgreSQL earnings_clearing
 }
 
-export async function resolveGigOrderPrice(gigId: string, extraIds: unknown): Promise<{ gig: any; gigPrice: number; extrasTitles: string[]; selectedExtrasDetails: any[] }> {
+export async function resolveGigOrderPrice(gigId: string, extraIds: unknown): Promise<{ gig: any; gigPrice: number; extrasTitles: string[]; selectedExtrasDetails: any[]; totalDeliveryDays: number }> {
   const res = await postgresStore.getPool().query('SELECT * FROM gigs WHERE id = $1', [gigId]);
   if (res.rows.length === 0) {
     const err: any = new Error('Gig not found.');
@@ -178,11 +178,13 @@ export async function resolveGigOrderPrice(gigId: string, extraIds: unknown): Pr
     throw err;
   }
   const basePrice = Number(r.price || 0);
+  const baseDeliveryDays = Math.max(1, Math.round(Number(r.delivery_days || r.deliveryDays || 7)));
   const extras = Array.isArray(r.extras) ? r.extras : [];
   const requestedIds = Array.isArray(extraIds) 
     ? Array.from(new Set(extraIds.map(String).filter(Boolean)))
     : [];
   let extrasTotal = 0;
+  let extrasDaysTotal = 0;
   const extrasTitles: string[] = [];
   const selectedExtrasDetails: any[] = [];
 
@@ -194,16 +196,20 @@ export async function resolveGigOrderPrice(gigId: string, extraIds: unknown): Pr
       throw err;
     }
     const price = Math.round(Number(matched.price || 0) * 100) / 100;
+    const deliveryDays = Math.max(0, Math.round(Number(matched.deliveryDays ?? matched.delivery_days)) || 0);
     extrasTotal += price;
+    extrasDaysTotal += deliveryDays;
     extrasTitles.push(String(matched.title || 'Extra'));
     selectedExtrasDetails.push({
       id: String(matched.id),
       title: String(matched.title || 'Extra'),
-      price
+      price,
+      deliveryDays
     });
   }
 
   const gigPrice = Math.round((basePrice + extrasTotal) * 100) / 100;
+  const totalDeliveryDays = baseDeliveryDays + extrasDaysTotal;
   return {
     gig: {
       id: r.id,
@@ -211,12 +217,13 @@ export async function resolveGigOrderPrice(gigId: string, extraIds: unknown): Pr
       price: basePrice,
       freelancerId: r.freelancer_id,
       freelancer_id: r.freelancer_id,
-      deliveryDays: Number(r.delivery_days || 7),
+      deliveryDays: baseDeliveryDays,
       extras
     },
     gigPrice,
     extrasTitles,
-    selectedExtrasDetails
+    selectedExtrasDetails,
+    totalDeliveryDays
   };
 }
 

@@ -124,12 +124,13 @@ gigRouter.post('/gigs', requireAuth, requireActiveStatus, async (req: Request, r
   const rawImage = req.body.image;
   const defaultImage = 'https://images.unsplash.com/photo-1498050108023-c5249f4df085?w=800&h=500&fit=crop';
   const image = (typeof rawImage === 'string' && !/^\s*(javascript:|vbscript:|data:(?!image\/))/i.test(rawImage)) ? rawImage : defaultImage;
-  let extras: { id: string; title: string; price: number }[] = [];
+  let extras: { id: string; title: string; price: number; deliveryDays: number }[] = [];
   if (Array.isArray(req.body.extras)) {
     extras = req.body.extras.slice(0, 20).map((ex: any, idx: number) => ({
       id: String(ex?.id || `extra_${Date.now()}_${idx}`),
       title: String(ex?.title || '').slice(0, 200),
-      price: Math.round(Math.min(100000, Math.max(0, Number(ex?.price) || 0)) * 100) / 100
+      price: Math.round(Math.min(100000, Math.max(0, Number(ex?.price) || 0)) * 100) / 100,
+      deliveryDays: Math.min(365, Math.max(0, Math.round(Number(ex?.deliveryDays ?? ex?.delivery_days)) || 0))
     }));
   }
 
@@ -227,7 +228,8 @@ const handleGigUpdate = async (req: Request, res: Response) => {
       updates.extras = req.body.extras.slice(0, 20).map((ex: any, idx: number) => ({
         id: String(ex?.id || `extra_${Date.now()}_${idx}`),
         title: String(ex?.title || '').slice(0, 200),
-        price: Math.round(Math.min(100000, Math.max(0, Number(ex?.price) || 0)) * 100) / 100
+        price: Math.round(Math.min(100000, Math.max(0, Number(ex?.price) || 0)) * 100) / 100,
+        deliveryDays: Math.min(365, Math.max(0, Math.round(Number(ex?.deliveryDays ?? ex?.delivery_days)) || 0))
       }));
     }
     if (req.body.image !== undefined && typeof req.body.image === 'string') {

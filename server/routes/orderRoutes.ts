@@ -240,11 +240,13 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
 
     let resolvedGigRow: any = null;
     let selectedExtrasDetails: any[] = [];
+    let totalDeliveryDaysFromGig: number | null = null;
     if (req.body?.gigId) {
       if (!isInquiry) {
-        const { gig: gigRow, gigPrice, selectedExtrasDetails: resolvedExtras } = await resolveGigOrderPrice(req.body.gigId, normalizedExtraIds);
+        const { gig: gigRow, gigPrice, selectedExtrasDetails: resolvedExtras, totalDeliveryDays } = await resolveGigOrderPrice(req.body.gigId, normalizedExtraIds);
         resolvedGigRow = gigRow;
         selectedExtrasDetails = resolvedExtras || [];
+        totalDeliveryDaysFromGig = totalDeliveryDays;
         if (gigRow.freelancer_id !== sellerId) {
           return res.status(400).json({ error: 'This gig does not belong to the selected seller.' });
         }
@@ -308,9 +310,13 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
 
     let deliveryDays = 10;
     if (req.body?.gigId) {
-      const gig = await store.getGig(req.body.gigId);
-      if (gig && Number(gig.deliveryDays) > 0) {
-        deliveryDays = Math.max(1, Math.min(365, Number(gig.deliveryDays)));
+      if (totalDeliveryDaysFromGig !== null) {
+        deliveryDays = Math.max(1, Math.min(365, totalDeliveryDaysFromGig));
+      } else {
+        const gig = await store.getGig(req.body.gigId);
+        if (gig && Number(gig.deliveryDays) > 0) {
+          deliveryDays = Math.max(1, Math.min(365, Number(gig.deliveryDays)));
+        }
       }
     } else if (req.body?.projectId) {
       const proj = await store.getProject(req.body.projectId);
