@@ -782,3 +782,24 @@ CREATE TABLE IF NOT EXISTS outbox_events (
 
 CREATE INDEX IF NOT EXISTS idx_outbox_events_status ON outbox_events(status, created_at);
 
+-- Performance & Integrity Indexes for Gigs
+CREATE INDEX IF NOT EXISTS idx_gigs_freelancer_id ON gigs(freelancer_id);
+CREATE INDEX IF NOT EXISTS idx_gigs_status_moderation ON gigs(status, moderation_status);
+
+-- Safe Slug Unique Resolution & Constraint
+UPDATE gigs SET slug = slug || '-' || SUBSTRING(id FROM 1 FOR 6)
+WHERE id IN (
+  SELECT id FROM (
+    SELECT id, ROW_NUMBER() OVER (PARTITION BY slug ORDER BY created_at ASC) as rn
+    FROM gigs WHERE slug IS NOT NULL AND slug != ''
+  ) s WHERE rn > 1
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gigs_unique_slug ON gigs(slug) WHERE slug IS NOT NULL AND slug != '';
+
+-- Foreign Key Constraint for Orders to Gigs
+DO $$ BEGIN
+  ALTER TABLE orders ADD CONSTRAINT fk_orders_gig FOREIGN KEY (gig_id) REFERENCES gigs(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
+END $$;
+
+

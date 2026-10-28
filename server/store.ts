@@ -657,7 +657,19 @@ export class PostgresAsyncStore implements StoreInterface {
   }
 
   async saveGig(g: Gig): Promise<void> {
-    const slug = g.slug || g.title?.toLowerCase().trim().replace(/[^\w\s-]/g, '').replace(/[\s_-]+/g, '-').replace(/^-+|-+$/g, '') || 'gig-' + g.id;
+    let slug = g.slug || g.title?.toLowerCase().trim().replace(/[^\w\s-]/g, '').replace(/[\s_-]+/g, '-').replace(/^-+|-+$/g, '') || 'gig-' + g.id;
+    if (slug.length < 2) slug = 'gig-' + g.id;
+
+    try {
+      const collisionRes = await postgresStore.getPool().query(
+        'SELECT id FROM gigs WHERE slug = $1 AND id != $2 LIMIT 1',
+        [slug, g.id]
+      );
+      if (collisionRes.rows.length > 0) {
+        slug = `${slug}-${g.id.slice(-6)}`;
+      }
+    } catch {}
+
     await postgresStore.getPool().query(
       `INSERT INTO gigs (
         id, freelancer_id, freelancer_name, freelancer_username, freelancer_avatar, freelancer_level,

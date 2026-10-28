@@ -233,10 +233,12 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
     const today = new Date().toISOString().split('T')[0];
 
     let resolvedGigRow: any = null;
+    let selectedExtrasDetails: any[] = [];
     if (req.body?.gigId) {
       if (!isInquiry) {
-        const { gig: gigRow, gigPrice } = await resolveGigOrderPrice(req.body.gigId, req.body?.extraIds);
+        const { gig: gigRow, gigPrice, selectedExtrasDetails: resolvedExtras } = await resolveGigOrderPrice(req.body.gigId, req.body?.extraIds);
         resolvedGigRow = gigRow;
+        selectedExtrasDetails = resolvedExtras || [];
         if (gigRow.freelancer_id !== sellerId) {
           return res.status(400).json({ error: 'This gig does not belong to the selected seller.' });
         }
@@ -310,20 +312,13 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
         deliveryDays = Math.max(1, Math.min(365, Number(proj.deadlineDays)));
       }
     }
-    const serverDerivedDueDate = new Date(Date.now() + deliveryDays * 86400000).toISOString().split('T')[0];
+    const serverDerivedDueDate = new Date(Date.now() + deliveryDays * 86400000).toISOString();
 
     const isGig = Boolean(req.body?.gigId);
     const isProject = Boolean(req.body?.projectId);
     const orderType: 'gig' | 'project' | undefined = isGig ? 'gig' : (isProject ? 'project' : undefined);
     const gigOrderId = isGig ? id : undefined;
     const projectOrderId = isProject ? id : undefined;
-
-    let selectedExtrasDetails: any[] = [];
-    if (resolvedGigRow && Array.isArray(req.body?.extraIds)) {
-      const gigExtras = Array.isArray(resolvedGigRow.extras) ? resolvedGigRow.extras : [];
-      const requestedIds = req.body.extraIds.map(String);
-      selectedExtrasDetails = gigExtras.filter((ex: any) => requestedIds.includes(String(ex.id)));
-    }
 
     const txResult = await postgresStore.executeInTransaction(async (client) => {
       if (scopedIdempKey) {
@@ -839,6 +834,10 @@ router.post('/orders/:id/deliverable', requireAuth, requireActiveStatus, async (
       uploadedAt: new Date().toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }),
       type: isDraft ? 'draft' : 'deliverable'
     }));
+
+    if (!isDraft) {
+      order.deliverableFiles = [...(order.deliverableFiles || []), ...uploadedFiles];
+    }
 
     const version = order.deliveryHistory.length + 1;
     const deliveredAt = new Date().toISOString();
@@ -1420,19 +1419,38 @@ router.post('/orders/:id/cancel-request/respond', requireAuth, requireActiveStat
 
     if (action === 'accept') {
       const actorName = caller?.name || (isBuyer ? 'Buyer' : 'Seller');
-      const requestKey = `cancel_accept_${order.id}_${order.cancellationRequest.requestedAt}`;
-      const refundRes = await refundOrderFunds(order, undefined, actorName, `Mutual cancellation accepted: ${order.cancellationRequest.reason}`, requestKey);
       order.cancellationRequest.status = 'accepted';
+      if (Array.isArray(order.cancellationHistory)) {
+        for (const ch of order.cancellationHistory) {
+          if (ch.requestedAt === order.cancellationRequest.requestedAt) {
+            ch.status = 'accepted';
+            ch.respondedBy = userId;
+            ch.respondedAt = now;
+          }
+        }
+      }
 
-      await postgresStore.getPool().query(
-        'UPDATE orders SET cancellation_request = $1, cancellation_history = $2 WHERE id = $3',
-        [JSON.stringify(order.cancellationRequest), JSON.stringify(order.cancellationHistory || []), order.id]
-      );
+      let refundedAmt = 0;
+      if (order.amount === 0 || /^inquiry:/i.test(order.title)) {
+        order.status = 'cancelled';
+        await postgresStore.getPool().query(
+          "UPDATE orders SET status = 'cancelled', cancellation_type = 'inquiry_cancelled', cancellation_request = $1, cancellation_history = $2 WHERE id = $3",
+          [JSON.stringify(order.cancellationRequest), JSON.stringify(order.cancellationHistory || []), order.id]
+        );
+      } else {
+        const requestKey = `cancel_accept_${order.id}_${order.cancellationRequest.requestedAt}`;
+        const refundRes = await refundOrderFunds(order, undefined, actorName, `Mutual cancellation accepted: ${order.cancellationRequest.reason}`, requestKey);
+        refundedAmt = refundRes.refunded;
+        await postgresStore.getPool().query(
+          'UPDATE orders SET cancellation_request = $1, cancellation_history = $2 WHERE id = $3',
+          [JSON.stringify(order.cancellationRequest), JSON.stringify(order.cancellationHistory || []), order.id]
+        );
+      }
 
       createNotification({
         userId: order.cancellationRequest.requesterId,
         title: 'Cancellation Accepted',
-        message: `Your cancellation request for order #${order.id} was accepted. Full refund issued ($${refundRes.refunded}).`,
+        message: `Your cancellation request for order #${order.id} was accepted.${refundedAmt > 0 ? ` Full refund issued ($${refundedAmt}).` : ' Order closed.'}`,
         type: 'order',
         link: `/messages/${order.id}`
       });
@@ -1443,22 +1461,32 @@ router.post('/orders/:id/cancel-request/respond', requireAuth, requireActiveStat
         role: caller?.role || 'user',
         action: 'GIG_CANCELLATION_ACCEPTED',
         target: `Order #${order.id}`,
-        details: `Cancellation accepted. Full refund of $${refundRes.refunded} issued.`,
+        details: `Cancellation accepted. ${refundedAmt > 0 ? `Full refund of $${refundedAmt} issued.` : 'Inquiry closed.'}`,
         timestamp: new Date().toLocaleString()
       });
 
-      return res.json({ success: true, order: enrichOrderWithServiceInfo(order), refunded: refundRes.refunded });
+      return res.json({ success: true, order: enrichOrderWithServiceInfo(order), refunded: refundedAmt });
     } else {
-      order.cancellationRequest.status = 'rejected';
-      order.cancellationRequest.rejectionReason = String(reason).trim();
+      const rejectedReq = { ...order.cancellationRequest, status: 'rejected' as const, rejectionReason: String(reason).trim() };
+      if (Array.isArray(order.cancellationHistory)) {
+        for (const ch of order.cancellationHistory) {
+          if (ch.requestedAt === order.cancellationRequest.requestedAt) {
+            ch.status = 'rejected';
+            ch.rejectionReason = String(reason).trim();
+            ch.respondedBy = userId;
+            ch.respondedAt = now;
+          }
+        }
+      }
       if (order.status === 'delivered') {
         order.reviewWindowRestartedAt = now;
       }
+      order.cancellationRequest = undefined as any;
 
       const rejectUpdated = await store.updateOrderStatus(
         order.id,
         {
-          cancellation_request: JSON.stringify(order.cancellationRequest),
+          cancellation_request: null,
           cancellation_history: JSON.stringify(order.cancellationHistory || []),
           review_window_restarted_at: order.reviewWindowRestartedAt || null
         },
@@ -1470,7 +1498,7 @@ router.post('/orders/:id/cancel-request/respond', requireAuth, requireActiveStat
 
       const actorName = caller?.name || (isBuyer ? 'Buyer' : 'Seller');
       createNotification({
-        userId: order.cancellationRequest.requesterId,
+        userId: rejectedReq.requesterId,
         title: 'Cancellation Rejected',
         message: `Your cancellation request for order #${order.id} was rejected. Reason: ${reason}. Order continues normally.`,
         type: 'order',

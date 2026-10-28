@@ -65,7 +65,7 @@ export async function recalculateGigRating(gigId: string): Promise<void> {
       [gigId]
     );
     const count = Number(res.rows[0]?.count || 0);
-    const avg = count > 0 ? Number(Number(res.rows[0]?.avg_rating).toFixed(1)) : 5.0;
+    const avg = count > 0 ? Number(Number(res.rows[0]?.avg_rating).toFixed(1)) : 0;
     await pool.query(
       'UPDATE gigs SET reviews_count = $1, rating = $2 WHERE id = $3',
       [count, avg, gigId]

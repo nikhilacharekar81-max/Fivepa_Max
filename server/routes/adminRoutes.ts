@@ -1092,9 +1092,36 @@ router.patch('/admin/gigs/:id', requireAdmin, async (req: Request, res: Response
     const { status, moderationStatus, moderationNotes } = req.body;
     const gig = await store.getGig(req.params.id);
     if (!gig) return res.status(404).json({ error: 'Gig not found' });
-    if (status !== undefined) gig.status = status;
-    if (moderationStatus !== undefined) (gig as any).moderationStatus = moderationStatus;
-    if (moderationNotes !== undefined) (gig as any).moderationNotes = moderationNotes;
+
+    const VALID_STATUSES = ['active', 'paused', 'moderation', 'deleted'];
+    const VALID_MODERATION_STATUSES = ['approved', 'pending', 'rejected', 'flagged'];
+
+    if (status !== undefined) {
+      const cleanStatus = String(status).trim().toLowerCase();
+      if (!VALID_STATUSES.includes(cleanStatus)) {
+        return res.status(400).json({ error: `Invalid gig status "${status}". Allowed: ${VALID_STATUSES.join(', ')}` });
+      }
+      gig.status = cleanStatus as any;
+    }
+
+    if (moderationStatus !== undefined) {
+      const cleanMod = String(moderationStatus).trim().toLowerCase();
+      if (!VALID_MODERATION_STATUSES.includes(cleanMod)) {
+        return res.status(400).json({ error: `Invalid moderation status "${moderationStatus}". Allowed: ${VALID_MODERATION_STATUSES.join(', ')}` });
+      }
+      (gig as any).moderationStatus = cleanMod;
+
+      if (cleanMod === 'approved' && status === undefined && gig.status === 'moderation') {
+        gig.status = 'active';
+      } else if ((cleanMod === 'rejected' || cleanMod === 'flagged') && gig.status === 'active') {
+        gig.status = 'moderation';
+      }
+    }
+
+    if (moderationNotes !== undefined) {
+      (gig as any).moderationNotes = String(moderationNotes).slice(0, 1000);
+    }
+
     await store.saveGig(gig);
     res.json({
       success: true,

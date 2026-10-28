@@ -260,9 +260,21 @@ const handleGigUpdate = async (req: Request, res: Response) => {
       status = g.status;
     }
 
+    const isMaterialEdit = title !== g.title || description !== g.description || image !== g.image || price !== g.price;
+    const activeSettings = siteSettings.getSettings();
+    if (isMaterialEdit && activeSettings.marketplace?.gigModerationRequired) {
+      moderationStatus = 'pending';
+      if (status === 'active') {
+        status = 'moderation';
+      }
+    }
+
+    const updatedSlug = req.body.title ? (String(req.body.title).toLowerCase().trim().replace(/[^\w\s-]/g, '').replace(/[\s_-]+/g, '-').replace(/^-+|-+$/g, '') || `gig-${g.id}`) : g.slug;
+
     const updatedGig: Gig = {
       ...g,
       title,
+      slug: updatedSlug,
       category,
       subcategory,
       description,
@@ -318,7 +330,7 @@ gigRouter.delete('/gigs/:id', requireAuth, requireActiveStatus, async (req: Requ
       role: caller.role,
       action: 'GIG_DELETED',
       target: `Gig "${g.title}"`,
-      details: `Permanently deleted freelancer gig #${g.id} by ${g.freelancerName}`,
+      details: `Soft-deleted freelancer gig #${g.id} by ${g.freelancerName} (status set to "deleted")`,
       timestamp: new Date().toLocaleString()
     });
 

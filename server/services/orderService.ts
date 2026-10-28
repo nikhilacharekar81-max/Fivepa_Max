@@ -164,7 +164,7 @@ export function syncIndexes() {
   // Clearing records are managed directly in PostgreSQL earnings_clearing
 }
 
-export async function resolveGigOrderPrice(gigId: string, extraIds: unknown): Promise<{ gig: any; gigPrice: number; extrasTitles: string[] }> {
+export async function resolveGigOrderPrice(gigId: string, extraIds: unknown): Promise<{ gig: any; gigPrice: number; extrasTitles: string[]; selectedExtrasDetails: any[] }> {
   const res = await postgresStore.getPool().query('SELECT * FROM gigs WHERE id = $1', [gigId]);
   if (res.rows.length === 0) {
     const err: any = new Error('Gig not found.');
@@ -182,12 +182,25 @@ export async function resolveGigOrderPrice(gigId: string, extraIds: unknown): Pr
   const requestedIds = Array.isArray(extraIds) ? extraIds.map(String) : [];
   let extrasTotal = 0;
   const extrasTitles: string[] = [];
-  for (const ex of extras) {
-    if (ex && requestedIds.includes(String(ex.id))) {
-      extrasTotal += Number(ex.price || 0);
-      if (ex.title) extrasTitles.push(String(ex.title));
+  const selectedExtrasDetails: any[] = [];
+
+  for (const reqId of requestedIds) {
+    const matched = extras.find((ex: any) => String(ex?.id) === String(reqId));
+    if (!matched) {
+      const err: any = new Error(`Invalid extra selected: ID "${reqId}" is not available for this Gig.`);
+      err.status = 400;
+      throw err;
     }
+    const price = Math.round(Number(matched.price || 0) * 100) / 100;
+    extrasTotal += price;
+    extrasTitles.push(String(matched.title || 'Extra'));
+    selectedExtrasDetails.push({
+      id: String(matched.id),
+      title: String(matched.title || 'Extra'),
+      price
+    });
   }
+
   const gigPrice = Math.round((basePrice + extrasTotal) * 100) / 100;
   return {
     gig: {
@@ -200,7 +213,8 @@ export async function resolveGigOrderPrice(gigId: string, extraIds: unknown): Pr
       extras
     },
     gigPrice,
-    extrasTitles
+    extrasTitles,
+    selectedExtrasDetails
   };
 }
 
@@ -273,7 +287,7 @@ export async function releaseOrderFunds(order: Order, actor: string, reason: str
 
   await syncUserBalances([order.buyerId, order.sellerId].filter(Boolean));
   await postgresStore.getPool().query(
-    'UPDATE orders SET status = $1, completed_at = COALESCE(completed_at, $2), accepted_version = COALESCE($3, accepted_version) WHERE id = $4 AND status NOT IN (\'completed\', \'cancelled\')',
+    'UPDATE orders SET status = $1, completed_at = COALESCE(completed_at, $2), accepted_version = COALESCE($3, accepted_version) WHERE id = $4 AND status != \'cancelled\'',
     ['completed', order.completedAt, order.acceptedVersion ?? null, order.id]
   );
 
@@ -427,16 +441,66 @@ export async function processCancellationTimeouts() {
         }
         try {
           const freshOrder = await store.getOrder(order.id);
-          if (!freshOrder || freshOrder.status === 'completed' || freshOrder.status === 'cancelled' || !freshOrder.cancellationRequest || freshOrder.cancellationRequest.status !== 'pending') {
+          if (!freshOrder || freshOrder.status === 'completed' || freshOrder.status === 'cancelled' || freshOrder.status === 'disputed' || !freshOrder.cancellationRequest || freshOrder.cancellationRequest.status !== 'pending') {
             continue;
           }
-          const requestKey = `cancel_timeout_${freshOrder.id}_${freshOrder.cancellationRequest.requestedAt}`;
-          const refundRes = await refundOrderFunds(freshOrder, undefined, 'System Auto-Cancel', 'Cancellation request auto-cancelled after 48h timeout', requestKey);
-          freshOrder.cancellationRequest.status = 'auto_cancelled';
-          await store.saveOrder(freshOrder);
+
+          const dispute = await store.getDisputeByOrderId(freshOrder.id);
+          if (dispute && (dispute.status === 'open' || dispute.status === 'under_investigation')) {
+            continue;
+          }
+
+          if (freshOrder.status === 'delivered') {
+            await emitSystemEvent(freshOrder.id, 'cancellation_escalated', '⚠️ Cancellation timeout reached on delivered work. Escalated to dispute resolution desk.', { orderId: freshOrder.id });
+            continue;
+          }
 
           const requesterId = freshOrder.cancellationRequest.requesterId;
           const otherId = requesterId === freshOrder.buyerId ? freshOrder.sellerId : freshOrder.buyerId;
+
+          if (freshOrder.amount === 0 || /^inquiry:/i.test(freshOrder.title)) {
+            freshOrder.status = 'cancelled';
+            freshOrder.cancellationRequest.status = 'auto_cancelled';
+            if (Array.isArray(freshOrder.cancellationHistory)) {
+              for (const ch of freshOrder.cancellationHistory) {
+                if (ch.requestedAt === freshOrder.cancellationRequest.requestedAt) {
+                  ch.status = 'auto_cancelled';
+                }
+              }
+            }
+            await pool.query(
+              "UPDATE orders SET status = 'cancelled', cancellation_type = 'inquiry_cancelled', cancellation_request = $1, cancellation_history = $2 WHERE id = $3",
+              [JSON.stringify(freshOrder.cancellationRequest), JSON.stringify(freshOrder.cancellationHistory || []), freshOrder.id]
+            );
+            createNotification({
+              userId: requesterId,
+              title: 'Inquiry Cancelled',
+              message: `Inquiry thread #${freshOrder.id} request timed out and was closed.`,
+              type: 'order',
+              link: `/messages/${freshOrder.id}`
+            });
+            createNotification({
+              userId: otherId,
+              title: 'Inquiry Cancelled',
+              message: `Inquiry thread #${freshOrder.id} request timed out and was closed.`,
+              type: 'order',
+              link: `/messages/${freshOrder.id}`
+            });
+            continue;
+          }
+
+          const requestKey = `cancel_timeout_${freshOrder.id}_${freshOrder.cancellationRequest.requestedAt}`;
+          const refundRes = await refundOrderFunds(freshOrder, undefined, 'System Auto-Cancel', 'Cancellation request auto-cancelled after 48h timeout', requestKey);
+          freshOrder.cancellationRequest.status = 'auto_cancelled';
+          if (Array.isArray(freshOrder.cancellationHistory)) {
+            for (const ch of freshOrder.cancellationHistory) {
+              if (ch.requestedAt === freshOrder.cancellationRequest.requestedAt) {
+                ch.status = 'auto_cancelled';
+              }
+            }
+          }
+          await store.saveOrder(freshOrder);
+
           createNotification({
             userId: requesterId,
             title: 'Cancellation Auto-Cancelled',
