@@ -98,8 +98,14 @@ if (IS_PROD) {
   (process.env as any).NODE_ENV = 'production';
 }
 
+let isShuttingDown = false;
+
 // Global Security Middleware
 app.use((req, res, next) => {
+  if (isShuttingDown) {
+    res.setHeader('Connection', 'close');
+    return res.status(503).json({ error: 'Server is shutting down. Please retry shortly.' });
+  }
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   if (IS_PRODUCTION) res.setHeader('Strict-Transport-Security', 'max-age=15552000');
@@ -290,10 +296,23 @@ if (process.env.NODE_ENV !== 'test' && !server.listening) {
 })();
 
 // Graceful shutdown
+import { stopOutboxProcessor } from './server/services/outboxService.js';
+import { clients } from './server/websocket.js';
+
+let shutdownInitiated = false;
 async function gracefulShutdown(signal: string) {
+  if (shutdownInitiated) return;
+  shutdownInitiated = true;
+  isShuttingDown = true;
   console.log(`Received ${signal}. Initiating graceful shutdown...`);
   
-  // 1. Stop accepting new requests
+  stopOutboxProcessor();
+
+  for (const client of clients) {
+    try { client.close(1001, 'Server shutting down'); } catch {}
+  }
+
+  // 1. Stop accepting new HTTP requests
   server.close(async () => {
     console.log('HTTP server closed.');
     

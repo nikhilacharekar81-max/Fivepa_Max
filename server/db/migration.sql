@@ -766,3 +766,19 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS selected_extras JSONB;
 ALTER TABLE gigs ADD COLUMN IF NOT EXISTS featured BOOLEAN DEFAULT FALSE;
 ALTER TABLE gigs ADD COLUMN IF NOT EXISTS is_featured BOOLEAN DEFAULT FALSE;
 ALTER TABLE gigs ADD COLUMN IF NOT EXISTS featured_until VARCHAR(64);
+
+CREATE TABLE IF NOT EXISTS outbox_events (
+  id VARCHAR(64) PRIMARY KEY,
+  event_type VARCHAR(128) NOT NULL,
+  aggregate_type VARCHAR(64) NOT NULL,
+  aggregate_id VARCHAR(128) NOT NULL,
+  payload JSONB NOT NULL,
+  status VARCHAR(32) DEFAULT 'pending' NOT NULL,
+  retry_count INT DEFAULT 0 NOT NULL,
+  error_message TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  processed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_events_status ON outbox_events(status, created_at);
+

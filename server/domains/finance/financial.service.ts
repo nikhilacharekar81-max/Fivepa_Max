@@ -2704,8 +2704,22 @@ export class FinancialTransactionService {
       const exceptions = exRes.rows.map((r: any) => financialRepository.formatReconciliationExceptionRow(r));
       const openExceptions = exceptions.filter((e: ReconciliationException) => e.status !== 'resolved');
 
+      const isReconciled = discrepancies.length === 0 && openExceptions.length === 0;
+      if (!isReconciled) {
+        diagnosticService.log(
+          'critical',
+          'finance',
+          'runFinancialReconciliation',
+          'financial.service.ts',
+          'reconciliation_check',
+          'FAILED',
+          { discrepancies, openExceptionsCount: openExceptions.length },
+          'Financial reconciliation detected discrepancies or unresolved exceptions. Immediate review required.'
+        );
+      }
+
       return {
-        reconciled: discrepancies.length === 0 && openExceptions.length === 0,
+        reconciled: isReconciled,
         timestamp: new Date().toISOString(),
         summary: {
           wallets: { totalAvailable: walletTotalAvail, totalHold: walletTotalHold, totalPendingWithdrawals: walletTotalPending },

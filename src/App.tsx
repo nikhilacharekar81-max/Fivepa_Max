@@ -580,7 +580,7 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
       isCreatingOrderRef.current = true;
       setIsCreatingOrder(true);
 
-      const payloadKey = `fivepa_patt_${gigId || 'custom'}_${priceUSD}_${Array.isArray(extraIds) ? [...extraIds].sort().join(',') : ''}`;
+      const payloadKey = `fivepa_patt_${activeUser.id}_${sellerId}_${gigId || 'custom'}_${encodeURIComponent(orderTitle)}_${priceUSD}_${Array.isArray(extraIds) ? [...extraIds].sort().join(',') : ''}`;
       let clientRequestId = '';
       try {
         clientRequestId = sessionStorage.getItem(payloadKey) || '';

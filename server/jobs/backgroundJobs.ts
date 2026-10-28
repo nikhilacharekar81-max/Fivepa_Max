@@ -1,9 +1,11 @@
 import { financialTransactionService } from '../services/financialService.js';
 import { processCancellationTimeouts, processAutoAcceptOrders } from '../services/orderService.js';
 import { postgresStore, isPostgresEnabled } from '../db/postgresStore.js';
+import { startOutboxProcessor } from '../services/outboxService.js';
 
 export async function runBackgroundJobs() {
   console.log('[BackgroundJobs] Starting financial and marketplace background jobs...');
+  startOutboxProcessor(3000);
 
   // 1. Earnings Clearing Job (Every 5 minutes with session advisory lock)
   setInterval(async () => {

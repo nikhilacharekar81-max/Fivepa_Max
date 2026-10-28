@@ -14,6 +14,7 @@ import { calculateOrderFees } from '../domains/finance/fees.js';
 import { checkOrRecordIdempotency, recordIdempotencyResult } from '../domains/finance/index.js';
 import { postgresStore } from '../db/postgresStore.js';
 import { financialRepository, financialTransactionService } from '../domains/finance/financial.service.js';
+import { recordOutboxEvent } from '../services/outboxService.js';
 import {
   requireAuth,
   requireActiveStatus,
@@ -470,6 +471,12 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
 
           enriched.status = 'funded_in_escrow';
           await client.query('UPDATE orders SET status = $1 WHERE id = $2', ['funded_in_escrow', id]);
+          await recordOutboxEvent(client, 'ORDER_ESCROW_FUNDED', 'order', id, {
+            title,
+            amount: rawAmount,
+            buyerId,
+            sellerId
+          });
         } catch (fundingErr: any) {
           throw new Error(fundingErr.message || 'Failed to fund escrow.');
         }

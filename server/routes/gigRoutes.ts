@@ -155,6 +155,8 @@ gigRouter.post('/gigs', requireAuth, requireActiveStatus, async (req: Request, r
     status: initialStatus,
     featured: false,
     isFeatured: false,
+    featuredUntil: undefined,
+    featured_until: undefined,
     isUrgent: false,
     packages: req.body.packages || undefined,
     extras,
@@ -258,7 +260,23 @@ const handleGigUpdate = async (req: Request, res: Response) => {
       status = g.status;
     }
 
-    const updatedGig: Gig = { ...g, title, category, subcategory, description, price, deliveryDays, extras, image, status, moderationStatus };
+    const updatedGig: Gig = {
+      ...g,
+      title,
+      category,
+      subcategory,
+      description,
+      price,
+      deliveryDays,
+      extras,
+      image,
+      status,
+      moderationStatus,
+      featured: g.featured,
+      isFeatured: (g as any).isFeatured || g.featured,
+      featuredUntil: g.featuredUntil,
+      featured_until: (g as any).featured_until
+    } as any;
     await store.saveGig(updatedGig);
 
     registerAuditLog({
