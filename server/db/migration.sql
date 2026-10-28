@@ -609,159 +609,16 @@ CREATE INDEX IF NOT EXISTS idx_payment_checkout_sessions_status ON payment_check
 CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_checkout_sessions_provider_tx_id ON payment_checkout_sessions (provider_tx_id) WHERE provider_tx_id IS NOT NULL AND status = 'completed';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_order_reviewer ON reviews (order_id, reviewer_id) WHERE order_id IS NOT NULL AND reviewer_id IS NOT NULL;
 
--- Referential Integrity Foreign Key Constraints with Pre-Existing Orphan Safety
-
--- 1. Orders buyer / seller / client / freelancer user reference safety
+-- Consolidated Schema Enhancements (Columns, Tables, Indexes)
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS client_id VARCHAR(64);
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS freelancer_id VARCHAR(64);
-UPDATE orders SET client_id = buyer_id WHERE client_id IS NULL AND buyer_id IS NOT NULL;
-UPDATE orders SET freelancer_id = seller_id WHERE freelancer_id IS NULL AND seller_id IS NOT NULL;
-
-INSERT INTO users (id, name, email, role, status)
-SELECT DISTINCT buyer_id, 'Legacy Buyer (' || buyer_id || ')', buyer_id || '@legacy.local', 'buyer', 'active'
-FROM orders WHERE buyer_id IS NOT NULL AND buyer_id NOT IN (SELECT id FROM users)
-ON CONFLICT (id) DO NOTHING;
-
-INSERT INTO users (id, name, email, role, status)
-SELECT DISTINCT seller_id, 'Legacy Seller (' || seller_id || ')', seller_id || '@legacy.local', 'freelancer', 'active'
-FROM orders WHERE seller_id IS NOT NULL AND seller_id NOT IN (SELECT id FROM users)
-ON CONFLICT (id) DO NOTHING;
-
-INSERT INTO users (id, name, email, role, status)
-SELECT DISTINCT client_id, 'Legacy Client (' || client_id || ')', client_id || '@legacy.local', 'buyer', 'active'
-FROM orders WHERE client_id IS NOT NULL AND client_id NOT IN (SELECT id FROM users)
-ON CONFLICT (id) DO NOTHING;
-
-INSERT INTO users (id, name, email, role, status)
-SELECT DISTINCT freelancer_id, 'Legacy Freelancer (' || freelancer_id || ')', freelancer_id || '@legacy.local', 'freelancer', 'active'
-FROM orders WHERE freelancer_id IS NOT NULL AND freelancer_id NOT IN (SELECT id FROM users)
-ON CONFLICT (id) DO NOTHING;
-
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_orders_buyer') THEN
-    ALTER TABLE orders ADD CONSTRAINT fk_orders_buyer FOREIGN KEY (buyer_id) REFERENCES users(id) ON DELETE RESTRICT;
-  END IF;
-END $$;
-
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_orders_seller') THEN
-    ALTER TABLE orders ADD CONSTRAINT fk_orders_seller FOREIGN KEY (seller_id) REFERENCES users(id) ON DELETE RESTRICT;
-  END IF;
-END $$;
-
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_orders_client') THEN
-    ALTER TABLE orders ADD CONSTRAINT fk_orders_client FOREIGN KEY (client_id) REFERENCES users(id) ON DELETE RESTRICT;
-  END IF;
-END $$;
-
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_orders_freelancer') THEN
-    ALTER TABLE orders ADD CONSTRAINT fk_orders_freelancer FOREIGN KEY (freelancer_id) REFERENCES users(id) ON DELETE RESTRICT;
-  END IF;
-END $$;
-
--- 2. Escrows orphan safety
-DELETE FROM escrows WHERE order_id NOT IN (SELECT id FROM orders);
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_escrows_order') THEN
-    ALTER TABLE escrows ADD CONSTRAINT fk_escrows_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE;
-  END IF;
-END $$;
-
--- 3. Proposals orphan safety
-DELETE FROM proposals WHERE project_id NOT IN (SELECT id FROM projects);
-INSERT INTO users (id, name, email, role, status)
-SELECT DISTINCT freelancer_id, 'Legacy Freelancer (' || freelancer_id || ')', freelancer_id || '@legacy.local', 'freelancer', 'active'
-FROM proposals WHERE freelancer_id IS NOT NULL AND freelancer_id NOT IN (SELECT id FROM users)
-ON CONFLICT (id) DO NOTHING;
-
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_proposals_project') THEN
-    ALTER TABLE proposals ADD CONSTRAINT fk_proposals_project FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
-  END IF;
-END $$;
-
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_proposals_freelancer') THEN
-    ALTER TABLE proposals ADD CONSTRAINT fk_proposals_freelancer FOREIGN KEY (freelancer_id) REFERENCES users(id) ON DELETE RESTRICT;
-  END IF;
-END $$;
-
--- 4. Reviews orphan safety
-UPDATE reviews SET reviewer_id = NULL WHERE reviewer_id IS NOT NULL AND reviewer_id NOT IN (SELECT id FROM users);
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_reviews_reviewer') THEN
-    ALTER TABLE reviews ADD CONSTRAINT fk_reviews_reviewer FOREIGN KEY (reviewer_id) REFERENCES users(id) ON DELETE SET NULL;
-  END IF;
-END $$;
-
--- 5. Disputes orphan safety
-DELETE FROM disputes WHERE order_id NOT IN (SELECT id FROM orders);
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_disputes_order') THEN
-    ALTER TABLE disputes ADD CONSTRAINT fk_disputes_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE;
-  END IF;
-END $$;
-
--- 6. Ledger entries orphan safety
-DELETE FROM ledger_entries WHERE journal_id NOT IN (SELECT id FROM ledger_journals);
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_ledger_entries_journal') THEN
-    ALTER TABLE ledger_entries ADD CONSTRAINT fk_ledger_entries_journal FOREIGN KEY (journal_id) REFERENCES ledger_journals(id) ON DELETE CASCADE;
-  END IF;
-END $$;
-
--- Authoritative Financial Database CHECK Constraints
-DO $$ BEGIN
-  ALTER TABLE wallets ADD CONSTRAINT check_wallets_available_balance CHECK (available_balance >= 0);
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
-
-DO $$ BEGIN
-  ALTER TABLE wallets ADD CONSTRAINT check_wallets_funds_on_hold CHECK (funds_on_hold >= 0);
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
-
-DO $$ BEGIN
-  ALTER TABLE wallets ADD CONSTRAINT check_wallets_pending_withdrawals CHECK (pending_withdrawals >= 0);
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
-
-DO $$ BEGIN
-  ALTER TABLE escrows ADD CONSTRAINT check_escrows_amount CHECK (amount >= 0);
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
-
-DO $$ BEGIN
-  ALTER TABLE escrows ADD CONSTRAINT check_escrows_remaining CHECK (remaining >= 0);
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
-
-DO $$ BEGIN
-  ALTER TABLE payouts ADD CONSTRAINT check_payouts_amount CHECK (amount > 0);
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
-
-DO $$ BEGIN
-  ALTER TABLE refunds ADD CONSTRAINT check_refunds_amount CHECK (amount > 0);
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
-
-DO $$ BEGIN
-  ALTER TABLE earnings_clearing ADD CONSTRAINT check_earnings_clearing_amount CHECK (amount >= 0);
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
-
-DO $$ BEGIN
-  ALTER TABLE ledger_entries ADD CONSTRAINT check_ledger_entries_debit CHECK (debit >= 0);
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
-
-DO $$ BEGIN
-  ALTER TABLE ledger_entries ADD CONSTRAINT check_ledger_entries_credit CHECK (credit >= 0);
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS selected_extras JSONB;
+ALTER TABLE payouts ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ;
+ALTER TABLE payouts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE gigs ADD COLUMN IF NOT EXISTS featured BOOLEAN DEFAULT FALSE;
+ALTER TABLE gigs ADD COLUMN IF NOT EXISTS is_featured BOOLEAN DEFAULT FALSE;
+ALTER TABLE gigs ADD COLUMN IF NOT EXISTS featured_until VARCHAR(64);
+ALTER TABLE gigs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 
 CREATE TABLE IF NOT EXISTS reconciliation_exceptions (
   id VARCHAR(64) PRIMARY KEY,
@@ -780,49 +637,6 @@ CREATE TABLE IF NOT EXISTS reconciliation_exceptions (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_reconciliation_exceptions_status ON reconciliation_exceptions(status);
-CREATE INDEX IF NOT EXISTS idx_reconciliation_exceptions_entity ON reconciliation_exceptions(entity_id);
-
-DELETE FROM workstream_offers WHERE order_id NOT IN (SELECT id FROM orders);
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_offers_order') THEN
-    ALTER TABLE workstream_offers ADD CONSTRAINT fk_offers_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE;
-  END IF;
-END $$;
-
-DELETE FROM messages WHERE order_id NOT IN (SELECT id FROM orders);
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_messages_order') THEN
-    ALTER TABLE messages ADD CONSTRAINT fk_messages_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE;
-  END IF;
-END $$;
-
-UPDATE uploads SET order_id = NULL WHERE order_id IS NOT NULL AND order_id NOT IN (SELECT id FROM orders);
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_uploads_order') THEN
-    ALTER TABLE uploads ADD CONSTRAINT fk_uploads_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE SET NULL;
-  END IF;
-END $$;
-
-CREATE INDEX IF NOT EXISTS idx_uploads_order_id ON uploads(order_id);
-CREATE INDEX IF NOT EXISTS idx_uploads_owner_id ON uploads(owner_id);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_messages_client_msg_id 
-ON messages (order_id, sender_id, (metadata->>'clientMessageId')) 
-WHERE metadata->>'clientMessageId' IS NOT NULL;
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_workstream_offers_number
-ON workstream_offers (number)
-WHERE number IS NOT NULL;
-
-ALTER TABLE payouts ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ;
-ALTER TABLE payouts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS selected_extras JSONB;
-ALTER TABLE gigs ADD COLUMN IF NOT EXISTS featured BOOLEAN DEFAULT FALSE;
-ALTER TABLE gigs ADD COLUMN IF NOT EXISTS is_featured BOOLEAN DEFAULT FALSE;
-ALTER TABLE gigs ADD COLUMN IF NOT EXISTS featured_until VARCHAR(64);
-ALTER TABLE gigs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
-
 CREATE TABLE IF NOT EXISTS outbox_events (
   id VARCHAR(64) PRIMARY KEY,
   event_type VARCHAR(128) NOT NULL,
@@ -836,9 +650,13 @@ CREATE TABLE IF NOT EXISTS outbox_events (
   processed_at TIMESTAMPTZ
 );
 
+CREATE INDEX IF NOT EXISTS idx_payment_checkout_sessions_provider_tx_id ON payment_checkout_sessions (provider_tx_id) WHERE provider_tx_id IS NOT NULL AND status = 'completed';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_order_reviewer ON reviews (order_id, reviewer_id) WHERE order_id IS NOT NULL AND reviewer_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_reconciliation_exceptions_status ON reconciliation_exceptions(status);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_exceptions_entity ON reconciliation_exceptions(entity_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_messages_client_msg_id ON messages (order_id, sender_id, (metadata->>'clientMessageId')) WHERE metadata->>'clientMessageId' IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_workstream_offers_number ON workstream_offers (number) WHERE number IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_outbox_events_status ON outbox_events(status, created_at);
-
--- Performance & Integrity Indexes for Gigs
 CREATE INDEX IF NOT EXISTS idx_gigs_freelancer_id ON gigs(freelancer_id);
 CREATE INDEX IF NOT EXISTS idx_gigs_status_moderation ON gigs(status, moderation_status);
 
@@ -852,24 +670,150 @@ WHERE id IN (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_gigs_unique_slug ON gigs(slug) WHERE slug IS NOT NULL AND slug != '';
 
--- Foreign Key Constraints for Orders and Gigs
-UPDATE orders SET gig_id = NULL WHERE gig_id IS NOT NULL AND gig_id NOT IN (SELECT id FROM gigs);
+-- Authoritative Financial Database CHECK Constraints
 DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_orders_gig') THEN
-    ALTER TABLE orders ADD CONSTRAINT fk_orders_gig FOREIGN KEY (gig_id) REFERENCES gigs(id) ON DELETE SET NULL;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'check_wallets_available_balance') THEN
+    ALTER TABLE wallets ADD CONSTRAINT check_wallets_available_balance CHECK (available_balance >= 0);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'check_wallets_funds_on_hold') THEN
+    ALTER TABLE wallets ADD CONSTRAINT check_wallets_funds_on_hold CHECK (funds_on_hold >= 0);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'check_wallets_pending_withdrawals') THEN
+    ALTER TABLE wallets ADD CONSTRAINT check_wallets_pending_withdrawals CHECK (pending_withdrawals >= 0);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'check_escrows_amount') THEN
+    ALTER TABLE escrows ADD CONSTRAINT check_escrows_amount CHECK (amount >= 0);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'check_escrows_remaining') THEN
+    ALTER TABLE escrows ADD CONSTRAINT check_escrows_remaining CHECK (remaining >= 0);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'check_payouts_amount') THEN
+    ALTER TABLE payouts ADD CONSTRAINT check_payouts_amount CHECK (amount > 0);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'check_refunds_amount') THEN
+    ALTER TABLE refunds ADD CONSTRAINT check_refunds_amount CHECK (amount > 0);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'check_earnings_clearing_amount') THEN
+    ALTER TABLE earnings_clearing ADD CONSTRAINT check_earnings_clearing_amount CHECK (amount >= 0);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'check_ledger_entries_debit') THEN
+    ALTER TABLE ledger_entries ADD CONSTRAINT check_ledger_entries_debit CHECK (debit >= 0);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'check_ledger_entries_credit') THEN
+    ALTER TABLE ledger_entries ADD CONSTRAINT check_ledger_entries_credit CHECK (credit >= 0);
   END IF;
 END $$;
 
+-- Referential Integrity Foreign Key Constraints with Pre-Existing Orphan Safety
+
+-- 0. Seed System/Legacy Parent Records
+INSERT INTO users (id, name, email, role, status)
+VALUES ('legacy_system', 'Legacy System', 'system@legacy.local', 'admin', 'active')
+ON CONFLICT (id) DO NOTHING;
+
+-- 1. User reference safety for all tables
+INSERT INTO users (id, name, email, role, status)
+SELECT DISTINCT buyer_id, 'Legacy Buyer (' || buyer_id || ')', buyer_id || '@legacy.local', 'buyer', 'active'
+FROM orders WHERE buyer_id IS NOT NULL AND buyer_id NOT IN (SELECT id FROM users)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO users (id, name, email, role, status)
+SELECT DISTINCT seller_id, 'Legacy Seller (' || seller_id || ')', seller_id || '@legacy.local', 'freelancer', 'active'
+FROM orders WHERE seller_id IS NOT NULL AND seller_id NOT IN (SELECT id FROM users)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO users (id, name, email, role, status)
+SELECT DISTINCT freelancer_id, 'Legacy Freelancer (' || freelancer_id || ')', freelancer_id || '@legacy.local', 'freelancer', 'active'
+FROM proposals WHERE freelancer_id IS NOT NULL AND freelancer_id NOT IN (SELECT id FROM users)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO users (id, name, email, role, status)
+SELECT DISTINCT freelancer_id, 'Legacy Freelancer (' || freelancer_id || ')', freelancer_id || '@legacy.local', 'freelancer', 'active'
+FROM gigs WHERE freelancer_id IS NOT NULL AND freelancer_id NOT IN (SELECT id FROM users)
+ON CONFLICT (id) DO NOTHING;
+
+-- 2. Project reference safety
+INSERT INTO projects (id, buyer_id, buyer_name, title, category, created_at, status)
+SELECT DISTINCT project_id, 'legacy_system', 'Legacy System', 'Legacy Project (' || project_id || ')', 'General', '2020-01-01', 'closed'
+FROM proposals WHERE project_id NOT IN (SELECT id FROM projects)
+ON CONFLICT (id) DO NOTHING;
+
+-- 3. Order reference safety
+INSERT INTO orders (id, title, buyer_id, seller_id, amount, status, created_at, due_date)
+SELECT DISTINCT order_id, 'Legacy Order (' || order_id || ')', 'legacy_system', 'legacy_system', 0, 'cancelled', '2020-01-01', '2020-01-01'
+FROM (
+  SELECT order_id FROM escrows
+  UNION SELECT order_id FROM disputes
+  UNION SELECT order_id FROM workstream_offers
+  UNION SELECT order_id FROM messages
+) orphans WHERE order_id NOT IN (SELECT id FROM orders)
+ON CONFLICT (id) DO NOTHING;
+
+-- 4. Journal reference safety
+INSERT INTO ledger_journals (id, reference, description, event_type, actor)
+SELECT DISTINCT journal_id, 'LEGACY-' || journal_id, 'Legacy Journal Entry', 'LEGACY_IMPORT', 'system'
+FROM ledger_entries WHERE journal_id NOT IN (SELECT id FROM ledger_journals)
+ON CONFLICT (id) DO NOTHING;
+
+-- 5. Gig reference safety
+UPDATE orders SET gig_id = NULL WHERE gig_id IS NOT NULL AND gig_id NOT IN (SELECT id FROM gigs);
+
+-- 6. Apply Foreign Key Constraints
 DO $$ BEGIN
-  IF EXISTS (
-    SELECT 1 FROM pg_constraint c
-    JOIN pg_namespace n ON n.oid = c.connamespace
-    WHERE c.conname = 'fk_gigs_freelancer' AND c.confdeltype = 'c'
-  ) THEN
+  -- User FKs
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_orders_buyer') THEN
+    ALTER TABLE orders ADD CONSTRAINT fk_orders_buyer FOREIGN KEY (buyer_id) REFERENCES users(id) ON DELETE RESTRICT;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_orders_seller') THEN
+    ALTER TABLE orders ADD CONSTRAINT fk_orders_seller FOREIGN KEY (seller_id) REFERENCES users(id) ON DELETE RESTRICT;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_orders_client') THEN
+    ALTER TABLE orders ADD CONSTRAINT fk_orders_client FOREIGN KEY (client_id) REFERENCES users(id) ON DELETE RESTRICT;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_orders_freelancer') THEN
+    ALTER TABLE orders ADD CONSTRAINT fk_orders_freelancer FOREIGN KEY (freelancer_id) REFERENCES users(id) ON DELETE RESTRICT;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_proposals_freelancer') THEN
+    ALTER TABLE proposals ADD CONSTRAINT fk_proposals_freelancer FOREIGN KEY (freelancer_id) REFERENCES users(id) ON DELETE RESTRICT;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_reviews_reviewer') THEN
+    UPDATE reviews SET reviewer_id = NULL WHERE reviewer_id IS NOT NULL AND reviewer_id NOT IN (SELECT id FROM users);
+    ALTER TABLE reviews ADD CONSTRAINT fk_reviews_reviewer FOREIGN KEY (reviewer_id) REFERENCES users(id) ON DELETE SET NULL;
+  END IF;
+
+  -- Gigs FK (ON DELETE RESTRICT to preserve data)
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_gigs_freelancer' AND confdeltype = 'c') THEN
     ALTER TABLE gigs DROP CONSTRAINT fk_gigs_freelancer;
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_gigs_freelancer') THEN
     ALTER TABLE gigs ADD CONSTRAINT fk_gigs_freelancer FOREIGN KEY (freelancer_id) REFERENCES users(id) ON DELETE RESTRICT;
+  END IF;
+
+  -- Project/Order/Journal FKs
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_proposals_project') THEN
+    ALTER TABLE proposals ADD CONSTRAINT fk_proposals_project FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_escrows_order') THEN
+    ALTER TABLE escrows ADD CONSTRAINT fk_escrows_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_disputes_order') THEN
+    ALTER TABLE disputes ADD CONSTRAINT fk_disputes_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_offers_order') THEN
+    ALTER TABLE workstream_offers ADD CONSTRAINT fk_offers_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_messages_order') THEN
+    ALTER TABLE messages ADD CONSTRAINT fk_messages_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_uploads_order') THEN
+    UPDATE uploads SET order_id = NULL WHERE order_id IS NOT NULL AND order_id NOT IN (SELECT id FROM orders);
+    ALTER TABLE uploads ADD CONSTRAINT fk_uploads_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE SET NULL;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_orders_gig') THEN
+    ALTER TABLE orders ADD CONSTRAINT fk_orders_gig FOREIGN KEY (gig_id) REFERENCES gigs(id) ON DELETE SET NULL;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_ledger_entries_journal') THEN
+    ALTER TABLE ledger_entries ADD CONSTRAINT fk_ledger_entries_journal FOREIGN KEY (journal_id) REFERENCES ledger_journals(id) ON DELETE CASCADE;
   END IF;
 END $$;
 
