@@ -1561,28 +1561,6 @@ router.post('/orders/:id/cancel-request/respond', requireAuth, requireActiveStat
   try {
     const userId = (req as any).authenticatedUserId;
     const caller = await store.getUser(userId);
-    const order = await store.getOrder(orderId);
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (!order.cancellationRequest || order.cancellationRequest.status !== 'pending') {
-      return res.status(400).json({ error: 'No pending cancellation request found for this order.' });
-    }
-
-    if (order.status === 'disputed') {
-      return res.status(409).json({ error: 'Cannot process cancellation: This order is currently under active dispute.' });
-    }
-    const activeDispute = await store.getDisputeByOrderId(order.id);
-    if (activeDispute && (activeDispute.status === 'open' || activeDispute.status === 'under_investigation')) {
-      return res.status(409).json({ error: 'Cannot process cancellation: This order has an active unresolved dispute.' });
-    }
-
-    const isBuyer = userId === order.buyerId;
-    const isSeller = userId === order.sellerId;
-    if (!isBuyer && !isSeller) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-    if (userId === order.cancellationRequest.requesterId) {
-      return res.status(403).json({ error: 'You cannot respond to your own cancellation request.' });
-    }
 
     const { action, reason } = req.body;
     if (!['accept', 'reject'].includes(action)) {
@@ -1592,55 +1570,154 @@ router.post('/orders/:id/cancel-request/respond', requireAuth, requireActiveStat
       return res.status(400).json({ error: 'Rejection reason is required when rejecting a cancellation request.' });
     }
 
-    const isExpired = Boolean(
-      order.cancellationRequest.respondBy &&
-      new Date() > new Date(order.cancellationRequest.respondBy)
-    );
-    if (isExpired && action === 'reject') {
-      return res.status(400).json({
-        error: 'The 48-hour response window for this cancellation request has expired and it can no longer be rejected.'
-      });
-    }
+    const txResult = await postgresStore.executeInTransaction(async (client) => {
+      const orderRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+      if (orderRes.rows.length === 0) {
+        const err: any = new Error('Order not found');
+        err.statusCode = 404;
+        throw err;
+      }
+      const orderRow = orderRes.rows[0];
+      const order = (store as any).mapOrderRow ? (store as any).mapOrderRow(orderRow) : await store.getOrder(orderId);
+      if (!order) {
+        const err: any = new Error('Order not found');
+        err.statusCode = 404;
+        throw err;
+      }
 
-    const now = new Date().toISOString();
-    order.cancellationRequest.respondedBy = userId;
-    order.cancellationRequest.respondedAt = now;
+      let cancelReq = order.cancellationRequest;
+      if (typeof cancelReq === 'string') {
+        try { cancelReq = JSON.parse(cancelReq); } catch {}
+      }
+      if (!cancelReq || cancelReq.status !== 'pending') {
+        const err: any = new Error('No pending cancellation request found for this order.');
+        err.statusCode = 400;
+        throw err;
+      }
 
-    if (action === 'accept') {
-      const actorName = caller?.name || (isBuyer ? 'Buyer' : 'Seller');
-      order.cancellationRequest.status = 'accepted';
-      if (Array.isArray(order.cancellationHistory)) {
-        for (const ch of order.cancellationHistory) {
-          if (ch.requestedAt === order.cancellationRequest.requestedAt) {
-            ch.status = 'accepted';
-            ch.respondedBy = userId;
-            ch.respondedAt = now;
+      if (order.status === 'disputed') {
+        const err: any = new Error('Cannot process cancellation: This order is currently under active dispute.');
+        err.statusCode = 409;
+        throw err;
+      }
+
+      const activeDisputeRes = await client.query(
+        "SELECT id FROM disputes WHERE order_id = $1 AND status IN ('open', 'under_investigation', 'under_review') LIMIT 1",
+        [order.id]
+      );
+      if (activeDisputeRes.rows.length > 0) {
+        const err: any = new Error('Cannot process cancellation: This order has an active unresolved dispute.');
+        err.statusCode = 409;
+        throw err;
+      }
+
+      const isBuyer = userId === order.buyerId;
+      const isSeller = userId === order.sellerId;
+      if (!isBuyer && !isSeller) {
+        const err: any = new Error('Forbidden');
+        err.statusCode = 403;
+        throw err;
+      }
+      if (userId === cancelReq.requesterId) {
+        const err: any = new Error('You cannot respond to your own cancellation request.');
+        err.statusCode = 403;
+        throw err;
+      }
+
+      const isExpired = Boolean(
+        cancelReq.respondBy &&
+        new Date() > new Date(cancelReq.respondBy)
+      );
+      if (isExpired && action === 'reject') {
+        const err: any = new Error('The 48-hour response window for this cancellation request has expired and it can no longer be rejected.');
+        err.statusCode = 400;
+        throw err;
+      }
+
+      const now = new Date().toISOString();
+      cancelReq.respondedBy = userId;
+      cancelReq.respondedAt = now;
+
+      if (action === 'accept') {
+        const actorName = caller?.name || (isBuyer ? 'Buyer' : 'Seller');
+        cancelReq.status = 'accepted';
+        if (Array.isArray(order.cancellationHistory)) {
+          for (const ch of order.cancellationHistory) {
+            if (ch.requestedAt === cancelReq.requestedAt) {
+              ch.status = 'accepted';
+              ch.respondedBy = userId;
+              ch.respondedAt = now;
+            }
           }
         }
-      }
 
-      let refundedAmt = 0;
-      if (order.amount === 0 || /^inquiry:/i.test(order.title)) {
-        order.status = 'cancelled';
-        await postgresStore.getPool().query(
-          "UPDATE orders SET status = 'cancelled', cancellation_type = 'inquiry_cancelled', cancellation_request = $1, cancellation_history = $2 WHERE id = $3",
-          [JSON.stringify(order.cancellationRequest), JSON.stringify(order.cancellationHistory || []), order.id]
-        );
+        let refundedAmt = 0;
+        if (order.amount === 0 || /^inquiry:/i.test(order.title)) {
+          order.status = 'cancelled';
+          await client.query(
+            "UPDATE orders SET status = 'cancelled', cancellation_type = 'inquiry_cancelled', cancellation_request = $1, cancellation_history = $2 WHERE id = $3",
+            [JSON.stringify(cancelReq), JSON.stringify(order.cancellationHistory || []), order.id]
+          );
+        } else {
+          const requestKey = `cancel_accept_${order.id}_${cancelReq.requestedAt}`;
+          const refundRes = await refundOrderFunds(
+            order, 
+            undefined, 
+            actorName, 
+            `Mutual cancellation accepted: ${cancelReq.reason}`, 
+            requestKey,
+            { cancellationRequest: cancelReq, cancellationHistory: order.cancellationHistory },
+            false,
+            client
+          );
+          refundedAmt = refundRes.refunded;
+        }
+
+        return { order, action: 'accept', refundedAmt, cancelReq, isBuyer, isSeller, caller };
       } else {
-        const requestKey = `cancel_accept_${order.id}_${order.cancellationRequest.requestedAt}`;
-        const refundRes = await refundOrderFunds(
-          order, 
-          undefined, 
-          actorName, 
-          `Mutual cancellation accepted: ${order.cancellationRequest.reason}`, 
-          requestKey,
-          { cancellationRequest: order.cancellationRequest, cancellationHistory: order.cancellationHistory }
-        );
-        refundedAmt = refundRes.refunded;
-      }
+        const rejectedReq = { ...cancelReq, status: 'rejected' as const, rejectionReason: String(reason).trim() };
+        if (Array.isArray(order.cancellationHistory)) {
+          for (const ch of order.cancellationHistory) {
+            if (ch.requestedAt === cancelReq.requestedAt) {
+              ch.status = 'rejected';
+              ch.rejectionReason = String(reason).trim();
+              ch.respondedBy = userId;
+              ch.respondedAt = now;
+            }
+          }
+        }
+        if (order.status === 'delivered') {
+          order.reviewWindowRestartedAt = now;
+        }
 
+        const updateRes = await client.query(
+          `UPDATE orders 
+           SET cancellation_request = NULL, 
+               cancellation_history = $1, 
+               review_window_restarted_at = COALESCE($2, review_window_restarted_at) 
+           WHERE id = $3 AND cancellation_request IS NOT NULL`,
+          [
+            JSON.stringify(order.cancellationHistory || []),
+            order.reviewWindowRestartedAt || null,
+            order.id
+          ]
+        );
+        if (updateRes.rowCount === 0) {
+          const err: any = new Error('Order status changed concurrently; cannot reject cancellation request.');
+          err.statusCode = 409;
+          throw err;
+        }
+
+        order.cancellationRequest = undefined as any;
+        return { order, action: 'reject', rejectedReq, isBuyer, isSeller, caller };
+      }
+    });
+
+    if (txResult.action === 'accept') {
+      const { order, cancelReq } = txResult;
+      const refundedAmt = txResult.refundedAmt || 0;
       createNotification({
-        userId: order.cancellationRequest.requesterId,
+        userId: cancelReq.requesterId,
         title: 'Cancellation Accepted',
         message: `Your cancellation request for order #${order.id} was accepted.${refundedAmt > 0 ? ` Full refund issued ($${refundedAmt}).` : ' Order closed.'}`,
         type: 'order',
@@ -1649,8 +1726,8 @@ router.post('/orders/:id/cancel-request/respond', requireAuth, requireActiveStat
 
       registerAuditLog({
         id: 'log_' + Date.now(),
-        actor: actorName,
-        role: caller?.role || 'user',
+        actor: txResult.caller?.name || (txResult.isBuyer ? 'Buyer' : 'Seller'),
+        role: txResult.caller?.role || 'user',
         action: 'GIG_CANCELLATION_ACCEPTED',
         target: `Order #${order.id}`,
         details: `Cancellation accepted. ${refundedAmt > 0 ? `Full refund of $${refundedAmt} issued.` : 'Inquiry closed.'}`,
@@ -1659,36 +1736,7 @@ router.post('/orders/:id/cancel-request/respond', requireAuth, requireActiveStat
 
       return res.json({ success: true, order: enrichOrderWithServiceInfo(order), refunded: refundedAmt });
     } else {
-      const rejectedReq = { ...order.cancellationRequest, status: 'rejected' as const, rejectionReason: String(reason).trim() };
-      if (Array.isArray(order.cancellationHistory)) {
-        for (const ch of order.cancellationHistory) {
-          if (ch.requestedAt === order.cancellationRequest.requestedAt) {
-            ch.status = 'rejected';
-            ch.rejectionReason = String(reason).trim();
-            ch.respondedBy = userId;
-            ch.respondedAt = now;
-          }
-        }
-      }
-      if (order.status === 'delivered') {
-        order.reviewWindowRestartedAt = now;
-      }
-      order.cancellationRequest = undefined as any;
-
-      const rejectUpdated = await store.updateOrderStatus(
-        order.id,
-        {
-          cancellation_request: null,
-          cancellation_history: JSON.stringify(order.cancellationHistory || []),
-          review_window_restarted_at: order.reviewWindowRestartedAt || null
-        },
-        ['payment_pending', 'funded_in_escrow', 'in_progress', 'delivered', 'revision', 'draft_review', 'work_in_progress']
-      );
-      if (!rejectUpdated) {
-        return res.status(409).json({ error: 'Order status changed concurrently; cannot reject cancellation request.' });
-      }
-
-      const actorName = caller?.name || (isBuyer ? 'Buyer' : 'Seller');
+      const { order, rejectedReq } = txResult;
       createNotification({
         userId: rejectedReq.requesterId,
         title: 'Cancellation Rejected',
@@ -1699,8 +1747,8 @@ router.post('/orders/:id/cancel-request/respond', requireAuth, requireActiveStat
 
       registerAuditLog({
         id: 'log_' + randomUUID(),
-        actor: actorName,
-        role: caller?.role || 'user',
+        actor: txResult.caller?.name || (txResult.isBuyer ? 'Buyer' : 'Seller'),
+        role: txResult.caller?.role || 'user',
         action: 'GIG_CANCELLATION_REJECTED',
         target: `Order #${order.id}`,
         details: `Cancellation rejected. Reason: ${reason}`,
@@ -1710,7 +1758,8 @@ router.post('/orders/:id/cancel-request/respond', requireAuth, requireActiveStat
       return res.json({ success: true, order: enrichOrderWithServiceInfo(order) });
     }
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    const statusCode = err?.statusCode || 400;
+    res.status(statusCode).json({ error: err.message });
   } finally {
     releaseOrderLock(orderId);
   }
@@ -1721,87 +1770,113 @@ const handleOrderCancel = async (req: Request, res: Response) => {
   if (!tryAcquireOrderLock(orderId, res)) return;
 
   try {
-    const order = await store.getOrder(orderId);
-    if (!order) return res.status(404).json({ error: 'Order not found' });
     const authUserId = (req as any).authenticatedUserId;
     const caller = (req as any).authenticatedUser || (authUserId ? await store.getUser(authUserId) : null);
-
-    const isStaff = isStaffUser(caller);
-    const isBuyer = authUserId === order.buyerId;
-    const isSeller = authUserId === order.sellerId;
-
-    if (!isStaff && !isBuyer && !isSeller) {
-      return res.status(403).json({ error: 'Forbidden: You are not a participant of this order.' });
-    }
-
-    if (order.status === 'completed' || order.status === 'cancelled' || (order.status as string) === 'refunded') {
-      return res.status(400).json({ error: `Cannot cancel order with status "${order.status}". Cancellation is not allowed for completed, cancelled, or refunded orders.` });
-    }
-
-    const pool = postgresStore.getPool();
-    const dispRes = await pool.query(
-      "SELECT 1 FROM disputes WHERE order_id = $1 AND status IN ('open', 'under_review') LIMIT 1",
-      [order.id]
-    );
-    if (!isStaff && dispRes.rows.length > 0) {
-      return res.status(400).json({ error: 'Direct cancellation is blocked because an active dispute is open. Please resolve the dispute or contact support.' });
-    }
-
-    const hasFundedEscrow = await orderHasEscrow(order.id);
-    const isGigOrder = order.orderType === 'gig' || Boolean(order.gigOrderId) || Boolean(order.gigId);
-
-    if (!isStaff && order.status !== 'payment_pending') {
-      if (isSeller) {
-        if (isGigOrder && (hasFundedEscrow || ['funded_in_escrow', 'in_progress', 'delivered', 'revision', 'revision_requested'].includes(order.status))) {
-          return res.status(400).json({
-            error: 'Direct cancellation is not allowed for funded gig orders. Please submit a cancellation request (POST /api/orders/:id/cancel-request).'
-          });
-        }
-        if (!isGigOrder && !['funded_in_escrow', 'in_progress'].includes(order.status)) {
-          return res.status(400).json({
-            error: `Seller cannot directly cancel a project order in "${order.status}" status.`
-          });
-        }
-      } else if (isBuyer) {
-        if (['delivered', 'revision', 'revision_requested', 'draft_review', 'disputed'].includes(order.status)) {
-          return res.status(403).json({
-            error: 'Cannot directly cancel an active or delivered order. Please request a revision, submit a cancellation request, or open a dispute.'
-          });
-        }
-        if (['funded_in_escrow', 'in_progress'].includes(order.status) || hasFundedEscrow) {
-          const hasZeroDeliveries = (!order.deliveryHistory || order.deliveryHistory.length === 0) && (!order.deliverableFiles || order.deliverableFiles.length === 0);
-          const deadlineMs = parseDeadlineInstant(order.dueDate, order.createdAt);
-          const isVeryLateGig = isGigOrder && deadlineMs !== null && (Date.now() > deadlineMs + LATE_ORDER_PROTECTION_HOURS * 3600 * 1000) && hasZeroDeliveries;
-          if (!isVeryLateGig) {
-            return res.status(403).json({
-              error: 'Cannot directly cancel an active or delivered order. Please submit a cancellation request (POST /api/orders/:id/cancel-request) or open a dispute (POST /api/orders/:id/dispute).'
-            });
-          }
-          order.cancellationType = 'very_late';
-        }
-      }
-    }
-
-    const actor = caller?.name || `user:${authUserId}`;
     const reason = (req.body?.reason || 'Order cancelled').trim();
-    if (hasFundedEscrow) {
-      await refundOrderFunds(order, undefined, actor, reason);
-    } else {
-      const cancelUpdated = await store.updateOrderStatus(
-        order.id,
-        { status: 'cancelled', cancellation_type: order.cancellationType || null },
-        ['payment_pending', 'funded_in_escrow', 'in_progress']
-      );
-      if (!cancelUpdated) {
-        return res.status(409).json({ error: 'Order status changed concurrently; cannot cancel order.' });
+
+    const txResult = await postgresStore.executeInTransaction(async (client) => {
+      const orderRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+      if (orderRes.rows.length === 0) {
+        const err: any = new Error('Order not found');
+        err.statusCode = 404;
+        throw err;
       }
-      order.status = 'cancelled';
-    }
+
+      const orderRow = orderRes.rows[0];
+      const order = (store as any).mapOrderRow ? (store as any).mapOrderRow(orderRow) : await store.getOrder(orderId);
+      if (!order) {
+        const err: any = new Error('Order not found');
+        err.statusCode = 404;
+        throw err;
+      }
+
+      const isStaff = isStaffUser(caller);
+      const isBuyer = authUserId === order.buyerId;
+      const isSeller = authUserId === order.sellerId;
+
+      if (!isStaff && !isBuyer && !isSeller) {
+        const err: any = new Error('Forbidden: You are not a participant of this order.');
+        err.statusCode = 403;
+        throw err;
+      }
+
+      if (order.status === 'completed' || order.status === 'cancelled' || (order.status as string) === 'refunded') {
+        const err: any = new Error(`Cannot cancel order with status "${order.status}". Cancellation is not allowed for completed, cancelled, or refunded orders.`);
+        err.statusCode = 400;
+        throw err;
+      }
+
+      const dispRes = await client.query(
+        "SELECT 1 FROM disputes WHERE order_id = $1 AND status IN ('open', 'under_review') LIMIT 1",
+        [order.id]
+      );
+      if (!isStaff && dispRes.rows.length > 0) {
+        const err: any = new Error('Direct cancellation is blocked because an active dispute is open. Please resolve the dispute or contact support.');
+        err.statusCode = 400;
+        throw err;
+      }
+
+      const hasFundedEscrow = await orderHasEscrow(order.id);
+      const isGigOrder = order.orderType === 'gig' || Boolean(order.gigOrderId) || Boolean(order.gigId);
+
+      if (!isStaff && order.status !== 'payment_pending') {
+        if (isSeller) {
+          if (isGigOrder && (hasFundedEscrow || ['funded_in_escrow', 'in_progress', 'delivered', 'revision', 'revision_requested'].includes(order.status))) {
+            const err: any = new Error('Direct cancellation is not allowed for funded gig orders. Please submit a cancellation request (POST /api/orders/:id/cancel-request).');
+            err.statusCode = 400;
+            throw err;
+          }
+          if (!isGigOrder && !['funded_in_escrow', 'in_progress'].includes(order.status)) {
+            const err: any = new Error(`Seller cannot directly cancel a project order in "${order.status}" status.`);
+            err.statusCode = 400;
+            throw err;
+          }
+        } else if (isBuyer) {
+          if (['delivered', 'revision', 'revision_requested', 'draft_review', 'disputed'].includes(order.status)) {
+            const err: any = new Error('Cannot directly cancel an active or delivered order. Please request a revision, submit a cancellation request, or open a dispute.');
+            err.statusCode = 403;
+            throw err;
+          }
+          if (['funded_in_escrow', 'in_progress'].includes(order.status) || hasFundedEscrow) {
+            const hasZeroDeliveries = (!order.deliveryHistory || order.deliveryHistory.length === 0) && (!order.deliverableFiles || order.deliverableFiles.length === 0);
+            const deadlineMs = parseDeadlineInstant(order.dueDate, order.createdAt);
+            const isVeryLateGig = isGigOrder && deadlineMs !== null && (Date.now() > deadlineMs + LATE_ORDER_PROTECTION_HOURS * 3600 * 1000) && hasZeroDeliveries;
+            if (!isVeryLateGig) {
+              const err: any = new Error('Cannot directly cancel an active or delivered order. Please submit a cancellation request (POST /api/orders/:id/cancel-request) or open a dispute (POST /api/orders/:id/dispute).');
+              err.statusCode = 403;
+              throw err;
+            }
+            order.cancellationType = 'very_late';
+          }
+        }
+      }
+
+      const actor = caller?.name || `user:${authUserId}`;
+      if (hasFundedEscrow) {
+        await refundOrderFunds(order, undefined, actor, reason, undefined, undefined, false, client);
+      } else {
+        const updateRes = await client.query(
+          `UPDATE orders SET status = 'cancelled', cancellation_type = $1 WHERE id = $2 AND status NOT IN ('completed', 'cancelled')`,
+          [order.cancellationType || null, order.id]
+        );
+        if (updateRes.rowCount === 0) {
+          const err: any = new Error('Order status changed concurrently; cannot cancel order.');
+          err.statusCode = 409;
+          throw err;
+        }
+        order.status = 'cancelled';
+      }
+
+      return { order };
+    });
+
+    const { order } = txResult;
     await cancelPendingOffersForOrder(order.id, caller?.id);
     await emitSystemEvent(order.id, 'order_cancelled', `Order was cancelled. Reason: ${reason}`);
     res.json({ success: true, order: enrichOrderWithServiceInfo(order) });
   } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Failed to cancel order' });
+    const statusCode = err?.statusCode || 400;
+    res.status(statusCode).json({ error: err.message || 'Failed to cancel order' });
   } finally {
     releaseOrderLock(orderId);
   }

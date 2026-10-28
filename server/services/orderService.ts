@@ -325,7 +325,8 @@ export async function releaseOrderFunds(
   reason: string, 
   approvedByBuyer: boolean, 
   requestKey?: string,
-  allowDisputeResolution?: boolean
+  allowDisputeResolution?: boolean,
+  externalClient?: any
 ) {
   if (order.status === 'completed' && !requestKey) {
     throw new Error('Order is already completed; funds were already released.');
@@ -340,7 +341,7 @@ export async function releaseOrderFunds(
     reason,
     idempotencyKey: requestKey,
     allowDisputeResolution
-  });
+  }, externalClient);
 
   order.status = 'completed';
   if (!order.completedAt) {
@@ -377,7 +378,8 @@ export async function refundOrderFunds(
   reason: string, 
   requestKey?: string,
   cancellationData?: { cancellationRequest?: any; cancellationHistory?: any },
-  allowDisputeResolution?: boolean
+  allowDisputeResolution?: boolean,
+  externalClient?: any
 ) {
   const result = await financialTransactionService.refundOrderFunds({
     orderId: order.id,
@@ -386,14 +388,15 @@ export async function refundOrderFunds(
     actor,
     idempotencyKey: requestKey,
     allowDisputeResolution
-  });
+  }, externalClient);
 
   if (result.remaining === 0) {
     order.status = 'cancelled';
   }
 
   await syncUserBalances([order.buyerId, order.sellerId].filter(Boolean));
-  await postgresStore.getPool().query(
+  const dbRunner = externalClient || postgresStore.getPool();
+  await dbRunner.query(
     `UPDATE orders 
      SET status = $1, 
          cancellation_type = COALESCE($2, cancellation_type),
@@ -525,78 +528,117 @@ export async function processCancellationTimeouts() {
           continue;
         }
         try {
-          const freshOrder = await store.getOrder(order.id);
-          if (!freshOrder || freshOrder.status === 'completed' || freshOrder.status === 'cancelled' || freshOrder.status === 'disputed' || !freshOrder.cancellationRequest || freshOrder.cancellationRequest.status !== 'pending') {
-            continue;
-          }
+          await postgresStore.executeInTransaction(async (client) => {
+            const lockRes = await client.query(
+              "SELECT * FROM orders WHERE id = $1 FOR UPDATE",
+              [order.id]
+            );
+            if (lockRes.rows.length === 0) return;
+            const freshRow = lockRes.rows[0];
 
-          const activeDisputeRes = await pool.query(
-            "SELECT 1 FROM disputes WHERE order_id = $1 AND status IN ('open', 'under_investigation', 'under_review') LIMIT 1",
-            [freshOrder.id]
-          );
-          if (activeDisputeRes.rows.length > 0) {
-            continue;
-          }
+            if (freshRow.status === 'completed' || freshRow.status === 'cancelled' || freshRow.status === 'disputed') {
+              return;
+            }
 
-          const requesterId = freshOrder.cancellationRequest.requesterId;
-          const otherId = requesterId === freshOrder.buyerId ? freshOrder.sellerId : freshOrder.buyerId;
+            let cancelReq = freshRow.cancellation_request;
+            if (typeof cancelReq === 'string') {
+              try { cancelReq = JSON.parse(cancelReq); } catch {}
+            }
+            if (!cancelReq || cancelReq.status !== 'pending') {
+              return;
+            }
 
-          if (freshOrder.amount === 0 || /^inquiry:/i.test(freshOrder.title)) {
-            freshOrder.status = 'cancelled';
-            freshOrder.cancellationRequest.status = 'auto_cancelled';
+            const respondByTimeMs = new Date(cancelReq.respondBy).getTime();
+            if (now <= respondByTimeMs) {
+              return;
+            }
+
+            const activeDisputeRes = await client.query(
+              "SELECT 1 FROM disputes WHERE order_id = $1 AND status IN ('open', 'under_investigation', 'under_review') LIMIT 1",
+              [order.id]
+            );
+            if (activeDisputeRes.rows.length > 0) {
+              return;
+            }
+
+            const freshOrder = (store as any).mapOrderRow ? (store as any).mapOrderRow(freshRow) : await store.getOrder(order.id);
+            if (!freshOrder) return;
+
+            const requesterId = cancelReq.requesterId;
+            const otherId = requesterId === freshOrder.buyerId ? freshOrder.sellerId : freshOrder.buyerId;
+
+            if (freshOrder.amount === 0 || /^inquiry:/i.test(freshOrder.title)) {
+              freshOrder.status = 'cancelled';
+              cancelReq.status = 'auto_cancelled';
+              freshOrder.cancellationRequest = cancelReq;
+              if (Array.isArray(freshOrder.cancellationHistory)) {
+                for (const ch of freshOrder.cancellationHistory) {
+                  if (ch.requestedAt === cancelReq.requestedAt) {
+                    ch.status = 'auto_cancelled';
+                  }
+                }
+              }
+              await client.query(
+                "UPDATE orders SET status = 'cancelled', cancellation_type = 'inquiry_cancelled', cancellation_request = $1, cancellation_history = $2 WHERE id = $3",
+                [JSON.stringify(cancelReq), JSON.stringify(freshOrder.cancellationHistory || []), freshOrder.id]
+              );
+              createNotification({
+                userId: requesterId,
+                title: 'Inquiry Cancelled',
+                message: `Inquiry thread #${freshOrder.id} request timed out and was closed.`,
+                type: 'order',
+                link: `/messages/${freshOrder.id}`
+              });
+              createNotification({
+                userId: otherId,
+                title: 'Inquiry Cancelled',
+                message: `Inquiry thread #${freshOrder.id} request timed out and was closed.`,
+                type: 'order',
+                link: `/messages/${freshOrder.id}`
+              });
+              return;
+            }
+
+            const requestKey = `cancel_timeout_${freshOrder.id}_${cancelReq.requestedAt}`;
+            freshOrder.cancellationRequest = cancelReq;
+            const refundRes = await refundOrderFunds(
+              freshOrder, 
+              undefined, 
+              'System Auto-Cancel', 
+              'Cancellation request auto-cancelled after 48h timeout', 
+              requestKey,
+              undefined,
+              false,
+              client
+            );
+
+            cancelReq.status = 'auto_cancelled';
             if (Array.isArray(freshOrder.cancellationHistory)) {
               for (const ch of freshOrder.cancellationHistory) {
-                if (ch.requestedAt === freshOrder.cancellationRequest.requestedAt) {
+                if (ch.requestedAt === cancelReq.requestedAt) {
                   ch.status = 'auto_cancelled';
                 }
               }
             }
-            await pool.query(
-              "UPDATE orders SET status = 'cancelled', cancellation_type = 'inquiry_cancelled', cancellation_request = $1, cancellation_history = $2 WHERE id = $3",
-              [JSON.stringify(freshOrder.cancellationRequest), JSON.stringify(freshOrder.cancellationHistory || []), freshOrder.id]
+            await client.query(
+              "UPDATE orders SET cancellation_request = $1, cancellation_history = $2 WHERE id = $3",
+              [JSON.stringify(cancelReq), JSON.stringify(freshOrder.cancellationHistory || []), freshOrder.id]
             );
+
             createNotification({
               userId: requesterId,
-              title: 'Inquiry Cancelled',
-              message: `Inquiry thread #${freshOrder.id} request timed out and was closed.`,
+              title: 'Cancellation Auto-Cancelled',
+              message: `Order #${freshOrder.id} cancellation request timed out after 48h. Order cancelled & full refund issued ($${refundRes.refunded}).`,
               type: 'order',
               link: `/messages/${freshOrder.id}`
             });
             createNotification({
               userId: otherId,
-              title: 'Inquiry Cancelled',
-              message: `Inquiry thread #${freshOrder.id} request timed out and was closed.`,
+              title: 'Cancellation Auto-Cancelled',
+              message: `Order #${freshOrder.id} cancellation request timed out after 48h. Order cancelled & full refund issued ($${refundRes.refunded}).`,
               type: 'order',
               link: `/messages/${freshOrder.id}`
             });
-            continue;
-          }
-
-          const requestKey = `cancel_timeout_${freshOrder.id}_${freshOrder.cancellationRequest.requestedAt}`;
-          const refundRes = await refundOrderFunds(freshOrder, undefined, 'System Auto-Cancel', 'Cancellation request auto-cancelled after 48h timeout', requestKey);
-          freshOrder.cancellationRequest.status = 'auto_cancelled';
-          if (Array.isArray(freshOrder.cancellationHistory)) {
-            for (const ch of freshOrder.cancellationHistory) {
-              if (ch.requestedAt === freshOrder.cancellationRequest.requestedAt) {
-                ch.status = 'auto_cancelled';
-              }
-            }
-          }
-          await store.saveOrder(freshOrder);
-
-          createNotification({
-            userId: requesterId,
-            title: 'Cancellation Auto-Cancelled',
-            message: `Order #${freshOrder.id} cancellation request timed out after 48h. Order cancelled & full refund issued ($${refundRes.refunded}).`,
-            type: 'order',
-            link: `/messages/${freshOrder.id}`
-          });
-          createNotification({
-            userId: otherId,
-            title: 'Cancellation Auto-Cancelled',
-            message: `Order #${freshOrder.id} cancellation request timed out after 48h. Order cancelled & full refund issued ($${refundRes.refunded}).`,
-            type: 'order',
-            link: `/messages/${freshOrder.id}`
           });
         } catch (err) {
           console.error(`[CancellationTimeout] Failed to auto-cancel order ${order.id}:`, err);
@@ -670,33 +712,52 @@ export async function processAutoAcceptOrders(customNow?: number): Promise<Array
 
       const requestKey = `auto_accept_${order.id}_v${latestDelivery.version}`;
       try {
-        const lockRes = await pool.query(
-          "SELECT * FROM orders WHERE id = $1 AND status = 'delivered' FOR UPDATE",
-          [order.id]
-        );
-        if (lockRes.rows.length === 0) continue;
-        const freshRow = lockRes.rows[0];
+        const autoResult = await postgresStore.executeInTransaction(async (client) => {
+          const lockRes = await client.query(
+            "SELECT * FROM orders WHERE id = $1 AND status = 'delivered' FOR UPDATE",
+            [order.id]
+          );
+          if (lockRes.rows.length === 0) return null;
+          const freshRow = lockRes.rows[0];
 
-        let cancelReq = freshRow.cancellation_request;
-        if (typeof cancelReq === 'string') {
-          try { cancelReq = JSON.parse(cancelReq); } catch {}
-        }
-        if (cancelReq && cancelReq.status === 'pending') continue;
+          let cancelReq = freshRow.cancellation_request;
+          if (typeof cancelReq === 'string') {
+            try { cancelReq = JSON.parse(cancelReq); } catch {}
+          }
+          if (cancelReq && cancelReq.status === 'pending') return null;
 
-        let revs = freshRow.revisions;
-        if (typeof revs === 'string') {
-          try { revs = JSON.parse(revs); } catch {}
-        }
-        if (Array.isArray(revs) && revs.some((rev: any) => rev.status === 'requested')) continue;
+          let revs = freshRow.revisions;
+          if (typeof revs === 'string') {
+            try { revs = JSON.parse(revs); } catch {}
+          }
+          if (Array.isArray(revs) && revs.some((rev: any) => rev.status === 'requested')) return null;
 
-        const freshOrder = await store.getOrder(order.id);
-        if (!freshOrder || freshOrder.status !== 'delivered') {
-          continue;
-        }
+          const activeDisputeRes = await client.query(
+            "SELECT id FROM disputes WHERE order_id = $1 AND status IN ('open', 'under_investigation', 'under_review') LIMIT 1",
+            [order.id]
+          );
+          if (activeDisputeRes.rows.length > 0) return null;
 
-        const result = await releaseOrderFunds(freshOrder, 'System Auto-Accept', `Auto-accept after buyer review window (${days} days) elapsed`, false, requestKey);
-        freshOrder.acceptedVersion = latestDelivery.version;
-        await store.saveOrder(freshOrder);
+          const freshOrder = (store as any).mapOrderRow ? (store as any).mapOrderRow(freshRow) : await store.getOrder(order.id);
+          if (!freshOrder || freshOrder.status !== 'delivered') return null;
+
+          const relResult = await releaseOrderFunds(
+            freshOrder, 
+            'System Auto-Accept', 
+            `Auto-accept after buyer review window (${days} days) elapsed`, 
+            false, 
+            requestKey, 
+            false, 
+            client
+          );
+          freshOrder.acceptedVersion = latestDelivery.version;
+          await store.saveOrder(freshOrder);
+
+          return { freshOrder, relResult };
+        });
+
+        if (!autoResult) continue;
+        const { freshOrder, relResult } = autoResult;
 
         const sysMsg: Message = {
           id: `msg_${randomUUID()}`,
@@ -729,7 +790,7 @@ export async function processAutoAcceptOrders(customNow?: number): Promise<Array
           orderId: freshOrder.id,
           acceptedVersion: latestDelivery.version,
           amount: freshOrder.amount,
-          freelancerNet: result.freelancerNet
+          freelancerNet: relResult.freelancerNet
         });
       } catch (err: any) {
         console.error(`[ReviewWindow] Failed to auto-accept order ${order.id}:`, err);
