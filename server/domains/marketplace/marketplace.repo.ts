@@ -28,8 +28,8 @@ export class MarketplaceRepo {
               id, freelancer_id, freelancer_name, freelancer_username, freelancer_avatar, 
               freelancer_level, title, slug, category, subcategory, description, price, 
               delivery_days, rating, reviews_count, image, cover_image, gallery, tags, 
-              status, featured, extras, moderation_status, moderation_notes
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+              status, featured, is_featured, featured_until, extras, moderation_status, moderation_notes
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
             ON CONFLICT (id) DO UPDATE SET
               freelancer_id = EXCLUDED.freelancer_id,
               freelancer_name = EXCLUDED.freelancer_name,
@@ -50,7 +50,9 @@ export class MarketplaceRepo {
               gallery = EXCLUDED.gallery,
               tags = EXCLUDED.tags,
               status = EXCLUDED.status,
-              featured = EXCLUDED.featured,
+              featured = CASE WHEN (gigs.featured_until IS NOT NULL AND gigs.featured_until::timestamptz > NOW()) OR EXCLUDED.featured THEN TRUE ELSE EXCLUDED.featured END,
+              is_featured = CASE WHEN (gigs.featured_until IS NOT NULL AND gigs.featured_until::timestamptz > NOW()) OR EXCLUDED.is_featured THEN TRUE ELSE EXCLUDED.is_featured END,
+              featured_until = COALESCE(EXCLUDED.featured_until, gigs.featured_until),
               extras = EXCLUDED.extras,
               moderation_status = EXCLUDED.moderation_status,
               moderation_notes = EXCLUDED.moderation_notes`,
@@ -59,7 +61,8 @@ export class MarketplaceRepo {
               g.freelancerLevel || null, g.title, g.slug || null, g.category, g.subcategory || null,
               g.description || null, g.price, g.deliveryDays, g.rating ?? 5.0, g.reviewsCount ?? 0,
               g.image || null, g.coverImage || null, g.gallery || [], g.tags || [],
-              g.status || 'active', !!g.featured, JSON.stringify(g.extras || []),
+              g.status || 'active', !!g.featured, !!g.featured || !!(g as any).isFeatured, (g as any).featuredUntil || null,
+              JSON.stringify(g.extras || []),
               g.moderationStatus || 'approved', g.moderationNotes || null
             ]
           );

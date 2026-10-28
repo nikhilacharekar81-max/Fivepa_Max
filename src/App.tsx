@@ -568,7 +568,6 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
     }
   };
 
-  const clientRequestIdRef = useRef<string>('req_' + Math.random().toString(36).substring(2, 11) + '_' + Date.now());
   const [isCreatingOrder, setIsCreatingOrder] = useState(false);
   const isCreatingOrderRef = useRef(false);
   const handleCreateOrder = useCallback(
@@ -581,7 +580,18 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
       isCreatingOrderRef.current = true;
       setIsCreatingOrder(true);
 
-      const clientRequestId = clientRequestIdRef.current;
+      const payloadKey = `fivepa_patt_${gigId || 'custom'}_${priceUSD}_${Array.isArray(extraIds) ? [...extraIds].sort().join(',') : ''}`;
+      let clientRequestId = '';
+      try {
+        clientRequestId = sessionStorage.getItem(payloadKey) || '';
+      } catch {}
+      if (!clientRequestId) {
+        clientRequestId = 'req_' + Math.random().toString(36).substring(2, 11) + '_' + Date.now();
+        try {
+          sessionStorage.setItem(payloadKey, clientRequestId);
+        } catch {}
+      }
+
       try {
         let token = getAuthToken();
         const isPrivileged = ['admin', 'super_admin', 'support'].includes(activeUser.role || '');
@@ -627,7 +637,7 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
         }
         if (res.ok) {
           const newOrder = await res.json();
-          clientRequestIdRef.current = 'req_' + Math.random().toString(36).substring(2, 11) + '_' + Date.now();
+          try { sessionStorage.removeItem(payloadKey); } catch {}
           setOrders(prev => [newOrder, ...prev.filter(o => o.id !== newOrder.id)]);
           await refresh(activeUser.id);
           setSelectedOrder(newOrder);
@@ -635,6 +645,9 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
         } else {
           const errData = await res.json().catch(() => ({}));
           const errMsg = errData.error || errData.message || `Failed to place order (HTTP ${res.status})`;
+          if (res.status === 400 || res.status === 403 || res.status === 422) {
+            try { sessionStorage.removeItem(payloadKey); } catch {}
+          }
           alert(errMsg);
         }
       } catch (e: any) {
