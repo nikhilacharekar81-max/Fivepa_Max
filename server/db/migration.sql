@@ -789,6 +789,27 @@ SELECT
 FROM wallets WHERE user_id NOT IN (SELECT id FROM users)
 ON CONFLICT (id) DO NOTHING;
 
+INSERT INTO reconciliation_exceptions (id, type, entity_id, description, detected_at)
+SELECT 
+  'RE_OW_' || MD5(id), 'ORPHAN_RECORD', id, 
+  'Order refers to non-existent workspace_id: ' || workspace_id, NOW()::text
+FROM orders WHERE workspace_id IS NOT NULL AND workspace_id NOT IN (SELECT workspace_id FROM workspaces)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO reconciliation_exceptions (id, type, entity_id, description, detected_at)
+SELECT 
+  'RE_OP_' || MD5(id), 'ORPHAN_RECORD', id, 
+  'Order refers to non-existent project_id: ' || project_id, NOW()::text
+FROM orders WHERE project_id IS NOT NULL AND project_id NOT IN (SELECT id FROM projects)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO reconciliation_exceptions (id, type, entity_id, description, detected_at)
+SELECT 
+  'RE_MU_' || MD5(id), 'ORPHAN_RECORD', id, 
+  'Message refers to non-existent sender_id: ' || sender_id, NOW()::text
+FROM messages WHERE sender_id NOT IN (SELECT id FROM users)
+ON CONFLICT (id) DO NOTHING;
+
 -- 6. Apply Foreign Key Constraints
 DO $$ 
 DECLARE
@@ -801,45 +822,48 @@ BEGIN
   
   FOR _m IN (
     SELECT * FROM (VALUES 
-      ('orders', 'fk_orders_buyer', 'buyer_id', 'users', 'r', 'RESTRICT'),
-      ('orders', 'fk_orders_seller', 'seller_id', 'users', 'r', 'RESTRICT'),
-      ('orders', 'fk_orders_client', 'client_id', 'users', 'r', 'RESTRICT'),
-      ('orders', 'fk_orders_freelancer', 'freelancer_id', 'users', 'r', 'RESTRICT'),
-      ('proposals', 'fk_proposals_freelancer', 'freelancer_id', 'users', 'r', 'RESTRICT'),
-      ('gigs', 'fk_gigs_freelancer', 'freelancer_id', 'users', 'r', 'RESTRICT'),
-      ('proposals', 'fk_proposals_project', 'project_id', 'projects', 'r', 'RESTRICT'),
-      ('escrows', 'fk_escrows_order', 'order_id', 'orders', 'r', 'RESTRICT'),
-      ('disputes', 'fk_disputes_order', 'order_id', 'orders', 'r', 'RESTRICT'),
-      ('workstream_offers', 'fk_offers_order', 'order_id', 'orders', 'r', 'RESTRICT'),
-      ('messages', 'fk_messages_order', 'order_id', 'orders', 'r', 'RESTRICT'),
-      ('ledger_entries', 'fk_ledger_entries_journal', 'journal_id', 'ledger_journals', 'r', 'RESTRICT'),
-      ('reviews', 'fk_reviews_reviewer', 'reviewer_id', 'users', 'n', 'SET NULL'),
-      ('uploads', 'fk_uploads_order', 'order_id', 'orders', 'n', 'SET NULL'),
-      ('orders', 'fk_orders_gig', 'gig_id', 'gigs', 'n', 'SET NULL'),
-      ('projects', 'fk_projects_buyer', 'buyer_id', 'users', 'r', 'RESTRICT'),
-      ('workspaces', 'fk_workspaces_buyer', 'buyer_id', 'users', 'r', 'RESTRICT'),
-      ('workspaces', 'fk_workspaces_seller', 'seller_id', 'users', 'r', 'RESTRICT'),
-      ('custom_invoices', 'fk_custom_invoices_buyer', 'buyer_id', 'users', 'r', 'RESTRICT'),
-      ('custom_invoices', 'fk_custom_invoices_seller', 'seller_id', 'users', 'r', 'RESTRICT'),
-      ('custom_invoices', 'fk_custom_invoices_order', 'related_order_id', 'orders', 'r', 'RESTRICT'),
-      ('disputes', 'fk_disputes_buyer', 'buyer_id', 'users', 'r', 'RESTRICT'),
-      ('disputes', 'fk_disputes_seller', 'seller_id', 'users', 'r', 'RESTRICT'),
-      ('refunds', 'fk_refunds_order', 'order_id', 'orders', 'r', 'RESTRICT'),
-      ('refunds', 'fk_refunds_buyer', 'buyer_id', 'users', 'r', 'RESTRICT'),
-      ('payouts', 'fk_payouts_freelancer', 'freelancer_id', 'users', 'r', 'RESTRICT'),
-      ('support_tickets', 'fk_support_tickets_user', 'user_id', 'users', 'r', 'RESTRICT'),
-      ('notifications', 'fk_notifications_user', 'user_id', 'users', 'r', 'RESTRICT'),
-      ('project_clarifications', 'fk_clarifications_project', 'project_id', 'projects', 'r', 'RESTRICT'),
-      ('project_clarifications', 'fk_clarifications_user', 'user_id', 'users', 'r', 'RESTRICT'),
-      ('wallet_movements', 'fk_wallet_movements_user', 'user_id', 'users', 'r', 'RESTRICT'),
-      ('earnings_clearing', 'fk_earnings_clearing_order', 'order_id', 'orders', 'r', 'RESTRICT'),
-      ('earnings_clearing', 'fk_earnings_clearing_seller', 'seller_id', 'users', 'r', 'RESTRICT'),
-      ('clearing_earnings', 'fk_clearing_earnings_order', 'order_id', 'orders', 'r', 'RESTRICT'),
-      ('clearing_earnings', 'fk_clearing_earnings_seller', 'seller_id', 'users', 'r', 'RESTRICT'),
-      ('payment_checkout_sessions', 'fk_checkout_sessions_user', 'user_id', 'users', 'r', 'RESTRICT'),
-      ('payment_checkout_sessions', 'fk_checkout_sessions_order', 'order_id', 'orders', 'r', 'RESTRICT'),
-      ('wallets', 'fk_wallets_user', 'user_id', 'users', 'r', 'RESTRICT')
-    ) AS t(tbl, con, col, ref, del_code, del_str)
+      ('orders', 'fk_orders_buyer', 'buyer_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('orders', 'fk_orders_seller', 'seller_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('orders', 'fk_orders_client', 'client_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('orders', 'fk_orders_freelancer', 'freelancer_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('orders', 'fk_orders_workspace', 'workspace_id', 'workspaces', 'workspace_id', 'r', 'RESTRICT'),
+      ('orders', 'fk_orders_project', 'project_id', 'projects', 'id', 'r', 'RESTRICT'),
+      ('messages', 'fk_messages_sender', 'sender_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('proposals', 'fk_proposals_freelancer', 'freelancer_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('gigs', 'fk_gigs_freelancer', 'freelancer_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('proposals', 'fk_proposals_project', 'project_id', 'projects', 'id', 'r', 'RESTRICT'),
+      ('escrows', 'fk_escrows_order', 'order_id', 'orders', 'id', 'r', 'RESTRICT'),
+      ('disputes', 'fk_disputes_order', 'order_id', 'orders', 'id', 'r', 'RESTRICT'),
+      ('workstream_offers', 'fk_offers_order', 'order_id', 'orders', 'id', 'r', 'RESTRICT'),
+      ('messages', 'fk_messages_order', 'order_id', 'orders', 'id', 'r', 'RESTRICT'),
+      ('ledger_entries', 'fk_ledger_entries_journal', 'journal_id', 'ledger_journals', 'id', 'r', 'RESTRICT'),
+      ('reviews', 'fk_reviews_reviewer', 'reviewer_id', 'users', 'id', 'n', 'SET NULL'),
+      ('uploads', 'fk_uploads_order', 'order_id', 'orders', 'id', 'n', 'SET NULL'),
+      ('orders', 'fk_orders_gig', 'gig_id', 'gigs', 'id', 'n', 'SET NULL'),
+      ('projects', 'fk_projects_buyer', 'buyer_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('workspaces', 'fk_workspaces_buyer', 'buyer_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('workspaces', 'fk_workspaces_seller', 'seller_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('custom_invoices', 'fk_custom_invoices_buyer', 'buyer_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('custom_invoices', 'fk_custom_invoices_seller', 'seller_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('custom_invoices', 'fk_custom_invoices_order', 'related_order_id', 'orders', 'id', 'r', 'RESTRICT'),
+      ('disputes', 'fk_disputes_buyer', 'buyer_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('disputes', 'fk_disputes_seller', 'seller_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('refunds', 'fk_refunds_order', 'order_id', 'orders', 'id', 'r', 'RESTRICT'),
+      ('refunds', 'fk_refunds_buyer', 'buyer_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('payouts', 'fk_payouts_freelancer', 'freelancer_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('support_tickets', 'fk_support_tickets_user', 'user_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('notifications', 'fk_notifications_user', 'user_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('project_clarifications', 'fk_clarifications_project', 'project_id', 'projects', 'id', 'r', 'RESTRICT'),
+      ('project_clarifications', 'fk_clarifications_user', 'user_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('wallet_movements', 'fk_wallet_movements_user', 'user_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('earnings_clearing', 'fk_earnings_clearing_order', 'order_id', 'orders', 'id', 'r', 'RESTRICT'),
+      ('earnings_clearing', 'fk_earnings_clearing_seller', 'seller_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('clearing_earnings', 'fk_clearing_earnings_order', 'order_id', 'orders', 'id', 'r', 'RESTRICT'),
+      ('clearing_earnings', 'fk_clearing_earnings_seller', 'seller_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('payment_checkout_sessions', 'fk_checkout_sessions_user', 'user_id', 'users', 'id', 'r', 'RESTRICT'),
+      ('payment_checkout_sessions', 'fk_checkout_sessions_order', 'order_id', 'orders', 'id', 'r', 'RESTRICT'),
+      ('wallets', 'fk_wallets_user', 'user_id', 'users', 'id', 'r', 'RESTRICT')
+    ) AS t(tbl, con, col, ref, ref_col, del_code, del_str)
   ) LOOP
     -- 1. Drop redundant/equivalent constraints with DIFFERENT names
     -- Only drops if the relationship (child col, ref table, ref col) is exactly the same
@@ -854,7 +878,7 @@ BEGIN
       JOIN pg_catalog.pg_attribute ra ON ra.attrelid = c.confrelid AND ra.attnum = ANY(c.confkey)
       WHERE n.nspname = current_schema() AND rn.nspname = current_schema()
         AND cl.relname = _m.tbl AND a.attname = _m.col AND c.contype = 'f' AND c.conname != _m.con
-        AND rcl.relname = _m.ref AND ra.attname = 'id' AND array_length(c.conkey, 1) = 1
+        AND rcl.relname = _m.ref AND ra.attname = _m.ref_col AND array_length(c.conkey, 1) = 1
     ) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _m.tbl, _r.conname); END LOOP;
 
     -- 2. Drop the intended named constraint if it is defined INCORRECTLY
@@ -874,7 +898,7 @@ BEGIN
       JOIN pg_catalog.pg_attribute ra ON ra.attrelid = c.confrelid AND ra.attnum = ANY(c.confkey)
       WHERE n.nspname = current_schema() AND rn.nspname = current_schema()
         AND cl.relname = _m.tbl AND c.conname = _m.con AND c.contype = 'f' AND c.confdeltype = _m.del_code
-        AND a.attname = _m.col AND rcl.relname = _m.ref AND ra.attname = 'id' AND array_length(c.conkey, 1) = 1
+        AND a.attname = _m.col AND rcl.relname = _m.ref AND ra.attname = _m.ref_col AND array_length(c.conkey, 1) = 1
     ) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _m.tbl, _m.con); END IF;
 
     -- 3. Add the intended constraint if it's missing
@@ -884,7 +908,7 @@ BEGIN
       JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace
       WHERE n.nspname = current_schema() AND cl.relname = _m.tbl AND c.conname = _m.con
     ) THEN
-      EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE %s NOT VALID', _m.tbl, _m.con, _m.col, _m.ref, _m.del_str);
+      EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(%I) ON DELETE %s NOT VALID', _m.tbl, _m.con, _m.col, _m.ref, _m.ref_col, _m.del_str);
     END IF;
   END LOOP;
 END $$;
