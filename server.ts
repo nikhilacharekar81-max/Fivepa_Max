@@ -203,7 +203,7 @@ if (process.env.NODE_ENV !== 'test' && !server.listening) {
     try {
       const pool = postgresStore.getPool();
       const [gigsRes, usersRes, projectsRes] = await Promise.all([
-        pool.query("SELECT * FROM gigs WHERE status = 'published' LIMIT 50"),
+        pool.query("SELECT * FROM gigs WHERE status IN ('active', 'published') LIMIT 50"),
         pool.query("SELECT * FROM users WHERE status = 'active' LIMIT 50"),
         pool.query("SELECT * FROM projects WHERE status = 'open' LIMIT 50")
       ]);
@@ -228,7 +228,8 @@ if (process.env.NODE_ENV !== 'test' && !server.listening) {
           coverImage: r.cover_image || '',
           gallery: r.gallery || [],
           tags: r.tags || [],
-          status: r.status,
+          status: r.status === 'published' ? 'active' : (r.status || 'active'),
+          moderationStatus: r.moderation_status || 'approved',
           createdAt: r.created_at,
           extras: r.extras || []
         }));

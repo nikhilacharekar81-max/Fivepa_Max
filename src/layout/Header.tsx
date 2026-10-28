@@ -456,7 +456,10 @@ export function Header({
                     const partnerAvatar = partner?.avatar;
                     const previewText = (ord as any).lastMessage || ord.title;
                     const rawDate = (ord as any).lastMessageTime || ord.createdAt;
-                    const formattedDate = rawDate ? new Date(rawDate).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : '';
+                    const parsedDate = rawDate ? new Date(rawDate) : null;
+                    const formattedDate = parsedDate && !isNaN(parsedDate.getTime())
+                      ? parsedDate.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+                      : (typeof rawDate === 'string' ? rawDate : '');
                     return (
                       <div 
                         key={ord.id}
@@ -581,7 +584,13 @@ export function Header({
                         <p className="text-xs font-bold text-fiverr-dark truncate">{n.title}</p>
                         <p className="text-[11.5px] text-slate-600 mt-0.5 line-clamp-2">{n.message}</p>
                         <span className="text-[10px] text-slate-400 mt-1 block">
-                          {new Date(n.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} • {new Date(n.createdAt).toLocaleDateString()}
+                          {(() => {
+                            const d = n.createdAt ? new Date(n.createdAt) : null;
+                            if (d && !isNaN(d.getTime())) {
+                              return `${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} • ${d.toLocaleDateString()}`;
+                            }
+                            return n.createdAt || '';
+                          })()}
                         </span>
                       </div>
                     </div>

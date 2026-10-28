@@ -51,6 +51,7 @@ interface MarketplaceGigsViewProps {
   setIsSignupModalOpen: (b: boolean) => void;
   slugify: (name: string) => string;
   CATEGORY_SLUGS: Record<string, string>;
+  isHomePage?: boolean;
 }
 
 type SortOption = 'recommended' | 'bestselling' | 'rating' | 'price_asc' | 'price_desc' | 'newest';
@@ -97,7 +98,8 @@ export const MarketplaceGigsView: React.FC<MarketplaceGigsViewProps> = ({
   currentUser,
   setIsSignupModalOpen,
   slugify,
-  CATEGORY_SLUGS
+  CATEGORY_SLUGS,
+  isHomePage = false
 }) => {
   // Sort State
   const [sortBy, setSortBy] = useState<SortOption>('recommended');
@@ -200,49 +202,91 @@ export const MarketplaceGigsView: React.FC<MarketplaceGigsViewProps> = ({
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 font-sans text-slate-800">
-      {/* ========================================================= */}
-      {/* FIVERR HEADER: Breadcrumbs & Page Headline                */}
-      {/* ========================================================= */}
-      <div className="mb-6">
-        {/* Breadcrumb row */}
-        <div className="flex items-center gap-1.5 text-xs text-slate-400 mb-2">
-          <a 
-            href="/" 
-            onClick={(e) => navigate('/', e)} 
-            className="hover:text-slate-700 transition-colors"
-          >
-            Fivepa
-          </a>
-          <ChevronRight className="w-3.5 h-3.5 text-slate-300" />
-          <span className="text-slate-600 font-medium capitalize">
-            {currentCategory === 'All' ? 'Services' : currentCategory}
-          </span>
-        </div>
-
-        {/* Category Title & Description */}
-        <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
-          <div>
-            <h1 className="text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight">
-              {currentCategory === 'All' ? 'Explore Freelance Services' : `${currentCategory} Services`}
+      {isHomePage ? (
+        /* ========================================================= */
+        /* HOMEPAGE HERO BANNER                                      */
+        /* ========================================================= */
+        <div className="relative rounded-3xl bg-slate-900 text-white p-8 md:p-12 mb-10 overflow-hidden shadow-xl">
+          <div
+            className="absolute right-0 top-0 w-1/2 h-full opacity-20 bg-cover bg-center pointer-events-none"
+            style={{ backgroundImage: `url('https://images.unsplash.com/photo-1522071820081-009f0129c71c?w=1200&h=800&fit=crop')` }}
+          />
+          <div className="relative z-10 max-w-2xl">
+            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/20 text-emerald-400 text-xs font-semibold mb-4 border border-emerald-500/30">
+              <ShieldCheck className="w-4 h-4" /> 100% Escrow Protection Guaranteed
+            </div>
+            <h1 className="text-3xl md:text-4xl font-bold leading-tight mb-4 text-white text-wrap balance">
+              {currentCategory === 'All' ? 'Hire top freelance talent for fixed-price gigs' : `${currentCategory} Freelance Gigs`}
             </h1>
-            <p className="text-xs sm:text-sm text-slate-500 mt-1 max-w-2xl leading-relaxed">
-              Find top-rated talent, review verified portfolios, and hire securely with Fivepa USD Escrow protection.
+            <p className="text-slate-300 text-sm md:text-base leading-relaxed mb-8">
+              Connect with elite developers, designers, and AI experts. Funds are safely held in escrow until you approve the deliverables.
             </p>
-          </div>
 
-          {/* Quick Search Input */}
-          <div className="relative w-full md:w-80 shrink-0">
-            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-            <input 
-              type="text" 
-              placeholder="Search gigs..." 
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-9 pr-3 py-2 bg-white border border-slate-200 rounded-xl text-xs text-slate-800 placeholder:text-slate-400 focus:outline-hidden focus:border-slate-400 shadow-2xs"
-            />
+            {/* Search Bar */}
+            <div className="flex items-center bg-white rounded-2xl p-2 shadow-lg max-w-xl">
+              <Search className="w-5 h-5 text-slate-400 ml-3 shrink-0" />
+              <input
+                type="text"
+                placeholder="Search services (e.g. React, UI/UX, Automation)..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none"
+              />
+              <button
+                type="button"
+                onClick={(e) => navigate('/gigs', e)}
+                className="px-6 py-3 bg-slate-900 text-white text-xs font-semibold rounded-xl hover:bg-slate-800 transition-colors cursor-pointer shrink-0"
+              >
+                Search
+              </button>
+            </div>
           </div>
         </div>
-      </div>
+      ) : (
+        /* ========================================================= */
+        /* EXPLORE GIGS HEADER: Breadcrumbs & Page Headline          */
+        /* ========================================================= */
+        <div className="mb-6">
+          {/* Breadcrumb row */}
+          <div className="flex items-center gap-1.5 text-xs text-slate-400 mb-2">
+            <a 
+              href="/" 
+              onClick={(e) => navigate('/', e)} 
+              className="hover:text-slate-700 transition-colors"
+            >
+              Fivepa
+            </a>
+            <ChevronRight className="w-3.5 h-3.5 text-slate-300" />
+            <span className="text-slate-600 font-medium capitalize">
+              {currentCategory === 'All' ? 'Services' : currentCategory}
+            </span>
+          </div>
+
+          {/* Category Title & Description */}
+          <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
+            <div>
+              <h1 className="text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight">
+                {currentCategory === 'All' ? 'Explore Freelance Services' : `${currentCategory} Services`}
+              </h1>
+              <p className="text-xs sm:text-sm text-slate-500 mt-1 max-w-2xl leading-relaxed">
+                Find top-rated talent, review verified portfolios, and hire securely with Fivepa USD Escrow protection.
+              </p>
+            </div>
+
+            {/* Quick Search Input */}
+            <div className="relative w-full md:w-80 shrink-0">
+              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input 
+                type="text" 
+                placeholder="Search gigs..." 
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full pl-9 pr-3 py-2 bg-white border border-slate-200 rounded-xl text-xs text-slate-800 placeholder:text-slate-400 focus:outline-hidden focus:border-slate-400 shadow-2xs"
+              />
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ========================================================= */}
       {/* FIVERR CATEGORY PILL STRIP                                 */}

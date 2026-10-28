@@ -216,8 +216,11 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
 
   // Initial client hydration fetch
   useEffect(() => {
-    loadUserSession().finally(() => {
-      refresh();
+    refresh();
+    loadUserSession().then((loaded) => {
+      if (loaded) {
+        refresh();
+      }
     });
   }, [loadUserSession, refresh]);
 
@@ -303,6 +306,15 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
   const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
   const [starredOrderIds, setStarredOrderIds] = useState<string[]>([]);
   const [workstreamSearch, setWorkstreamSearch] = useState('');
+  const [orderFeedback, setOrderFeedback] = useState<{ type: 'success' | 'error'; message: string; orderId?: string } | null>(null);
+
+  useEffect(() => {
+    if (!orderFeedback) return;
+    const timer = setTimeout(() => {
+      setOrderFeedback(null);
+    }, 8000);
+    return () => clearTimeout(timer);
+  }, [orderFeedback]);
 
   const toggleStarOrder = useCallback((orderId: string) => {
     setStarredOrderIds(prev =>
@@ -313,6 +325,8 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
   const workstream = useWorkstream({
     orders,
     setOrders,
+    usersList: users,
+    gigs,
     messages,
     setMessages,
     reviews,
@@ -579,6 +593,7 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
       if (isCreatingOrderRef.current || isCreatingOrder) return;
       isCreatingOrderRef.current = true;
       setIsCreatingOrder(true);
+      setOrderFeedback(null);
 
       const payloadKey = `fivepa_patt_${activeUser.id}_${sellerId}_${gigId || 'custom'}_${encodeURIComponent(orderTitle)}_${priceUSD}_${Array.isArray(extraIds) ? [...extraIds].sort().join(',') : ''}`;
       let clientRequestId = '';
@@ -639,26 +654,38 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
           const newOrder = await res.json();
           try { sessionStorage.removeItem(payloadKey); } catch {}
           setOrders(prev => [newOrder, ...prev.filter(o => o.id !== newOrder.id)]);
-          await refresh(activeUser.id);
           setSelectedOrder(newOrder);
+          workstream.fetchMessages(newOrder.id);
+          setOrderFeedback({
+            type: 'success',
+            message: `Order #${newOrder.id} placed successfully! Funds are secured in escrow.`,
+            orderId: newOrder.id
+          });
           navigate(`/messages/${newOrder.id}`);
+          void refresh(activeUser.id);
         } else {
           const errData = await res.json().catch(() => ({}));
           const errMsg = errData.error || errData.message || `Failed to place order (HTTP ${res.status})`;
           if (res.status === 400 || res.status === 403 || res.status === 422) {
             try { sessionStorage.removeItem(payloadKey); } catch {}
           }
-          alert(errMsg);
+          setOrderFeedback({
+            type: 'error',
+            message: errMsg
+          });
         }
       } catch (e: any) {
         console.error('Order creation failed:', e);
-        alert(e?.message || 'Network error while placing order. Please check your connection and retry.');
+        setOrderFeedback({
+          type: 'error',
+          message: e?.message || 'Network error while placing order. Please check your connection and retry.'
+        });
       } finally {
         isCreatingOrderRef.current = false;
         setIsCreatingOrder(false);
       }
     },
-    [activeUser, isCreatingOrder, navigate, refresh, setOrders]
+    [activeUser, isCreatingOrder, navigate, refresh, setOrders, workstream]
   );
 
   const handleContactSeller = useCallback(
@@ -688,8 +715,20 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
     if (cleanPath === '/forgot-password') setIsForgotPasswordModalOpen(true);
   }, [cleanPath]);
 
+  useEffect(() => {
+    if ((cleanPath.startsWith('/messages/') || cleanPath.startsWith('/orders/')) && pathParts.length >= 2) {
+      const targetOrderId = pathParts[1];
+      if (targetOrderId && selectedOrder?.id !== targetOrderId) {
+        const matched = orders.find(o => o.id === targetOrderId);
+        if (matched) {
+          setSelectedOrder(matched);
+        }
+      }
+    }
+  }, [cleanPath, pathParts, orders, selectedOrder?.id]);
+
   // Route flags
-  const isGigsList = cleanPath === '/' || cleanPath === '/gigs' || cleanPath.startsWith('/categories');
+  const isGigsList = cleanPath === '/gigs' || cleanPath.startsWith('/categories');
   const isProjectsList = ['/projects', '/search-projects', '/project-search', '/freelance-jobs'].includes(cleanPath);
   const isFreelancersList = ['/freelancers', '/search-freelancers', '/freelancer-search'].includes(cleanPath);
   const isCategoryRoute = cleanPath.startsWith('/categories');
@@ -720,6 +759,13 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
           return false;
         }
       }
+      if (serviceOptionFilter && serviceOptionFilter !== 'All') {
+        const catSlug = CATEGORY_SLUGS[g.category] || slugify(g.category);
+        const optSlug = CATEGORY_SLUGS[serviceOptionFilter] || slugify(serviceOptionFilter);
+        if (catSlug !== optSlug && g.category.toLowerCase() !== serviceOptionFilter.toLowerCase()) {
+          return false;
+        }
+      }
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase();
         const matchTitle = g.title.toLowerCase().includes(q);
@@ -737,12 +783,12 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
       if (deliveryTimeFilter) {
         if (g.deliveryDays > deliveryTimeFilter) return false;
       }
-      if (sellerLevelFilter && sellerLevelFilter !== 'All' && g.freelancerLevel && g.freelancerLevel !== sellerLevelFilter) {
+      if (sellerLevelFilter && sellerLevelFilter !== 'All' && g.freelancerLevel && !g.freelancerLevel.toLowerCase().includes(sellerLevelFilter.toLowerCase())) {
         return false;
       }
       return true;
     });
-  }, [gigs, currentCategory, searchQuery, budgetFilter, deliveryTimeFilter, sellerLevelFilter]);
+  }, [gigs, currentCategory, serviceOptionFilter, searchQuery, budgetFilter, deliveryTimeFilter, sellerLevelFilter]);
 
   // Determine current active view
   let mainContent: React.ReactNode = null;
@@ -855,18 +901,27 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
     cleanPath.startsWith('/orders/')
   ) {
     const routeOrderId = pathParts.length >= 2 ? pathParts[1] : null;
-    const activeWorkstreamOrder = routeOrderId
-      ? orders.find(o => o.id === routeOrderId) || selectedOrder
-      : selectedOrder;
+    const rawActiveOrder = routeOrderId
+      ? workstream.hydratedWorkstreamItems.find(o => o.id === routeOrderId) ||
+        orders.find(o => o.id === routeOrderId) ||
+        (selectedOrder?.id === routeOrderId ? selectedOrder : null)
+      : workstream.selectedOrder || selectedOrder;
 
-    if (activeWorkstreamOrder) {
+    if (rawActiveOrder) {
+      const hydratedActiveOrder = {
+        ...rawActiveOrder,
+        seller: (rawActiveOrder as any).seller || users.find(u => u.id === rawActiveOrder.sellerId),
+        buyer: (rawActiveOrder as any).buyer || users.find(u => u.id === rawActiveOrder.buyerId),
+        gig: (rawActiveOrder as any).gig || gigs.find(g => g.id === rawActiveOrder.gigId)
+      };
       const workstreamPartner = users.find(
-        u => u.id === (activeUser?.id === activeWorkstreamOrder.buyerId ? activeWorkstreamOrder.sellerId : activeWorkstreamOrder.buyerId)
+        u => u.id === (activeUser?.id === hydratedActiveOrder.buyerId ? hydratedActiveOrder.sellerId : hydratedActiveOrder.buyerId)
       );
+      const orderSpecificMessages = workstream.messages.filter(m => m.orderId === hydratedActiveOrder.id);
       mainContent = (
         <WorkstreamWorkspace
-          order={activeWorkstreamOrder as any}
-          messages={workstream.messages}
+          order={hydratedActiveOrder as any}
+          messages={orderSpecificMessages as any}
           files={workstream.activeSharedFiles}
           currentUser={activeUser}
           usersList={users}
@@ -878,6 +933,9 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
           onSendMessage={workstream.sendMessage}
           onAttachFile={(file) => workstream.sendMessage(`Attached file: ${file.name}`, 'file', file)}
           sendEvent={workstream.sendEvent}
+          onOrderChanged={() => {
+            if (activeUser?.id) void refresh(activeUser.id);
+          }}
           onReleaseEscrow={workstream.handleReleaseEscrow}
           onDeliverWork={workstream.handleDeliverWork}
           onRequestRevision={workstream.handleRequestRevision}
@@ -971,6 +1029,9 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
             navigate={navigate}
             handleContactSeller={handleContactSeller}
             handleCreateOrder={handleCreateOrder}
+            isCreatingOrder={isCreatingOrder}
+            orderFeedback={orderFeedback}
+            onDismissOrderFeedback={() => setOrderFeedback(null)}
             slugify={slugify}
           />
         </div>
@@ -1055,6 +1116,7 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
         setIsSignupModalOpen={setIsSignupModalOpen}
         slugify={slugify}
         CATEGORY_SLUGS={CATEGORY_SLUGS}
+        isHomePage={cleanPath === '/'}
       />
     );
   }
@@ -1092,6 +1154,45 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
         onOpenSignup={() => setIsSignupModalOpen(true)}
         onOpenSwitchUser={() => setIsUserSwitchModalOpen(true)}
       />
+
+      {/* Order Purchase Status Banner */}
+      {orderFeedback && (
+        <div className="max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8 pt-4">
+          <div
+            role="status"
+            className={`rounded-2xl border px-4 py-3 shadow-sm flex items-center justify-between gap-4 text-xs font-medium ${
+              orderFeedback.type === 'success'
+                ? 'bg-emerald-50 border-emerald-300 text-emerald-950'
+                : 'bg-rose-50 border-rose-300 text-rose-950'
+            }`}
+          >
+            <div className="flex items-center gap-2.5 flex-wrap">
+              <span
+                className={`inline-block w-2 h-2 rounded-full shrink-0 ${
+                  orderFeedback.type === 'success' ? 'bg-emerald-600' : 'bg-rose-600'
+                }`}
+              />
+              <span className="font-bold">{orderFeedback.message}</span>
+              {orderFeedback.orderId && cleanPath !== `/messages/${orderFeedback.orderId}` && (
+                <button
+                  type="button"
+                  onClick={(e) => navigate(`/messages/${orderFeedback.orderId}`, e)}
+                  className="underline font-bold text-emerald-700 hover:text-emerald-900 cursor-pointer ml-1"
+                >
+                  View Workstream #{orderFeedback.orderId}
+                </button>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => setOrderFeedback(null)}
+              className="text-slate-500 hover:text-slate-900 font-bold px-2 py-0.5 rounded-lg cursor-pointer"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Main Page Content Body */}
       <main className="flex-1">

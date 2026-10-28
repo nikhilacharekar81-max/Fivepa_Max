@@ -691,8 +691,8 @@ export class PostgresAsyncStore implements StoreInterface {
         description = EXCLUDED.description,
         price = EXCLUDED.price,
         delivery_days = EXCLUDED.delivery_days,
-        rating = COALESCE(gigs.rating, EXCLUDED.rating),
-        reviews_count = COALESCE(gigs.reviews_count, EXCLUDED.reviews_count),
+        rating = EXCLUDED.rating,
+        reviews_count = EXCLUDED.reviews_count,
         image = EXCLUDED.image,
         cover_image = EXCLUDED.cover_image,
         gallery = EXCLUDED.gallery,
@@ -721,11 +721,8 @@ export class PostgresAsyncStore implements StoreInterface {
           END
         ),
         extras = EXCLUDED.extras,
-        moderation_status = CASE 
-          WHEN EXCLUDED.moderation_status IN ('pending', 'rejected') THEN EXCLUDED.moderation_status
-          ELSE COALESCE(gigs.moderation_status, EXCLUDED.moderation_status)
-        END,
-        moderation_notes = COALESCE(EXCLUDED.moderation_notes, gigs.moderation_notes)`,
+        moderation_status = EXCLUDED.moderation_status,
+        moderation_notes = EXCLUDED.moderation_notes`,
       [
         g.id, g.freelancerId, g.freelancerName, g.freelancerUsername || null, g.freelancerAvatar || null, g.freelancerLevel || null,
         g.title, slug, g.category, g.subcategory || null, g.description || '', g.price, g.deliveryDays, g.rating ?? 5.0, g.reviewsCount ?? 0,
