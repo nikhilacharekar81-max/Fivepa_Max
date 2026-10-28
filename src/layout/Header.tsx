@@ -98,7 +98,7 @@ export function Header({
   };
 
   useEffect(() => {
-    if (!currentUser || typeof window === 'undefined') {
+    if (!currentUser?.id || typeof window === 'undefined') {
       setNotifications([]);
       return;
     }
@@ -121,9 +121,9 @@ export function Header({
       } catch {}
     };
     fetchNotifs();
-    const interval = setInterval(fetchNotifs, 10000);
+    const interval = setInterval(fetchNotifs, 30000);
     return () => clearInterval(interval);
-  }, [currentUser]);
+  }, [currentUser?.id]);
 
   const unreadCount = notifications.filter(n => !n.read).length;
 

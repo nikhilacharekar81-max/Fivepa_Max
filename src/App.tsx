@@ -941,22 +941,24 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
     }
     if (gig) {
       mainContent = (
-        <GigDetailView
-          currentGig={gig}
-          gigs={gigs}
-          reviews={reviews}
-          orders={orders}
-          currentUser={activeUser}
-          navigate={navigate}
-          handleContactSeller={handleContactSeller}
-          handleCreateOrder={handleCreateOrder}
-          slugify={slugify}
-        />
+        <div className="max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
+          <GigDetailView
+            currentGig={gig}
+            gigs={gigs}
+            reviews={reviews}
+            orders={orders}
+            currentUser={activeUser}
+            navigate={navigate}
+            handleContactSeller={handleContactSeller}
+            handleCreateOrder={handleCreateOrder}
+            slugify={slugify}
+          />
+        </div>
       );
     }
   } else if (cleanPath === '/payments' || cleanPath.startsWith('/payments')) {
     mainContent = (
-      <div className="max-w-7xl mx-auto py-8 px-4">
+      <div className="max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
         <PaymentsModule
           currentUser={activeUser}
           orders={orders}
@@ -989,13 +991,15 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
     );
     if (matchedUser) {
       mainContent = (
-        <FreelancerProfileView
-          profileUser={matchedUser}
-          currentUser={activeUser}
-          gigs={gigs}
-          reviews={reviews}
-          onNavigate={navigate}
-        />
+        <div className="max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
+          <FreelancerProfileView
+            profileUser={matchedUser}
+            currentUser={activeUser}
+            gigs={gigs}
+            reviews={reviews}
+            onNavigate={navigate}
+          />
+        </div>
       );
     }
   }

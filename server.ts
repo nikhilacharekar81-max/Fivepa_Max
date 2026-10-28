@@ -129,6 +129,17 @@ app.use((req, res, next) => {
   return express.json({ limit: '10mb' })(req, res, next);
 });
 
+let resolveStartupReady!: () => void;
+const startupReadyPromise = new Promise<void>((resolve) => {
+  resolveStartupReady = resolve;
+});
+
+// Gate requests until hydration and SSR middleware are registered
+app.use(async (_req, _res, next) => {
+  await startupReadyPromise;
+  next();
+});
+
 // Mount Central API Router
 app.use('/api', apiRouter);
 
@@ -150,6 +161,27 @@ export const server = createServer(app);
 
 // Initialize WebSocket Engine
 initWebSocketServer(server);
+
+const portArgIndex = process.argv.findIndex(arg => arg === '--port' || arg === '-p');
+const cliPort = portArgIndex !== -1 && process.argv[portArgIndex + 1] ? Number(process.argv[portArgIndex + 1]) : null;
+const PORT = cliPort || (process.env.PORT && process.env.PORT !== '8080' ? Number(process.env.PORT) : 3000);
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[UnhandledRejection]', reason);
+});
+
+if (process.env.NODE_ENV !== 'test' && !server.listening) {
+  server.on('error', (err: any) => {
+    if (err.code === 'EADDRINUSE') {
+      console.warn(`Port ${PORT} in use, selecting dynamic fallback port`);
+      server.listen(0, '0.0.0.0');
+    }
+  });
+  server.listen(Number(PORT), '0.0.0.0', () => {
+    const actualPort = (server.address() as any)?.port || PORT;
+    console.log(`WorkPerHour server running on http://0.0.0.0:${actualPort}`);
+  });
+}
 
 // Application Startup & Hydration
 (async () => {
@@ -254,26 +286,7 @@ initWebSocketServer(server);
     }
   });
 
-  const portArgIndex = process.argv.findIndex(arg => arg === '--port' || arg === '-p');
-  const cliPort = portArgIndex !== -1 && process.argv[portArgIndex + 1] ? Number(process.argv[portArgIndex + 1]) : null;
-  const PORT = cliPort || (process.env.PORT && process.env.PORT !== '8080' ? Number(process.env.PORT) : 3000);
-
-  process.on('unhandledRejection', (reason) => {
-    console.error('[UnhandledRejection]', reason);
-  });
-
-  if (!server.listening) {
-    server.on('error', (err: any) => {
-      if (err.code === 'EADDRINUSE') {
-        console.warn(`Port ${PORT} in use, selecting dynamic fallback port`);
-        server.listen(0, '0.0.0.0');
-      }
-    });
-    server.listen(Number(PORT), '0.0.0.0', () => {
-      const actualPort = (server.address() as any)?.port || PORT;
-      console.log(`WorkPerHour server running on http://0.0.0.0:${actualPort}`);
-    });
-  }
+  resolveStartupReady();
 })();
 
 // Graceful shutdown
