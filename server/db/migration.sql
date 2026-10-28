@@ -761,243 +761,132 @@ SELECT
 FROM orders WHERE gig_id IS NOT NULL AND gig_id NOT IN (SELECT id FROM gigs)
 ON CONFLICT (id) DO NOTHING;
 
+INSERT INTO reconciliation_exceptions (id, type, entity_id, description, detected_at)
+SELECT 
+  'RE_PO_' || MD5(id), 'ORPHAN_RECORD', id, 
+  'Payout refers to non-existent freelancer_id: ' || freelancer_id, NOW()::text
+FROM payouts WHERE freelancer_id NOT IN (SELECT id FROM users)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO reconciliation_exceptions (id, type, entity_id, description, detected_at)
+SELECT 
+  'RE_RO_' || MD5(id), 'ORPHAN_RECORD', id, 
+  'Refund refers to non-existent order_id: ' || order_id, NOW()::text
+FROM refunds WHERE order_id NOT IN (SELECT id FROM orders)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO reconciliation_exceptions (id, type, entity_id, description, detected_at)
+SELECT 
+  'RE_CO_' || MD5(id), 'ORPHAN_RECORD', id, 
+  'Earnings clearing refers to non-existent order_id: ' || order_id, NOW()::text
+FROM earnings_clearing WHERE order_id NOT IN (SELECT id FROM orders)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO reconciliation_exceptions (id, type, entity_id, description, detected_at)
+SELECT 
+  'RE_WU_' || MD5(user_id), 'ORPHAN_RECORD', user_id, 
+  'Wallet refers to non-existent user_id: ' || user_id, NOW()::text
+FROM wallets WHERE user_id NOT IN (SELECT id FROM users)
+ON CONFLICT (id) DO NOTHING;
+
 -- 6. Apply Foreign Key Constraints
 DO $$ 
 DECLARE
-  _t text; _c text; _col text; _ref text; _del char;
   _r RECORD;
+  _m RECORD;
 BEGIN
   -- Macro-like logic for managed foreign keys. Ensures exactly one named constraint with correct definition exists.
-  -- Drops duplicate FKs on the same column (Fix 3) and corrects mismatched definitions (Fix 2).
+  -- Drops duplicate FKs on the same column only if they are exactly equivalent relationships.
+  -- Corrects same-named constraints if any part of the definition (columns, reference table, delete action) is wrong.
   
-  -- 1. orders (buyer_id) -> users (RESTRICT)
-  _t := 'orders'; _c := 'fk_orders_buyer'; _col := 'buyer_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
+  FOR _m IN (
+    SELECT * FROM (VALUES 
+      ('orders', 'fk_orders_buyer', 'buyer_id', 'users', 'r', 'RESTRICT'),
+      ('orders', 'fk_orders_seller', 'seller_id', 'users', 'r', 'RESTRICT'),
+      ('orders', 'fk_orders_client', 'client_id', 'users', 'r', 'RESTRICT'),
+      ('orders', 'fk_orders_freelancer', 'freelancer_id', 'users', 'r', 'RESTRICT'),
+      ('proposals', 'fk_proposals_freelancer', 'freelancer_id', 'users', 'r', 'RESTRICT'),
+      ('gigs', 'fk_gigs_freelancer', 'freelancer_id', 'users', 'r', 'RESTRICT'),
+      ('proposals', 'fk_proposals_project', 'project_id', 'projects', 'r', 'RESTRICT'),
+      ('escrows', 'fk_escrows_order', 'order_id', 'orders', 'r', 'RESTRICT'),
+      ('disputes', 'fk_disputes_order', 'order_id', 'orders', 'r', 'RESTRICT'),
+      ('workstream_offers', 'fk_offers_order', 'order_id', 'orders', 'r', 'RESTRICT'),
+      ('messages', 'fk_messages_order', 'order_id', 'orders', 'r', 'RESTRICT'),
+      ('ledger_entries', 'fk_ledger_entries_journal', 'journal_id', 'ledger_journals', 'r', 'RESTRICT'),
+      ('reviews', 'fk_reviews_reviewer', 'reviewer_id', 'users', 'n', 'SET NULL'),
+      ('uploads', 'fk_uploads_order', 'order_id', 'orders', 'n', 'SET NULL'),
+      ('orders', 'fk_orders_gig', 'gig_id', 'gigs', 'n', 'SET NULL'),
+      ('projects', 'fk_projects_buyer', 'buyer_id', 'users', 'r', 'RESTRICT'),
+      ('workspaces', 'fk_workspaces_buyer', 'buyer_id', 'users', 'r', 'RESTRICT'),
+      ('workspaces', 'fk_workspaces_seller', 'seller_id', 'users', 'r', 'RESTRICT'),
+      ('custom_invoices', 'fk_custom_invoices_buyer', 'buyer_id', 'users', 'r', 'RESTRICT'),
+      ('custom_invoices', 'fk_custom_invoices_seller', 'seller_id', 'users', 'r', 'RESTRICT'),
+      ('custom_invoices', 'fk_custom_invoices_order', 'related_order_id', 'orders', 'r', 'RESTRICT'),
+      ('disputes', 'fk_disputes_buyer', 'buyer_id', 'users', 'r', 'RESTRICT'),
+      ('disputes', 'fk_disputes_seller', 'seller_id', 'users', 'r', 'RESTRICT'),
+      ('refunds', 'fk_refunds_order', 'order_id', 'orders', 'r', 'RESTRICT'),
+      ('refunds', 'fk_refunds_buyer', 'buyer_id', 'users', 'r', 'RESTRICT'),
+      ('payouts', 'fk_payouts_freelancer', 'freelancer_id', 'users', 'r', 'RESTRICT'),
+      ('support_tickets', 'fk_support_tickets_user', 'user_id', 'users', 'r', 'RESTRICT'),
+      ('notifications', 'fk_notifications_user', 'user_id', 'users', 'r', 'RESTRICT'),
+      ('project_clarifications', 'fk_clarifications_project', 'project_id', 'projects', 'r', 'RESTRICT'),
+      ('project_clarifications', 'fk_clarifications_user', 'user_id', 'users', 'r', 'RESTRICT'),
+      ('wallet_movements', 'fk_wallet_movements_user', 'user_id', 'users', 'r', 'RESTRICT'),
+      ('earnings_clearing', 'fk_earnings_clearing_order', 'order_id', 'orders', 'r', 'RESTRICT'),
+      ('earnings_clearing', 'fk_earnings_clearing_seller', 'seller_id', 'users', 'r', 'RESTRICT'),
+      ('clearing_earnings', 'fk_clearing_earnings_order', 'order_id', 'orders', 'r', 'RESTRICT'),
+      ('clearing_earnings', 'fk_clearing_earnings_seller', 'seller_id', 'users', 'r', 'RESTRICT'),
+      ('payment_checkout_sessions', 'fk_checkout_sessions_user', 'user_id', 'users', 'r', 'RESTRICT'),
+      ('payment_checkout_sessions', 'fk_checkout_sessions_order', 'order_id', 'orders', 'r', 'RESTRICT'),
+      ('wallets', 'fk_wallets_user', 'user_id', 'users', 'r', 'RESTRICT')
+    ) AS t(tbl, con, col, ref, del_code, del_str)
+  ) LOOP
+    -- 1. Drop redundant/equivalent constraints with DIFFERENT names
+    -- Only drops if the relationship (child col, ref table, ref col) is exactly the same
+    FOR _r IN (
+      SELECT c.conname 
+      FROM pg_catalog.pg_constraint c 
+      JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid 
+      JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace
+      JOIN pg_catalog.pg_class rcl ON c.confrelid = rcl.oid
+      JOIN pg_catalog.pg_namespace rn ON rn.oid = rcl.relnamespace
+      JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+      JOIN pg_catalog.pg_attribute ra ON ra.attrelid = c.confrelid AND ra.attnum = ANY(c.confkey)
+      WHERE n.nspname = current_schema() AND rn.nspname = current_schema()
+        AND cl.relname = _m.tbl AND a.attname = _m.col AND c.contype = 'f' AND c.conname != _m.con
+        AND rcl.relname = _m.ref AND ra.attname = 'id' AND array_length(c.conkey, 1) = 1
+    ) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _m.tbl, _r.conname); END LOOP;
 
-  -- 2. orders (seller_id) -> users (RESTRICT)
-  _t := 'orders'; _c := 'fk_orders_seller'; _col := 'seller_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
+    -- 2. Drop the intended named constraint if it is defined INCORRECTLY
+    -- Checks constraint type, delete action, columns, and referenced table
+    IF EXISTS (
+      SELECT 1 FROM pg_catalog.pg_constraint c 
+      JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid 
+      JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace
+      WHERE n.nspname = current_schema() AND cl.relname = _m.tbl AND c.conname = _m.con
+    ) AND NOT EXISTS (
+      SELECT 1 FROM pg_catalog.pg_constraint c 
+      JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid 
+      JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace
+      JOIN pg_catalog.pg_class rcl ON c.confrelid = rcl.oid
+      JOIN pg_catalog.pg_namespace rn ON rn.oid = rcl.relnamespace
+      JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+      JOIN pg_catalog.pg_attribute ra ON ra.attrelid = c.confrelid AND ra.attnum = ANY(c.confkey)
+      WHERE n.nspname = current_schema() AND rn.nspname = current_schema()
+        AND cl.relname = _m.tbl AND c.conname = _m.con AND c.contype = 'f' AND c.confdeltype = _m.del_code
+        AND a.attname = _m.col AND rcl.relname = _m.ref AND ra.attname = 'id' AND array_length(c.conkey, 1) = 1
+    ) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _m.tbl, _m.con); END IF;
 
-  -- 3. orders (client_id) -> users (RESTRICT)
-  _t := 'orders'; _c := 'fk_orders_client'; _col := 'client_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 4. orders (freelancer_id) -> users (RESTRICT)
-  _t := 'orders'; _c := 'fk_orders_freelancer'; _col := 'freelancer_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 5. proposals (freelancer_id) -> users (RESTRICT)
-  _t := 'proposals'; _c := 'fk_proposals_freelancer'; _col := 'freelancer_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 6. gigs (freelancer_id) -> users (RESTRICT)
-  _t := 'gigs'; _c := 'fk_gigs_freelancer'; _col := 'freelancer_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 7. proposals (project_id) -> projects (RESTRICT)
-  _t := 'proposals'; _c := 'fk_proposals_project'; _col := 'project_id'; _ref := 'projects'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 8. escrows (order_id) -> orders (RESTRICT)
-  _t := 'escrows'; _c := 'fk_escrows_order'; _col := 'order_id'; _ref := 'orders'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 9. disputes (order_id) -> orders (RESTRICT)
-  _t := 'disputes'; _c := 'fk_disputes_order'; _col := 'order_id'; _ref := 'orders'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 10. workstream_offers (order_id) -> orders (RESTRICT)
-  _t := 'workstream_offers'; _c := 'fk_offers_order'; _col := 'order_id'; _ref := 'orders'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 11. messages (order_id) -> orders (RESTRICT)
-  _t := 'messages'; _c := 'fk_messages_order'; _col := 'order_id'; _ref := 'orders'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 12. ledger_entries (journal_id) -> ledger_journals (RESTRICT)
-  _t := 'ledger_entries'; _c := 'fk_ledger_entries_journal'; _col := 'journal_id'; _ref := 'ledger_journals'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 13. reviews (reviewer_id) -> users (SET NULL)
-  _t := 'reviews'; _c := 'fk_reviews_reviewer'; _col := 'reviewer_id'; _ref := 'users'; _del := 'n';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE SET NULL NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 14. uploads (order_id) -> orders (SET NULL)
-  _t := 'uploads'; _c := 'fk_uploads_order'; _col := 'order_id'; _ref := 'orders'; _del := 'n';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE SET NULL NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 15. orders (gig_id) -> gigs (SET NULL)
-  _t := 'orders'; _c := 'fk_orders_gig'; _col := 'gig_id'; _ref := 'gigs'; _del := 'n';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE SET NULL NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 16. projects (buyer_id) -> users (RESTRICT)
-  _t := 'projects'; _c := 'fk_projects_buyer'; _col := 'buyer_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 17. workspaces (buyer_id) -> users (RESTRICT)
-  _t := 'workspaces'; _c := 'fk_workspaces_buyer'; _col := 'buyer_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 18. workspaces (seller_id) -> users (RESTRICT)
-  _t := 'workspaces'; _c := 'fk_workspaces_seller'; _col := 'seller_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 19. custom_invoices (buyer_id) -> users (RESTRICT)
-  _t := 'custom_invoices'; _c := 'fk_custom_invoices_buyer'; _col := 'buyer_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 20. custom_invoices (seller_id) -> users (RESTRICT)
-  _t := 'custom_invoices'; _c := 'fk_custom_invoices_seller'; _col := 'seller_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 21. custom_invoices (related_order_id) -> orders (RESTRICT)
-  _t := 'custom_invoices'; _c := 'fk_custom_invoices_order'; _col := 'related_order_id'; _ref := 'orders'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 22. disputes (buyer_id) -> users (RESTRICT)
-  _t := 'disputes'; _c := 'fk_disputes_buyer'; _col := 'buyer_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 23. disputes (seller_id) -> users (RESTRICT)
-  _t := 'disputes'; _c := 'fk_disputes_seller'; _col := 'seller_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 24. refunds (order_id) -> orders (RESTRICT)
-  _t := 'refunds'; _c := 'fk_refunds_order'; _col := 'order_id'; _ref := 'orders'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 25. refunds (buyer_id) -> users (RESTRICT)
-  _t := 'refunds'; _c := 'fk_refunds_buyer'; _col := 'buyer_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 26. payouts (freelancer_id) -> users (RESTRICT)
-  _t := 'payouts'; _c := 'fk_payouts_freelancer'; _col := 'freelancer_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 27. support_tickets (user_id) -> users (RESTRICT)
-  _t := 'support_tickets'; _c := 'fk_support_tickets_user'; _col := 'user_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 28. notifications (user_id) -> users (RESTRICT)
-  _t := 'notifications'; _c := 'fk_notifications_user'; _col := 'user_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 29. project_clarifications (project_id) -> projects (RESTRICT)
-  _t := 'project_clarifications'; _c := 'fk_clarifications_project'; _col := 'project_id'; _ref := 'projects'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 30. project_clarifications (user_id) -> users (RESTRICT)
-  _t := 'project_clarifications'; _c := 'fk_clarifications_user'; _col := 'user_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 31. wallet_movements (user_id) -> users (RESTRICT)
-  _t := 'wallet_movements'; _c := 'fk_wallet_movements_user'; _col := 'user_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 32. earnings_clearing (order_id) -> orders (RESTRICT)
-  _t := 'earnings_clearing'; _c := 'fk_earnings_clearing_order'; _col := 'order_id'; _ref := 'orders'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 33. earnings_clearing (seller_id) -> users (RESTRICT)
-  _t := 'earnings_clearing'; _c := 'fk_earnings_clearing_seller'; _col := 'seller_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 34. clearing_earnings (order_id) -> orders (RESTRICT)
-  _t := 'clearing_earnings'; _c := 'fk_clearing_earnings_order'; _col := 'order_id'; _ref := 'orders'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 35. clearing_earnings (seller_id) -> users (RESTRICT)
-  _t := 'clearing_earnings'; _c := 'fk_clearing_earnings_seller'; _col := 'seller_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 36. payment_checkout_sessions (user_id) -> users (RESTRICT)
-  _t := 'payment_checkout_sessions'; _c := 'fk_checkout_sessions_user'; _col := 'user_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 37. payment_checkout_sessions (order_id) -> orders (RESTRICT)
-  _t := 'payment_checkout_sessions'; _c := 'fk_checkout_sessions_order'; _col := 'order_id'; _ref := 'orders'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
-  -- 38. wallets (user_id) -> users (RESTRICT)
-  _t := 'wallets'; _c := 'fk_wallets_user'; _col := 'user_id'; _ref := 'users'; _del := 'r';
-  FOR _r IN (SELECT conname FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) WHERE cl.relname = _t AND a.attname = _col AND c.contype = 'f' AND c.conname != _c) LOOP EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _r.conname); END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid WHERE cl.relname = _t AND c.conname = _c AND (c.confdeltype != _del OR c.contype != 'f')) THEN EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', _t, _c); END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class cl ON cl.oid = c.conrelid WHERE cl.relname = _t AND c.conname = _c) THEN EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE RESTRICT NOT VALID', _t, _c, _col, _ref); END IF;
-
+    -- 3. Add the intended constraint if it's missing
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_catalog.pg_constraint c 
+      JOIN pg_catalog.pg_class cl ON c.conrelid = cl.oid 
+      JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace
+      WHERE n.nspname = current_schema() AND cl.relname = _m.tbl AND c.conname = _m.con
+    ) THEN
+      EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE %s NOT VALID', _m.tbl, _m.con, _m.col, _m.ref, _m.del_str);
+    END IF;
+  END LOOP;
 END $$;
 
 
