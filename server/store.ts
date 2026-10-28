@@ -692,6 +692,7 @@ export class PostgresAsyncStore implements StoreInterface {
           subcategory = EXCLUDED.subcategory,
           description = EXCLUDED.description,
           price = EXCLUDED.price,
+          delivery_days = EXCLUDED.delivery_days,
           rating = COALESCE(gigs.rating, EXCLUDED.rating),
           reviews_count = COALESCE(gigs.reviews_count, EXCLUDED.reviews_count),
           image = EXCLUDED.image,

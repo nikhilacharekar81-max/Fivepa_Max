@@ -403,18 +403,25 @@ export async function refundOrderFunds(
 
   await syncUserBalances([order.buyerId, order.sellerId].filter(Boolean));
   const dbRunner = externalClient || postgresStore.getPool();
+  const cancelReqJson = cancellationData?.cancellationRequest !== undefined
+    ? JSON.stringify(cancellationData.cancellationRequest)
+    : (order.cancellationRequest ? JSON.stringify(order.cancellationRequest) : null);
+  const cancelHistJson = cancellationData?.cancellationHistory !== undefined
+    ? JSON.stringify(cancellationData.cancellationHistory)
+    : (order.cancellationHistory ? JSON.stringify(order.cancellationHistory) : null);
+
   await dbRunner.query(
     `UPDATE orders 
      SET status = $1, 
          cancellation_type = COALESCE($2, cancellation_type),
          cancellation_request = COALESCE($3, cancellation_request),
          cancellation_history = COALESCE($4, cancellation_history)
-     WHERE id = $5 AND status NOT IN ('completed', 'cancelled')`,
+     WHERE id = $5 AND status != 'completed'`,
     [
       order.status,
       order.cancellationType || null,
-      cancellationData?.cancellationRequest !== undefined ? JSON.stringify(cancellationData.cancellationRequest) : null,
-      cancellationData?.cancellationHistory !== undefined ? JSON.stringify(cancellationData.cancellationHistory) : null,
+      cancelReqJson,
+      cancelHistJson,
       order.id
     ]
   );

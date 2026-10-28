@@ -735,19 +735,25 @@ CREATE TABLE IF NOT EXISTS reconciliation_exceptions (
 CREATE INDEX IF NOT EXISTS idx_reconciliation_exceptions_status ON reconciliation_exceptions(status);
 CREATE INDEX IF NOT EXISTS idx_reconciliation_exceptions_entity ON reconciliation_exceptions(entity_id);
 
+DELETE FROM workstream_offers WHERE order_id NOT IN (SELECT id FROM orders);
 DO $$ BEGIN
-  ALTER TABLE workstream_offers ADD CONSTRAINT fk_offers_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE;
-EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_offers_order') THEN
+    ALTER TABLE workstream_offers ADD CONSTRAINT fk_offers_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE;
+  END IF;
 END $$;
 
+DELETE FROM messages WHERE order_id NOT IN (SELECT id FROM orders);
 DO $$ BEGIN
-  ALTER TABLE messages ADD CONSTRAINT fk_messages_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE;
-EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_messages_order') THEN
+    ALTER TABLE messages ADD CONSTRAINT fk_messages_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE;
+  END IF;
 END $$;
 
+UPDATE uploads SET order_id = NULL WHERE order_id IS NOT NULL AND order_id NOT IN (SELECT id FROM orders);
 DO $$ BEGIN
-  ALTER TABLE uploads ADD CONSTRAINT fk_uploads_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE SET NULL;
-EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_uploads_order') THEN
+    ALTER TABLE uploads ADD CONSTRAINT fk_uploads_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE SET NULL;
+  END IF;
 END $$;
 
 CREATE INDEX IF NOT EXISTS idx_uploads_order_id ON uploads(order_id);
@@ -799,14 +805,24 @@ WHERE id IN (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_gigs_unique_slug ON gigs(slug) WHERE slug IS NOT NULL AND slug != '';
 
 -- Foreign Key Constraints for Orders and Gigs
+UPDATE orders SET gig_id = NULL WHERE gig_id IS NOT NULL AND gig_id NOT IN (SELECT id FROM gigs);
 DO $$ BEGIN
-  ALTER TABLE orders ADD CONSTRAINT fk_orders_gig FOREIGN KEY (gig_id) REFERENCES gigs(id) ON DELETE SET NULL;
-EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_orders_gig') THEN
+    ALTER TABLE orders ADD CONSTRAINT fk_orders_gig FOREIGN KEY (gig_id) REFERENCES gigs(id) ON DELETE SET NULL;
+  END IF;
 END $$;
 
 DO $$ BEGIN
-  ALTER TABLE gigs ADD CONSTRAINT fk_gigs_freelancer FOREIGN KEY (freelancer_id) REFERENCES users(id) ON DELETE CASCADE;
-EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint c
+    JOIN pg_namespace n ON n.oid = c.connamespace
+    WHERE c.conname = 'fk_gigs_freelancer' AND c.confdeltype = 'c'
+  ) THEN
+    ALTER TABLE gigs DROP CONSTRAINT fk_gigs_freelancer;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_gigs_freelancer') THEN
+    ALTER TABLE gigs ADD CONSTRAINT fk_gigs_freelancer FOREIGN KEY (freelancer_id) REFERENCES users(id) ON DELETE RESTRICT;
+  END IF;
 END $$;
 
 

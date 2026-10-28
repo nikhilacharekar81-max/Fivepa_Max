@@ -502,6 +502,14 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
 
     const enriched = txResult.result;
 
+    if (!isInquiry) {
+      try {
+        await syncUserBalances([buyerId, sellerId].filter(Boolean));
+      } catch (syncErr) {
+        console.error('[OrderCreate] Non-fatal syncUserBalances error after commit:', syncErr);
+      }
+    }
+
     if (isInquiry) {
       await emitSystemEvent(enriched.id, 'order_created', `Inquiry thread opened: ${title}.`);
     } else {
