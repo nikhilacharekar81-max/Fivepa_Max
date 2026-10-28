@@ -115,7 +115,13 @@ export class MarketplaceRepo {
               await executeRowInsert(targetSlug);
               await client.query(`RELEASE SAVEPOINT ${spName}`);
             } catch (err) {
-              await client.query(`ROLLBACK TO SAVEPOINT ${spName}`);
+              try {
+                await client.query(`ROLLBACK TO SAVEPOINT ${spName}`);
+                await client.query(`RELEASE SAVEPOINT ${spName}`);
+              } catch (cleanupErr) {
+                console.error(`[MarketplaceRepo.saveGigs] Failed to clean up savepoint ${spName}:`, cleanupErr);
+                throw cleanupErr;
+              }
               throw err;
             }
           };
