@@ -92,6 +92,7 @@ export async function registerAuditLog(log: AuditLog): Promise<void> {
     await store.addAuditLog(log);
   } catch (err) {
     console.error('[PostgresStore] Failed to save audit log:', err);
+    throw err;
   }
 }
 

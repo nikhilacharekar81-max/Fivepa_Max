@@ -1093,6 +1093,8 @@ router.patch('/admin/gigs/:id', requireAdmin, async (req: Request, res: Response
     const gig = await store.getGig(req.params.id);
     if (!gig) return res.status(404).json({ error: 'Gig not found' });
 
+    const previousStatus = gig.status;
+
     const VALID_STATUSES = ['active', 'paused', 'moderation', 'deleted'];
     const VALID_MODERATION_STATUSES = ['approved', 'pending', 'rejected', 'flagged'];
 
@@ -1133,7 +1135,7 @@ router.patch('/admin/gigs/:id', requireAdmin, async (req: Request, res: Response
     const updatedGig = await store.updateGig(gig.id, adminUpdates);
     if (!updatedGig) return res.status(404).json({ error: 'Gig not found' });
 
-    if (updatedGig.status === 'deleted') {
+    if (previousStatus !== 'deleted' && updatedGig.status === 'deleted') {
       await registerAuditLog({
         id: 'log_' + Date.now(),
         actor: adminActor(req),
