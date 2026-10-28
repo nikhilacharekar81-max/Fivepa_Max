@@ -963,7 +963,7 @@ router.patch('/admin/disputes/:id/resolve', requireAdmin, async (req: Request, r
       } catch (err: any) {
         return res.status(409).json({ error: err.message });
       }
-      if (status === 'resolved_release') await releaseOrderFunds(order, adminActor(req), reason, false);
+      if (status === 'resolved_release') await releaseOrderFunds(order, adminActor(req), reason, false, undefined, true);
       else if (status === 'resolved_refund') await refundOrderFunds(order, undefined, adminActor(req), reason);
       else await splitOrderFunds(order, Number(req.body.refundAmount), adminActor(req), reason);
     }

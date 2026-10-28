@@ -1212,11 +1212,81 @@ const handleOpenDispute = async (req: Request, res: Response) => {
     };
 
     const allowedDisputeStatuses = ['funded_in_escrow', 'in_progress', 'delivered', 'revision', 'draft_review', 'work_in_progress'];
-    const dispUpdated = await store.updateOrderStatus(order.id, { status: 'disputed' }, allowedDisputeStatuses);
-    if (!dispUpdated) {
-      return res.status(409).json({ error: 'Cannot open a dispute: order status changed concurrently.' });
-    }
-    await store.saveDispute(newDispute);
+
+    // ATOMIC TRANSACTION: Both order status update and dispute insertion commit together or rollback together
+    await postgresStore.executeInTransaction(async (client) => {
+      // Re-verify order status under FOR UPDATE lock
+      const orderRes = await client.query('SELECT status FROM orders WHERE id = $1 FOR UPDATE', [order.id]);
+      if (orderRes.rows.length === 0) {
+        const err: any = new Error('Order not found');
+        err.statusCode = 404;
+        throw err;
+      }
+      const currentStatus = orderRes.rows[0].status;
+      if (currentStatus === 'completed' || currentStatus === 'cancelled') {
+        const err: any = new Error(`Cannot open a dispute: this order is already ${currentStatus}.`);
+        err.statusCode = 409;
+        throw err;
+      }
+      if (currentStatus === 'disputed') {
+        const err: any = new Error('This order is already under dispute.');
+        err.statusCode = 409;
+        throw err;
+      }
+      if (!allowedDisputeStatuses.includes(currentStatus)) {
+        const err: any = new Error(`Cannot open a dispute for order in status "${currentStatus}".`);
+        err.statusCode = 409;
+        throw err;
+      }
+
+      // Re-verify active held escrow under FOR UPDATE lock
+      const escRes = await client.query('SELECT status, remaining FROM escrows WHERE order_id = $1 FOR UPDATE', [order.id]);
+      if (escRes.rows.length === 0 || escRes.rows[0].status !== 'held' || Number(escRes.rows[0].remaining) <= 0) {
+        const err: any = new Error('Cannot open a dispute: there is no active escrow held for this order.');
+        err.statusCode = 409;
+        throw err;
+      }
+
+      // Re-verify existing active dispute under FOR UPDATE lock
+      const dispCheck = await client.query(
+        "SELECT id FROM disputes WHERE order_id = $1 AND status IN ('open', 'under_investigation') FOR UPDATE",
+        [order.id]
+      );
+      if (dispCheck.rows.length > 0) {
+        const err: any = new Error('An active dispute already exists for this order.');
+        err.statusCode = 400;
+        throw err;
+      }
+
+      // Atomically update order status
+      const updateRes = await client.query(
+        `UPDATE orders SET status = 'disputed' WHERE id = $1 AND status NOT IN ('completed', 'cancelled', 'disputed')`,
+        [order.id]
+      );
+      if (updateRes.rowCount === 0) {
+        const err: any = new Error('Cannot open a dispute: order status changed concurrently.');
+        err.statusCode = 409;
+        throw err;
+      }
+
+      // Atomically insert dispute record
+      await client.query(
+        `INSERT INTO disputes (id, order_id, buyer_id, seller_id, raised_by, reason, evidence, status, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          newDispute.id,
+          newDispute.orderId,
+          newDispute.buyerId || null,
+          newDispute.sellerId || null,
+          newDispute.raisedBy,
+          newDispute.reason,
+          newDispute.evidence || null,
+          newDispute.status,
+          newDispute.createdAt
+        ]
+      );
+    });
+
     order.status = 'disputed';
 
     const sysMsg: Message = {
@@ -1239,7 +1309,8 @@ const handleOpenDispute = async (req: Request, res: Response) => {
 
     res.json({ success: true, dispute: newDispute, order: enrichOrderWithServiceInfo(order) });
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    const statusCode = err?.statusCode || 400;
+    res.status(statusCode).json({ error: err.message });
   } finally {
     releaseOrderLock(orderId);
   }
@@ -1332,7 +1403,7 @@ const handleOrderForceComplete = async (req: Request, res: Response) => {
     }
 
     const reason = String(req.body.reason || 'Admin administrative force-release in seller favor.');
-    const result = await releaseOrderFunds(order, adminActor(req), reason, false, req.body.requestKey);
+    const result = await releaseOrderFunds(order, adminActor(req), reason, false, req.body.requestKey, true);
     await closeActiveDispute(order.id, 'resolved_release', reason);
 
     res.json({ success: true, order: enrichOrderWithServiceInfo(order), result });

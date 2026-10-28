@@ -319,11 +319,18 @@ export async function topUpOrderEscrowWithEvent(params: { orderId: string; order
   return res;
 }
 
-export async function releaseOrderFunds(order: Order, actor: string, reason: string, approvedByBuyer: boolean, requestKey?: string) {
+export async function releaseOrderFunds(
+  order: Order, 
+  actor: string, 
+  reason: string, 
+  approvedByBuyer: boolean, 
+  requestKey?: string,
+  allowDisputeResolution?: boolean
+) {
   if (order.status === 'completed' && !requestKey) {
     throw new Error('Order is already completed; funds were already released.');
   }
-  if (order.cancellationRequest && order.cancellationRequest.status === 'pending') {
+  if (!allowDisputeResolution && order.cancellationRequest && order.cancellationRequest.status === 'pending') {
     throw new Error('Cannot release payment while a cancellation request is pending. The cancellation request must be resolved or rejected first.');
   }
 
@@ -331,7 +338,8 @@ export async function releaseOrderFunds(order: Order, actor: string, reason: str
     orderId: order.id,
     actor,
     reason,
-    idempotencyKey: requestKey
+    idempotencyKey: requestKey,
+    allowDisputeResolution
   });
 
   order.status = 'completed';
@@ -347,8 +355,8 @@ export async function releaseOrderFunds(order: Order, actor: string, reason: str
     `UPDATE orders 
      SET status = $1, completed_at = COALESCE(completed_at, $2), accepted_version = COALESCE($3, accepted_version) 
      WHERE id = $4 
-       AND status NOT IN ('completed', 'cancelled')
-       AND (cancellation_request IS NULL OR cancellation_request->>'status' != 'pending')`,
+       AND (status = 'completed' OR status NOT IN ('completed', 'cancelled'))
+       AND (${allowDisputeResolution ? 'TRUE' : "cancellation_request IS NULL OR cancellation_request->>'status' != 'pending'"})`,
     ['completed', order.completedAt, order.acceptedVersion ?? null, order.id]
   );
   if (updateRes.rowCount === 0) {
