@@ -351,17 +351,6 @@ export async function releaseOrderFunds(
   }
 
   await syncUserBalances([order.buyerId, order.sellerId].filter(Boolean));
-  const updateRes = await postgresStore.getPool().query(
-    `UPDATE orders 
-     SET status = $1, completed_at = COALESCE(completed_at, $2), accepted_version = COALESCE($3, accepted_version) 
-     WHERE id = $4 
-       AND (status = 'completed' OR status NOT IN ('completed', 'cancelled'))
-       AND (${allowDisputeResolution ? 'TRUE' : "cancellation_request IS NULL OR cancellation_request->>'status' != 'pending'"})`,
-    ['completed', order.completedAt, order.acceptedVersion ?? null, order.id]
-  );
-  if (updateRes.rowCount === 0) {
-    throw new Error('Payment release failed: Order status changed or a cancellation request is pending.');
-  }
 
   if (approvedByBuyer) {
     await emitSystemEvent(order.id, 'deliverable_approved', `✅ Deliverables approved by buyer.`, {

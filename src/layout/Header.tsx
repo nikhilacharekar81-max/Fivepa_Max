@@ -8,7 +8,7 @@ import { PPH_CATEGORIES } from '../components/HeaderCategoriesNav';
 import { slugify } from '../utils/slugify';
 import type { Order, UserAccount } from '../types';
 import { clearAuthToken, getAuthToken } from '../utils/authToken';
-import { DEFAULT_AVATAR } from '../constants';
+import { DEFAULT_AVATAR, getUserInitialsAvatar } from '../constants';
 
 export interface HeaderProps {
   navigate: (to: string, e?: React.MouseEvent) => void;
@@ -654,11 +654,15 @@ export function Header({
             >
               <div className="relative">
                 <img 
-                  src={currentUser.avatar || DEFAULT_AVATAR} 
+                  src={currentUser.avatar || getUserInitialsAvatar(currentUser.name)} 
                   alt={currentUser.name} 
                   className="w-8 h-8 rounded-full object-cover border border-slate-200" 
                   onError={(e) => {
-                    (e.target as HTMLImageElement).src = DEFAULT_AVATAR;
+                    const img = e.currentTarget;
+                    const fallback = getUserInitialsAvatar(currentUser.name);
+                    if (img.src !== fallback) {
+                      img.src = fallback;
+                    }
                   }}
                 />
                 {currentUser.isAvailableNow && (

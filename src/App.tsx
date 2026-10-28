@@ -147,14 +147,14 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
       } catch {}
     }
     if (initialData?.users && initialData.users.length > 0) {
-      const marcus = initialData.users.find((u: any) => u.id === 'u2' || u.name?.includes('Marcus Vance'));
-      if (marcus) {
+      const elena = initialData.users.find((u: any) => u.id === 'u3' || u.name?.includes('Elena Rostova'));
+      const defaultUser = elena || initialData.users[0];
+      if (defaultUser) {
         if (typeof window !== 'undefined') {
-          localStorage.setItem('current_user', JSON.stringify(marcus));
+          localStorage.setItem('current_user', JSON.stringify(defaultUser));
         }
-        return marcus;
+        return defaultUser;
       }
-      return initialData.users[0];
     }
     return null;
   });
@@ -193,6 +193,22 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
   );
 
   const loadUserSession = useCallback(async (): Promise<boolean> => {
+    const existingToken = getAuthToken();
+    if (existingToken) {
+      try {
+        const res = await fetch('/api/auth/me', {
+          headers: { 'Authorization': `Bearer ${existingToken}` }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data?.user) {
+            updateCurrentUser(data.user);
+            return true;
+          }
+        }
+      } catch {}
+    }
+
     let storedUser: any = null;
     try {
       const storedRaw = typeof window !== 'undefined'
@@ -201,7 +217,7 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
       storedUser = storedRaw ? JSON.parse(storedRaw) : null;
     } catch {}
 
-    const targetUserId = storedUser?.id || 'u2';
+    const targetUserId = storedUser?.id || 'u3';
 
     try {
       const demoSession = await requestDemoSession(targetUserId);

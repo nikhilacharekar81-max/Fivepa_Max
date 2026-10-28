@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS gigs (
   extras JSONB,
   moderation_status VARCHAR(32) DEFAULT 'approved',
   moderation_notes TEXT,
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Canonical gig statuses: active, paused, moderation, deleted
@@ -766,6 +767,7 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS selected_extras JSONB;
 ALTER TABLE gigs ADD COLUMN IF NOT EXISTS featured BOOLEAN DEFAULT FALSE;
 ALTER TABLE gigs ADD COLUMN IF NOT EXISTS is_featured BOOLEAN DEFAULT FALSE;
 ALTER TABLE gigs ADD COLUMN IF NOT EXISTS featured_until VARCHAR(64);
+ALTER TABLE gigs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 
 CREATE TABLE IF NOT EXISTS outbox_events (
   id VARCHAR(64) PRIMARY KEY,
