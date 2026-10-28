@@ -251,6 +251,59 @@ export function isAutoAcceptEnabled(): boolean {
 
 export const LATE_ORDER_PROTECTION_HOURS = 48;
 
+/**
+ * Parses an order deadline into an authoritative UTC timestamp in milliseconds.
+ * - Full ISO timestamps (e.g. 2026-10-30T14:30:00.000Z) are parsed directly.
+ * - Legacy date-only records (e.g. 2026-10-30) are handled conservatively:
+ *   If the order's creation timestamp has a valid time-of-day, that time-of-day is preserved.
+ *   Otherwise, the date-only record is treated as end-of-day (23:59:59.999Z) so the deadline
+ *   is never prematurely triggered earlier than intended.
+ * - Invalid or unparseable inputs return null.
+ */
+export function parseDeadlineInstant(dueDate: unknown, referenceCreatedAt?: unknown): number | null {
+  if (!dueDate || typeof dueDate !== 'string') return null;
+  const trimmed = dueDate.trim();
+  if (!trimmed) return null;
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    if (referenceCreatedAt && typeof referenceCreatedAt === 'string' && referenceCreatedAt.includes('T')) {
+      const createdDate = new Date(referenceCreatedAt);
+      if (!isNaN(createdDate.getTime())) {
+        const timePart = referenceCreatedAt.split('T')[1];
+        if (timePart) {
+          const candidate = new Date(`${trimmed}T${timePart}`);
+          if (!isNaN(candidate.getTime())) {
+            return candidate.getTime();
+          }
+        }
+      }
+    }
+    const endOfDay = new Date(`${trimmed}T23:59:59.999Z`);
+    return isNaN(endOfDay.getTime()) ? null : endOfDay.getTime();
+  }
+
+  const parsed = new Date(trimmed);
+  const time = parsed.getTime();
+  return isNaN(time) ? null : time;
+}
+
+/**
+ * Calculates a new extended deadline instant from an existing deadline.
+ * Preserves the exact time-of-day and UTC offset, returning a full ISO 8601 string.
+ * Returns null if the existing deadline is invalid or missing.
+ */
+export function calculateExtendedDeadline(
+  existingDueDate: unknown,
+  daysToAdd: number,
+  referenceCreatedAt?: unknown
+): string | null {
+  if (!Number.isFinite(daysToAdd) || daysToAdd <= 0) return null;
+  const baseInstant = parseDeadlineInstant(existingDueDate, referenceCreatedAt);
+  if (baseInstant === null) return null;
+  const newDate = new Date(baseInstant + daysToAdd * 86400000);
+  return newDate.toISOString();
+}
+
 export function assertOrderOpen(order: Order) {
   if (order.status === 'completed') throw new Error('Order is already completed; funds were already released.');
   if (order.status === 'cancelled') throw new Error('Order is already cancelled; funds were already handled.');
@@ -317,14 +370,16 @@ export async function refundOrderFunds(
   actor: string, 
   reason: string, 
   requestKey?: string,
-  cancellationData?: { cancellationRequest?: any; cancellationHistory?: any }
+  cancellationData?: { cancellationRequest?: any; cancellationHistory?: any },
+  allowDisputeResolution?: boolean
 ) {
   const result = await financialTransactionService.refundOrderFunds({
     orderId: order.id,
     amount,
     reason,
     actor,
-    idempotencyKey: requestKey
+    idempotencyKey: requestKey,
+    allowDisputeResolution
   });
 
   if (result.remaining === 0) {
@@ -445,11 +500,11 @@ export async function processCancellationTimeouts() {
   const pool = postgresStore.getPool();
   try {
     const res = await pool.query(
-      "SELECT id FROM orders WHERE status NOT IN ('completed', 'cancelled') AND cancellation_request IS NOT NULL"
+      "SELECT id FROM orders WHERE status NOT IN ('completed', 'cancelled', 'disputed') AND cancellation_request IS NOT NULL"
     );
     for (const r of res.rows) {
       const order = await store.getOrder(r.id);
-      if (!order || !order.cancellationRequest || order.cancellationRequest.status !== 'pending') continue;
+      if (!order || order.status === 'completed' || order.status === 'cancelled' || order.status === 'disputed' || !order.cancellationRequest || order.cancellationRequest.status !== 'pending') continue;
       const respondByTime = new Date(order.cancellationRequest.respondBy).getTime();
 
       if (now > respondByTime) {
@@ -461,7 +516,15 @@ export async function processCancellationTimeouts() {
         }
         try {
           const freshOrder = await store.getOrder(order.id);
-          if (!freshOrder || freshOrder.status === 'completed' || freshOrder.status === 'cancelled' || !freshOrder.cancellationRequest || freshOrder.cancellationRequest.status !== 'pending') {
+          if (!freshOrder || freshOrder.status === 'completed' || freshOrder.status === 'cancelled' || freshOrder.status === 'disputed' || !freshOrder.cancellationRequest || freshOrder.cancellationRequest.status !== 'pending') {
+            continue;
+          }
+
+          const activeDisputeRes = await pool.query(
+            "SELECT 1 FROM disputes WHERE order_id = $1 AND status IN ('open', 'under_investigation', 'under_review') LIMIT 1",
+            [freshOrder.id]
+          );
+          if (activeDisputeRes.rows.length > 0) {
             continue;
           }
 

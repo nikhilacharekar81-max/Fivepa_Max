@@ -48,7 +48,8 @@ import {
   ensureWallet,
   LATE_ORDER_PROTECTION_HOURS,
   registerAuditLog,
-  validateOrderReleasePreconditions
+  validateOrderReleasePreconditions,
+  parseDeadlineInstant
 } from '../../services/orderService.js';
 import { siteSettings } from '../../../src/server/siteSettings.js';
 import { broadcastMessage } from '../../websocket.js';
@@ -395,7 +396,7 @@ router.post('/payments/escrow/deposit', requireAuth, requireFinancialActiveStatu
         amount,
         status: 'payment_pending',
         createdAt: today,
-        dueDate: new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0],
+        dueDate: new Date(Date.now() + 7 * 86400000).toISOString(),
         escrowProtectionStartDate: today,
         escrowProtectionEndDate: protectionEnd,
         feeBreakdown: calculateOrderFees(amount),
@@ -1002,7 +1003,8 @@ router.post('/payments/escrow/refund', requireAuth, async (req: Request, res: Re
     const isGigOrder = order.orderType === 'gig' || Boolean(order.gigOrderId);
     if (isGigOrder && isSeller && !isAdmin) return res.status(403).json({ error: 'Sellers must use the cancellation request.' });
     const overdueThresholdHours = LATE_ORDER_PROTECTION_HOURS;
-    const isOverdueByThreshold = order.dueDate ? (Date.now() > new Date(order.dueDate).getTime() + overdueThresholdHours * 60 * 60 * 1000) : false;
+    const deadlineMs = parseDeadlineInstant(order.dueDate, order.createdAt);
+    const isOverdueByThreshold = deadlineMs !== null ? (Date.now() > deadlineMs + overdueThresholdHours * 60 * 60 * 1000) : false;
 
     if (!isAdmin && !isSeller) {
       if (isBuyer && isOverdueByThreshold) {

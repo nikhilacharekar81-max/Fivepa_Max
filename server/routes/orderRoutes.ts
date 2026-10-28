@@ -42,7 +42,9 @@ import {
   ensureWallet,
   registerAuditLog,
   getActiveEscrowRemaining,
-  LATE_ORDER_PROTECTION_HOURS
+  LATE_ORDER_PROTECTION_HOURS,
+  parseDeadlineInstant,
+  calculateExtendedDeadline
 } from '../services/orderService.js';
 import { broadcastMessage } from '../websocket.js';
 import {
@@ -371,7 +373,7 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
           amount: 0,
           status: 'in_progress',
           createdAt: today,
-          dueDate: new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0],
+          dueDate: new Date(Date.now() + 7 * 86400000).toISOString(),
           gigId: req.body.gigId,
           projectId: req.body.projectId,
           ...(requirements ? { requirements } : {}),
@@ -531,14 +533,50 @@ const handleOrderExtendTime = async (req: Request, res: Response) => {
 
     const { days, newDueDate, reason } = req.body;
     const oldDate = order.dueDate;
-    let targetDate = newDueDate;
+    let targetDate: string;
 
-    if (days && Number(days) > 0) {
-      const current = new Date(order.dueDate || Date.now());
-      current.setDate(current.getDate() + Number(days));
-      targetDate = current.toISOString().split('T')[0];
-    } else if (!targetDate) {
-      targetDate = new Date(Date.now() + 2 * 86400000).toISOString().split('T')[0];
+    if (days !== undefined && Number(days) > 0) {
+      const numDays = Number(days);
+      const extended = calculateExtendedDeadline(order.dueDate, numDays, order.createdAt);
+      if (extended) {
+        targetDate = extended;
+      } else {
+        // Safe explicit fallback consistent with admin workflow if existing deadline was missing/invalid
+        targetDate = new Date(Date.now() + numDays * 86400000).toISOString();
+      }
+    } else if (newDueDate !== undefined) {
+      if (typeof newDueDate !== 'string' || !newDueDate.trim()) {
+        return res.status(400).json({ error: 'A valid newDueDate string must be provided.' });
+      }
+      const trimmed = newDueDate.trim();
+      let candidateIso: string;
+
+      if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+        // Administrator supplied a date-only replacement: preserve existing time-of-day if available, or end of day
+        let timePart: string | null = null;
+        if (order.dueDate && typeof order.dueDate === 'string' && order.dueDate.includes('T')) {
+          timePart = order.dueDate.split('T')[1] || null;
+        } else if (order.createdAt && typeof order.createdAt === 'string' && order.createdAt.includes('T')) {
+          timePart = order.createdAt.split('T')[1] || null;
+        }
+
+        if (timePart) {
+          candidateIso = `${trimmed}T${timePart}`;
+        } else {
+          candidateIso = `${trimmed}T23:59:59.999Z`;
+        }
+      } else {
+        candidateIso = trimmed;
+      }
+
+      const parsed = new Date(candidateIso);
+      if (isNaN(parsed.getTime())) {
+        return res.status(400).json({ error: `Invalid deadline date format: "${newDueDate}".` });
+      }
+      targetDate = parsed.toISOString();
+    } else {
+      // Default fallback extension if neither days nor newDueDate provided
+      targetDate = new Date(Date.now() + 2 * 86400000).toISOString();
     }
 
     order.dueDate = targetDate;
@@ -606,13 +644,18 @@ router.post('/orders/:id/extension-request', requireAuth, requireActiveStatus, r
     if (!Number.isInteger(numDays) || numDays < 1 || numDays > 14) return res.status(400).json({ error: 'Days must be 1-14.' });
     if (!reason || !reason.trim()) return res.status(400).json({ error: 'Reason required.' });
 
+    const requestedDueDate = calculateExtendedDeadline(order.dueDate, numDays, order.createdAt);
+    if (!requestedDueDate) {
+      return res.status(400).json({ error: 'Order does not have a valid deadline to extend.' });
+    }
+
     const newRequest: ExtensionRequest = {
       id: 'ext_' + randomUUID().slice(0, 12),
       requestedBy: 'seller',
       days: numDays,
       reason: reason.trim(),
       originalDueDate: order.dueDate,
-      requestedDueDate: new Date(new Date(order.dueDate).getTime() + numDays * 86400000).toISOString().split('T')[0],
+      requestedDueDate,
       requestedAt: new Date().toISOString(),
       responseDeadline: new Date(Date.now() + 48 * 3600 * 1000).toISOString(),
       status: 'pending'
@@ -1261,7 +1304,7 @@ const handleOrderForceCancel = async (req: Request, res: Response) => {
       await closeActiveDispute(order.id, 'resolved_partial', reason);
       await pushSystemMessage(order.id, `⚖️ Order resolved by Administration. $${refundAmount} refunded to buyer; the remainder was released to the freelancer. Reason: ${reason}`, 'dispute_resolved');
     } else {
-      result = await refundOrderFunds(order, undefined, adminActor(req), reason, req.body.requestKey);
+      result = await refundOrderFunds(order, undefined, adminActor(req), reason, req.body.requestKey, undefined, true);
       refundAmount = result.refunded;
       await closeActiveDispute(order.id, 'resolved_refund', reason);
     }
@@ -1384,6 +1427,14 @@ router.post('/orders/:id/cancel-request/respond', requireAuth, requireActiveStat
     if (!order) return res.status(404).json({ error: 'Order not found' });
     if (!order.cancellationRequest || order.cancellationRequest.status !== 'pending') {
       return res.status(400).json({ error: 'No pending cancellation request found for this order.' });
+    }
+
+    if (order.status === 'disputed') {
+      return res.status(409).json({ error: 'Cannot process cancellation: This order is currently under active dispute.' });
+    }
+    const activeDispute = await store.getDisputeByOrderId(order.id);
+    if (activeDispute && (activeDispute.status === 'open' || activeDispute.status === 'under_investigation')) {
+      return res.status(409).json({ error: 'Cannot process cancellation: This order has an active unresolved dispute.' });
     }
 
     const isBuyer = userId === order.buyerId;
@@ -1581,7 +1632,8 @@ const handleOrderCancel = async (req: Request, res: Response) => {
         }
         if (['funded_in_escrow', 'in_progress'].includes(order.status) || hasFundedEscrow) {
           const hasZeroDeliveries = (!order.deliveryHistory || order.deliveryHistory.length === 0) && (!order.deliverableFiles || order.deliverableFiles.length === 0);
-          const isVeryLateGig = isGigOrder && Boolean(order.dueDate) && (Date.now() > new Date(order.dueDate).getTime() + LATE_ORDER_PROTECTION_HOURS * 3600 * 1000) && hasZeroDeliveries;
+          const deadlineMs = parseDeadlineInstant(order.dueDate, order.createdAt);
+          const isVeryLateGig = isGigOrder && deadlineMs !== null && (Date.now() > deadlineMs + LATE_ORDER_PROTECTION_HOURS * 3600 * 1000) && hasZeroDeliveries;
           if (!isVeryLateGig) {
             return res.status(403).json({
               error: 'Cannot directly cancel an active or delivered order. Please submit a cancellation request (POST /api/orders/:id/cancel-request) or open a dispute (POST /api/orders/:id/dispute).'

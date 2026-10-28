@@ -1145,7 +1145,7 @@ export class FinancialTransactionService {
     return postgresStore.executeInTransaction(run);
   }
 
-  async refundOrderFunds(params: { orderId: string; amount?: number; reason: string; actor: string; idempotencyKey?: string; }, externalClient?: any) {
+  async refundOrderFunds(params: { orderId: string; amount?: number; reason: string; actor: string; idempotencyKey?: string; allowDisputeResolution?: boolean; }, externalClient?: any) {
     if (params.amount !== undefined) {
       assertValidMoneyAmount(params.amount, 'amount');
     }
@@ -1180,6 +1180,19 @@ export class FinancialTransactionService {
       const orderRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [params.orderId]);
       if (orderRes.rows.length > 0 && (orderRes.rows[0].status === 'completed' || orderRes.rows[0].status === 'cancelled')) {
         throw new Error(`Cannot refund escrow: Order is already ${orderRes.rows[0].status}.`);
+      }
+
+      if (!params.allowDisputeResolution) {
+        if (orderRes.rows.length > 0 && orderRes.rows[0].status === 'disputed') {
+          throw new Error('Cannot refund escrow: Order is currently under dispute. The dispute must be resolved through dispute resolution.');
+        }
+        const activeDisputeRes = await client.query(
+          "SELECT id FROM disputes WHERE order_id = $1 AND status IN ('open', 'under_investigation', 'under_review') LIMIT 1",
+          [params.orderId]
+        );
+        if (activeDisputeRes.rows.length > 0) {
+          throw new Error('Cannot refund escrow: Order has an active unresolved dispute.');
+        }
       }
 
       await this.ensureWallet({ userId: escrow.buyer_id, role: 'buyer' }, client);

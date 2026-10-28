@@ -482,6 +482,10 @@ export class PostgresStore {
     return this.marketplaceRepo.saveGigs(gigs);
   }
 
+  async updateGig(id: string, updates: Record<string, any>, expectedFreelancerId?: string): Promise<Gig | null> {
+    return this.marketplaceRepo.updateGig(id, updates, expectedFreelancerId);
+  }
+
   async listGigs(): Promise<Gig[]> {
     return this.marketplaceRepo.listGigs();
   }

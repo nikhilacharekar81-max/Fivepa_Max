@@ -271,8 +271,7 @@ const handleGigUpdate = async (req: Request, res: Response) => {
 
     const updatedSlug = req.body.title ? (String(req.body.title).toLowerCase().trim().replace(/[^\w\s-]/g, '').replace(/[\s_-]+/g, '-').replace(/^-+|-+$/g, '') || `gig-${g.id}`) : g.slug;
 
-    const updatedGig: Gig = {
-      ...g,
+    const updatedGig = await store.updateGig(g.id, {
       title,
       slug: updatedSlug,
       category,
@@ -283,13 +282,12 @@ const handleGigUpdate = async (req: Request, res: Response) => {
       extras,
       image,
       status,
-      moderationStatus,
-      featured: g.featured,
-      isFeatured: (g as any).isFeatured || g.featured,
-      featuredUntil: g.featuredUntil,
-      featured_until: (g as any).featured_until
-    } as any;
-    await store.saveGig(updatedGig);
+      moderationStatus
+    }, caller.id);
+
+    if (!updatedGig) {
+      return res.status(404).json({ error: 'Gig not found or cannot be updated.' });
+    }
 
     registerAuditLog({
       id: 'log_' + Date.now(),

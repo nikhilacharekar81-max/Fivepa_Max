@@ -105,6 +105,7 @@ export interface StoreInterface {
   listGigs(status?: string): Promise<Gig[]>;
   listGigsForFreelancer(freelancerId: string): Promise<Gig[]>;
   saveGig(gig: Gig): Promise<void>;
+  updateGig(id: string, updates: Record<string, any>, expectedFreelancerId?: string): Promise<Gig | null>;
   deleteGig(id: string): Promise<boolean>;
 
   // Projects
@@ -690,14 +691,17 @@ export class PostgresAsyncStore implements StoreInterface {
         subcategory = EXCLUDED.subcategory,
         description = EXCLUDED.description,
         price = EXCLUDED.price,
-        delivery_days = EXCLUDED.delivery_days,
-        rating = EXCLUDED.rating,
-        reviews_count = EXCLUDED.reviews_count,
+        rating = COALESCE(gigs.rating, EXCLUDED.rating),
+        reviews_count = COALESCE(gigs.reviews_count, EXCLUDED.reviews_count),
         image = EXCLUDED.image,
         cover_image = EXCLUDED.cover_image,
         gallery = EXCLUDED.gallery,
         tags = EXCLUDED.tags,
-        status = CASE WHEN gigs.status = 'deleted' THEN 'deleted' ELSE EXCLUDED.status END,
+        status = CASE 
+          WHEN gigs.status = 'deleted' THEN 'deleted' 
+          WHEN gigs.moderation_status IN ('rejected', 'flagged') AND EXCLUDED.status = 'active' THEN gigs.status 
+          ELSE EXCLUDED.status 
+        END,
         featured = (
           CASE 
             WHEN (EXCLUDED.featured_until IS NOT NULL AND EXCLUDED.featured_until::timestamptz > NOW()) THEN TRUE
@@ -721,8 +725,11 @@ export class PostgresAsyncStore implements StoreInterface {
           END
         ),
         extras = EXCLUDED.extras,
-        moderation_status = EXCLUDED.moderation_status,
-        moderation_notes = EXCLUDED.moderation_notes`,
+        moderation_status = CASE 
+          WHEN gigs.moderation_status IN ('rejected', 'flagged') AND EXCLUDED.moderation_status NOT IN ('rejected', 'flagged') THEN gigs.moderation_status 
+          ELSE EXCLUDED.moderation_status 
+        END,
+        moderation_notes = COALESCE(EXCLUDED.moderation_notes, gigs.moderation_notes)`,
       [
         g.id, g.freelancerId, g.freelancerName, g.freelancerUsername || null, g.freelancerAvatar || null, g.freelancerLevel || null,
         g.title, slug, g.category, g.subcategory || null, g.description || '', g.price, g.deliveryDays, g.rating ?? 5.0, g.reviewsCount ?? 0,
@@ -731,6 +738,74 @@ export class PostgresAsyncStore implements StoreInterface {
         JSON.stringify(g.extras || []), g.moderationStatus || 'approved', g.moderationNotes || null
       ]
     );
+  }
+
+  async updateGig(id: string, updates: Record<string, any>, expectedFreelancerId?: string): Promise<Gig | null> {
+    const fieldMap: Record<string, string> = {
+      title: 'title',
+      slug: 'slug',
+      category: 'category',
+      subcategory: 'subcategory',
+      description: 'description',
+      price: 'price',
+      deliveryDays: 'delivery_days',
+      image: 'image',
+      coverImage: 'cover_image',
+      gallery: 'gallery',
+      tags: 'tags',
+      extras: 'extras',
+      status: 'status',
+      moderationStatus: 'moderation_status',
+      moderationNotes: 'moderation_notes',
+      freelancerName: 'freelancer_name',
+      freelancerUsername: 'freelancer_username',
+      freelancerAvatar: 'freelancer_avatar',
+      freelancerLevel: 'freelancer_level'
+    };
+
+    const setClauses: string[] = [];
+    const values: any[] = [];
+    let idx = 1;
+
+    for (const [key, col] of Object.entries(fieldMap)) {
+      if (updates[key] !== undefined) {
+        let val = updates[key];
+        if (key === 'extras') {
+          val = JSON.stringify(val || []);
+        }
+        setClauses.push(`${col} = $${idx}`);
+        values.push(val);
+        idx++;
+      }
+    }
+
+    if (setClauses.length === 0) {
+      const existing = await this.getGig(id);
+      return existing || null;
+    }
+
+    setClauses.push('updated_at = NOW()');
+
+    let whereClause = `WHERE id = $${idx} AND status != 'deleted'`;
+    values.push(id);
+    idx++;
+
+    if (expectedFreelancerId) {
+      whereClause += ` AND freelancer_id = $${idx}`;
+      values.push(expectedFreelancerId);
+      idx++;
+    }
+
+    const query = `
+      UPDATE gigs
+      SET ${setClauses.join(', ')}
+      ${whereClause}
+      RETURNING *
+    `;
+
+    const res = await postgresStore.getPool().query(query, values);
+    if (res.rows.length === 0) return null;
+    return mapGigRow(res.rows[0]);
   }
 
   async deleteGig(id: string): Promise<boolean> {
@@ -1624,7 +1699,7 @@ export async function hydrateStoreFromPostgres() {
 
     if (!isProduction && orderCount === 0 && seedCheckUsers.rows.length === 2) {
       const todayDate = new Date().toISOString().split('T')[0];
-      const dueDate = new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0];
+      const dueDate = new Date(Date.now() + 7 * 86400000).toISOString();
       const protectionEnd = new Date(Date.now() + 14 * 86400000).toISOString().split('T')[0];
       const nowIso = new Date().toISOString();
       const seedOrderId = 'ord_seed_1';

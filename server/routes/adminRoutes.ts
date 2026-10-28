@@ -1122,16 +1122,26 @@ router.patch('/admin/gigs/:id', requireAdmin, async (req: Request, res: Response
       (gig as any).moderationNotes = String(moderationNotes).slice(0, 1000);
     }
 
-    await store.saveGig(gig);
+    const adminUpdates: any = {
+      status: gig.status,
+      moderationStatus: (gig as any).moderationStatus
+    };
+    if (moderationNotes !== undefined) {
+      adminUpdates.moderationNotes = (gig as any).moderationNotes;
+    }
+
+    const updatedGig = await store.updateGig(gig.id, adminUpdates);
+    if (!updatedGig) return res.status(404).json({ error: 'Gig not found' });
+
     res.json({
       success: true,
       gig: {
-        id: gig.id,
-        freelancerId: gig.freelancerId,
-        title: gig.title,
-        status: gig.status,
-        moderationStatus: (gig as any).moderationStatus,
-        moderationNotes: (gig as any).moderationNotes
+        id: updatedGig.id,
+        freelancerId: updatedGig.freelancerId,
+        title: updatedGig.title,
+        status: updatedGig.status,
+        moderationStatus: (updatedGig as any).moderationStatus,
+        moderationNotes: (updatedGig as any).moderationNotes
       }
     });
   } catch (err: any) {
