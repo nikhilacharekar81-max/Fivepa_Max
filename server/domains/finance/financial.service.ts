@@ -1709,8 +1709,8 @@ export class FinancialTransactionService {
       );
 
       await client.query(
-        'UPDATE gigs SET is_featured = TRUE, featured_until = $1, badges = array_append(array_remove(badges, $2), $2) WHERE id = $3',
-        [params.featuredUntil, 'Featured', params.gigId]
+        'UPDATE gigs SET featured = TRUE, is_featured = TRUE, featured_until = $1 WHERE id = $2',
+        [params.featuredUntil, params.gigId]
       );
 
       const journalId = 'jnl_' + randomUUID().slice(0, 12);

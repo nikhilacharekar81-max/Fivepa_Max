@@ -630,9 +630,14 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
           await refresh(activeUser.id);
           setSelectedOrder(newOrder);
           navigate(`/messages/${newOrder.id}`);
+        } else {
+          const errData = await res.json().catch(() => ({}));
+          const errMsg = errData.error || errData.message || `Failed to place order (HTTP ${res.status})`;
+          alert(errMsg);
         }
-      } catch (e) {
+      } catch (e: any) {
         console.error('Order creation failed:', e);
+        alert(e?.message || 'Network error while placing order. Please check your connection and retry.');
       } finally {
         isCreatingOrderRef.current = false;
         setIsCreatingOrder(false);

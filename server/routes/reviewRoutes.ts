@@ -15,6 +15,7 @@ import {
   isValidIntegerRating,
   isReviewPublic,
   recalculateUserRating,
+  recalculateGigRating,
   sanitizePublicReview
 } from '../services/reviewService.js';
 import { enrichOrderWithServiceInfo } from '../services/orderService.js';
@@ -201,6 +202,10 @@ export const handleSubmitReview = async (req: Request, res: Response) => {
     }
 
     recalculateUserRating(resolvedTargetUserId);
+    const targetGigId = order.gigId || newReview.gigId;
+    if (targetGigId) {
+      await recalculateGigRating(targetGigId);
+    }
 
     createNotification({
       userId: resolvedTargetUserId,

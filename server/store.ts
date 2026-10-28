@@ -249,7 +249,8 @@ export function mapOrderRow(r: any): Order {
     cancellationHistory: typeof r.cancellation_history === 'string' ? JSON.parse(r.cancellation_history) : (r.cancellation_history || []),
     cancellationType: r.cancellation_type || undefined,
     reviewWindowRestartedAt: r.review_window_restarted_at || undefined,
-    responseDeadline: r.response_deadline || undefined
+    responseDeadline: r.response_deadline || undefined,
+    selectedExtras: typeof r.selected_extras === 'string' ? JSON.parse(r.selected_extras) : (r.selected_extras || undefined)
   } as unknown as Order;
 }
 
@@ -287,6 +288,16 @@ export function mapUserRow(r: any): User {
   };
 }
 
+function unescapeHtml(str: string): string {
+  if (typeof str !== 'string') return '';
+  return str
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
 export function mapGigRow(r: any): Gig {
   if (!r) return undefined as any;
   return {
@@ -296,11 +307,11 @@ export function mapGigRow(r: any): Gig {
     freelancerUsername: r.freelancer_username || r.freelancer_name?.toLowerCase().replace(/\s+/g, '_') || undefined,
     freelancerAvatar: r.freelancer_avatar || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
     freelancerLevel: r.freelancer_level || 'Level 1 ★',
-    title: r.title,
+    title: unescapeHtml(r.title),
     slug: r.slug || r.title?.toLowerCase().trim().replace(/[^\w\s-]/g, '').replace(/[\s_-]+/g, '-').replace(/^-+|-+$/g, '') || undefined,
     category: r.category,
     subcategory: r.subcategory || 'General',
-    description: r.description || '',
+    description: unescapeHtml(r.description || ''),
     price: Number(r.price),
     deliveryDays: Number(r.delivery_days || 7),
     rating: Number(r.rating || 0),

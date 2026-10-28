@@ -142,11 +142,11 @@ gigRouter.post('/gigs', requireAuth, requireActiveStatus, async (req: Request, r
     freelancerUsername: caller.username || caller.name.toLowerCase().replace(/\s+/g, '_'),
     freelancerAvatar: caller.avatar,
     freelancerLevel: 'Level 1 ★',
-    title: escapeHtml(req.body.title || 'Untitled Gig'),
-    slug: req.body.title ? req.body.title.toLowerCase().trim().replace(/[^\w\s-]/g, '').replace(/[\s_-]+/g, '-').replace(/^-+|-+$/g, '') : 'custom-gig',
+    title: String(req.body.title || 'Untitled Gig').trim().slice(0, 300),
+    slug: req.body.title ? String(req.body.title).toLowerCase().trim().replace(/[^\w\s-]/g, '').replace(/[\s_-]+/g, '-').replace(/^-+|-+$/g, '') : 'custom-gig',
     category,
     subcategory,
-    description: escapeHtml(req.body.description || ''),
+    description: String(req.body.description || '').trim(),
     price: gigPrice,
     deliveryDays,
     rating: 0,
@@ -196,10 +196,10 @@ const handleGigUpdate = async (req: Request, res: Response) => {
     let status: Gig['status'] = g.status;
     let moderationStatus = g.moderationStatus;
 
-    if (req.body.title !== undefined) title = escapeHtml(req.body.title);
+    if (req.body.title !== undefined) title = String(req.body.title).trim().slice(0, 300);
     if (req.body.category !== undefined && typeof req.body.category === 'string') category = req.body.category.trim().slice(0, 100);
     if (req.body.subcategory !== undefined && typeof req.body.subcategory === 'string') subcategory = req.body.subcategory.trim().slice(0, 100);
-    if (req.body.description !== undefined) description = escapeHtml(req.body.description);
+    if (req.body.description !== undefined) description = String(req.body.description).trim();
     if (req.body.price !== undefined) {
       const newPrice = Number(req.body.price);
       if (!Number.isFinite(newPrice)) return res.status(400).json({ error: 'Gig price must be a valid number.' });
