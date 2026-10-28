@@ -322,12 +322,12 @@ export function mapGigRow(r: any): Gig {
     gallery: typeof r.gallery === 'string' ? JSON.parse(r.gallery) : (r.gallery || []),
     tags: typeof r.tags === 'string' ? JSON.parse(r.tags) : (r.tags || []),
     status: (() => {
-      const st = (r.status || '').toLowerCase().trim();
+      if (!r.status) return 'moderation';
+      const st = String(r.status).toLowerCase().trim();
       if (st === 'active' || st === 'published') return 'active';
-      if (st === 'pending' || st === 'draft') return 'moderation';
-      if (st === 'deleted') return 'deleted';
       if (st === 'paused') return 'paused';
-      if (st === 'moderation') return 'moderation';
+      if (st === 'deleted') return 'deleted';
+      if (st === 'pending' || st === 'draft' || st === 'moderation') return 'moderation';
       return 'moderation';
     })(),
     featured: Boolean(r.featured || r.is_featured),

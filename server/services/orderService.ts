@@ -623,8 +623,6 @@ export async function processAutoAcceptOrders(customNow?: number): Promise<Array
     }
 
     for (const order of targetOrders) {
-      if (order.cancellationRequest && order.cancellationRequest.status === 'pending') continue;
-
       const days = order.orderType === 'project' ? 7 : getReviewWindowDays();
       const windowMs = days * 24 * 60 * 60 * 1000;
 
@@ -640,6 +638,8 @@ export async function processAutoAcceptOrders(customNow?: number): Promise<Array
         const hasActiveRequestedRevision = order.revisions.some(rev => rev.status === 'requested');
         if (hasActiveRequestedRevision) continue;
       }
+
+      if (order.cancellationRequest && order.cancellationRequest.status === 'pending') continue;
 
       const dispute = await store.getDisputeByOrderId(order.id);
       const inMemoryDispute = (disputes || []).find(d => d.orderId === order.id && (d.status === 'open' || d.status === 'under_investigation'));

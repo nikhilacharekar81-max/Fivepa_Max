@@ -926,8 +926,6 @@ router.post('/orders/:id/deliverable', requireAuth, requireActiveStatus, async (
 
     if (!success) return res.status(409).json({ error: 'Order state changed concurrently. Please retry.' });
 
-    order.status = isDraft ? 'draft_review' : 'delivered';
-
     if (resolvedRevisionCount > 0) {
       await emitSystemEvent(order.id, 'revision_resolved', `📝 Revision resolved via Delivery #v${version}.`, {
         deliveryVersion: version
