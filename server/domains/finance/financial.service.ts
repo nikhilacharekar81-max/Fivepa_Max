@@ -68,6 +68,41 @@ export function assertValidMoneyAmount(amount: unknown, fieldName = 'amount', al
   return amount;
 }
 
+export function sortKeysDeep(val: any): any {
+  if (val === null || typeof val !== 'object') {
+    return val;
+  }
+  if (Array.isArray(val)) {
+    return val.map(sortKeysDeep);
+  }
+  const sortedKeys = Object.keys(val).sort();
+  const res: Record<string, any> = {};
+  for (const k of sortedKeys) {
+    if (val[k] !== undefined) {
+      res[k] = sortKeysDeep(val[k]);
+    }
+  }
+  return res;
+}
+
+export function canonicalizeFingerprint(val: any): string {
+  if (val === null || val === undefined) return '';
+  let obj = val;
+  if (typeof val === 'string') {
+    const trimmed = val.trim();
+    if (!trimmed) return '';
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      return trimmed;
+    }
+  }
+  if (typeof obj !== 'object' || obj === null) {
+    return String(obj);
+  }
+  return JSON.stringify(sortKeysDeep(obj));
+}
+
 /**
  * Checks or records idempotency with request fingerprinting.
  * Prevents key collision or parameter tampering across financial operations.
@@ -78,20 +113,13 @@ export async function checkOrRecordIdempotency(
   operation: string,
   payloadFingerprintObj: Record<string, any>
 ): Promise<{ replayed: boolean; result?: any }> {
-  const sortedKeys = Object.keys(payloadFingerprintObj).sort();
-  const sortedObj: Record<string, any> = {};
-  for (const k of sortedKeys) {
-    if (payloadFingerprintObj[k] !== undefined) {
-      sortedObj[k] = payloadFingerprintObj[k];
-    }
-  }
-  const fingerprint = JSON.stringify(sortedObj);
+  const incomingFingerprint = canonicalizeFingerprint(payloadFingerprintObj);
 
   await client.query(
     `INSERT INTO financial_idempotency (key, operation, status, request_fingerprint, result, created_at, updated_at)
      VALUES ($1, $2, 'in_progress', $3, '{}'::jsonb, NOW(), NOW())
      ON CONFLICT (key) DO NOTHING`,
-    [key, operation, fingerprint]
+    [key, operation, incomingFingerprint]
   );
 
   const existing = await client.query(
@@ -101,9 +129,17 @@ export async function checkOrRecordIdempotency(
 
   if (existing.rows.length > 0) {
     const row = existing.rows[0];
-    if (row.operation !== operation || (row.request_fingerprint && row.request_fingerprint !== fingerprint)) {
-      throw new Error(`Idempotency key conflict: key "${key}" was already used with different request parameters.`);
+    if (row.operation !== operation) {
+      throw new Error(`Idempotency key conflict: key "${key}" was already used for operation "${row.operation}".`);
     }
+
+    if (row.request_fingerprint !== null && row.request_fingerprint !== undefined) {
+      const storedFingerprint = canonicalizeFingerprint(row.request_fingerprint);
+      if (storedFingerprint && incomingFingerprint && storedFingerprint !== incomingFingerprint) {
+        throw new Error(`Idempotency key conflict: key "${key}" was already used with different request parameters.`);
+      }
+    }
+
     if (row.status === 'completed') {
       const resVal = typeof row.result === 'string' ? JSON.parse(row.result) : row.result;
       return { replayed: true, result: resVal };
@@ -120,14 +156,7 @@ export async function recordIdempotencyResult(
   result: any,
   payloadFingerprintObj: Record<string, any>
 ): Promise<void> {
-  const sortedKeys = Object.keys(payloadFingerprintObj).sort();
-  const sortedObj: Record<string, any> = {};
-  for (const k of sortedKeys) {
-    if (payloadFingerprintObj[k] !== undefined) {
-      sortedObj[k] = payloadFingerprintObj[k];
-    }
-  }
-  const fingerprint = JSON.stringify(sortedObj);
+  const fingerprint = canonicalizeFingerprint(payloadFingerprintObj);
 
   await client.query(
     `UPDATE financial_idempotency
