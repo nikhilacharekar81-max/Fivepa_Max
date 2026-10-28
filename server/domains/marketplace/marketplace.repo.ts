@@ -23,6 +23,18 @@ export class MarketplaceRepo {
         for (const g of gigs) {
           if (!g?.id || seen.has(g.id)) continue;
           seen.add(g.id);
+          let slug = g.slug || g.title?.toLowerCase().trim().replace(/[^\w\s-]/g, '').replace(/[\s_-]+/g, '-').replace(/^-+|-+$/g, '') || 'gig-' + g.id;
+          if (slug.length < 2) slug = 'gig-' + g.id;
+          try {
+            const collisionRes = await client.query(
+              'SELECT id FROM gigs WHERE slug = $1 AND id != $2 LIMIT 1',
+              [slug, g.id]
+            );
+            if (collisionRes.rows.length > 0) {
+              slug = `${slug}-${g.id}`;
+            }
+          } catch {}
+
           await client.query(
             `INSERT INTO gigs (
               id, freelancer_id, freelancer_name, freelancer_username, freelancer_avatar, 
@@ -43,13 +55,13 @@ export class MarketplaceRepo {
               description = EXCLUDED.description,
               price = EXCLUDED.price,
               delivery_days = EXCLUDED.delivery_days,
-              rating = EXCLUDED.rating,
-              reviews_count = EXCLUDED.reviews_count,
+              rating = COALESCE(gigs.rating, EXCLUDED.rating),
+              reviews_count = COALESCE(gigs.reviews_count, EXCLUDED.reviews_count),
               image = EXCLUDED.image,
               cover_image = EXCLUDED.cover_image,
               gallery = EXCLUDED.gallery,
               tags = EXCLUDED.tags,
-              status = EXCLUDED.status,
+              status = CASE WHEN gigs.status = 'deleted' THEN 'deleted' ELSE EXCLUDED.status END,
               featured = (
                 CASE 
                   WHEN (EXCLUDED.featured_until IS NOT NULL AND EXCLUDED.featured_until::timestamptz > NOW()) THEN TRUE
@@ -73,11 +85,14 @@ export class MarketplaceRepo {
                 END
               ),
               extras = EXCLUDED.extras,
-              moderation_status = EXCLUDED.moderation_status,
-              moderation_notes = EXCLUDED.moderation_notes`,
+              moderation_status = CASE 
+                WHEN EXCLUDED.moderation_status IN ('pending', 'rejected') THEN EXCLUDED.moderation_status
+                ELSE COALESCE(gigs.moderation_status, EXCLUDED.moderation_status)
+              END,
+              moderation_notes = COALESCE(EXCLUDED.moderation_notes, gigs.moderation_notes)`,
             [
               g.id, g.freelancerId, g.freelancerName, g.freelancerUsername || null, g.freelancerAvatar || null,
-              g.freelancerLevel || null, g.title, g.slug || null, g.category, g.subcategory || null,
+              g.freelancerLevel || null, g.title, slug, g.category, g.subcategory || null,
               g.description || null, g.price, g.deliveryDays, g.rating ?? 5.0, g.reviewsCount ?? 0,
               g.image || null, g.coverImage || null, g.gallery || [], g.tags || [],
               g.status || 'active', !!g.featured, !!g.featured || !!(g as any).isFeatured, (g as any).featuredUntil || null,

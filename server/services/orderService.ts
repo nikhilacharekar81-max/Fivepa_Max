@@ -179,7 +179,9 @@ export async function resolveGigOrderPrice(gigId: string, extraIds: unknown): Pr
   }
   const basePrice = Number(r.price || 0);
   const extras = Array.isArray(r.extras) ? r.extras : [];
-  const requestedIds = Array.isArray(extraIds) ? extraIds.map(String) : [];
+  const requestedIds = Array.isArray(extraIds) 
+    ? Array.from(new Set(extraIds.map(String).filter(Boolean)))
+    : [];
   let extrasTotal = 0;
   const extrasTitles: string[] = [];
   const selectedExtrasDetails: any[] = [];
@@ -309,7 +311,14 @@ export async function releaseOrderFunds(order: Order, actor: string, reason: str
   return result;
 }
 
-export async function refundOrderFunds(order: Order, amount: number | undefined, actor: string, reason: string, requestKey?: string) {
+export async function refundOrderFunds(
+  order: Order, 
+  amount: number | undefined, 
+  actor: string, 
+  reason: string, 
+  requestKey?: string,
+  cancellationData?: { cancellationRequest?: any; cancellationHistory?: any }
+) {
   const result = await financialTransactionService.refundOrderFunds({
     orderId: order.id,
     amount,
@@ -324,8 +333,19 @@ export async function refundOrderFunds(order: Order, amount: number | undefined,
 
   await syncUserBalances([order.buyerId, order.sellerId].filter(Boolean));
   await postgresStore.getPool().query(
-    'UPDATE orders SET status = $1, cancellation_type = COALESCE($2, cancellation_type) WHERE id = $3 AND status NOT IN (\'completed\', \'cancelled\')',
-    [order.status, order.cancellationType || null, order.id]
+    `UPDATE orders 
+     SET status = $1, 
+         cancellation_type = COALESCE($2, cancellation_type),
+         cancellation_request = COALESCE($3, cancellation_request),
+         cancellation_history = COALESCE($4, cancellation_history)
+     WHERE id = $5 AND status NOT IN ('completed', 'cancelled')`,
+    [
+      order.status,
+      order.cancellationType || null,
+      cancellationData?.cancellationRequest !== undefined ? JSON.stringify(cancellationData.cancellationRequest) : null,
+      cancellationData?.cancellationHistory !== undefined ? JSON.stringify(cancellationData.cancellationHistory) : null,
+      order.id
+    ]
   );
 
   await emitSystemEvent(order.id, 'escrow_refunded', `💸 Escrow refunded ($${result.refunded.toLocaleString()}) to buyer wallet. Reason: ${reason}`, {
@@ -441,17 +461,7 @@ export async function processCancellationTimeouts() {
         }
         try {
           const freshOrder = await store.getOrder(order.id);
-          if (!freshOrder || freshOrder.status === 'completed' || freshOrder.status === 'cancelled' || freshOrder.status === 'disputed' || !freshOrder.cancellationRequest || freshOrder.cancellationRequest.status !== 'pending') {
-            continue;
-          }
-
-          const dispute = await store.getDisputeByOrderId(freshOrder.id);
-          if (dispute && (dispute.status === 'open' || dispute.status === 'under_investigation')) {
-            continue;
-          }
-
-          if (freshOrder.status === 'delivered') {
-            await emitSystemEvent(freshOrder.id, 'cancellation_escalated', '⚠️ Cancellation timeout reached on delivered work. Escalated to dispute resolution desk.', { orderId: freshOrder.id });
+          if (!freshOrder || freshOrder.status === 'completed' || freshOrder.status === 'cancelled' || !freshOrder.cancellationRequest || freshOrder.cancellationRequest.status !== 'pending') {
             continue;
           }
 

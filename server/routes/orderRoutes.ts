@@ -1439,12 +1439,15 @@ router.post('/orders/:id/cancel-request/respond', requireAuth, requireActiveStat
         );
       } else {
         const requestKey = `cancel_accept_${order.id}_${order.cancellationRequest.requestedAt}`;
-        const refundRes = await refundOrderFunds(order, undefined, actorName, `Mutual cancellation accepted: ${order.cancellationRequest.reason}`, requestKey);
-        refundedAmt = refundRes.refunded;
-        await postgresStore.getPool().query(
-          'UPDATE orders SET cancellation_request = $1, cancellation_history = $2 WHERE id = $3',
-          [JSON.stringify(order.cancellationRequest), JSON.stringify(order.cancellationHistory || []), order.id]
+        const refundRes = await refundOrderFunds(
+          order, 
+          undefined, 
+          actorName, 
+          `Mutual cancellation accepted: ${order.cancellationRequest.reason}`, 
+          requestKey,
+          { cancellationRequest: order.cancellationRequest, cancellationHistory: order.cancellationHistory }
         );
+        refundedAmt = refundRes.refunded;
       }
 
       createNotification({

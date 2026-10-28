@@ -787,7 +787,7 @@ CREATE INDEX IF NOT EXISTS idx_gigs_freelancer_id ON gigs(freelancer_id);
 CREATE INDEX IF NOT EXISTS idx_gigs_status_moderation ON gigs(status, moderation_status);
 
 -- Safe Slug Unique Resolution & Constraint
-UPDATE gigs SET slug = slug || '-' || SUBSTRING(id FROM 1 FOR 6)
+UPDATE gigs SET slug = slug || '-' || id
 WHERE id IN (
   SELECT id FROM (
     SELECT id, ROW_NUMBER() OVER (PARTITION BY slug ORDER BY created_at ASC) as rn
@@ -796,9 +796,14 @@ WHERE id IN (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_gigs_unique_slug ON gigs(slug) WHERE slug IS NOT NULL AND slug != '';
 
--- Foreign Key Constraint for Orders to Gigs
+-- Foreign Key Constraints for Orders and Gigs
 DO $$ BEGIN
   ALTER TABLE orders ADD CONSTRAINT fk_orders_gig FOREIGN KEY (gig_id) REFERENCES gigs(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  ALTER TABLE gigs ADD CONSTRAINT fk_gigs_freelancer FOREIGN KEY (freelancer_id) REFERENCES users(id) ON DELETE CASCADE;
 EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
 END $$;
 

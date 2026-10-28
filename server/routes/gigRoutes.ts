@@ -83,6 +83,11 @@ gigRouter.post('/gigs', requireAuth, requireActiveStatus, async (req: Request, r
   const caller = (req as any).authenticatedUser;
   if (caller.status === 'restricted') return res.status(403).json({ error: 'Restricted: You cannot post new services while your account is restricted.' });
 
+  const isBuyerOnly = caller.role === 'buyer' && !caller.isSeller && !caller.canSell && !caller.sellerCapability;
+  if (isBuyerOnly) {
+    return res.status(403).json({ error: 'Seller capability required: Your account does not have permission to publish Gigs. Please enable a seller profile or role.' });
+  }
+
   const activeSettings = siteSettings.getSettings();
 
   const gigPrice = Number(req.body.price);
