@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { createHash, randomUUID } from 'crypto';
 import {
   DEFAULT_SITE_SETTINGS,
+  siteSettings,
   store,
   type ExtensionRequest,
   type Message,
@@ -10,7 +11,7 @@ import {
   type User,
   type WorkstreamOffer
 } from '../store.js';
-import { calculateOrderFees } from '../domains/finance/fees.js';
+import { calculateOrderFees, quoteOrderWithLiveSettings } from '../domains/finance/fees.js';
 import { checkOrRecordIdempotency, recordIdempotencyResult } from '../domains/finance/index.js';
 import { postgresStore } from '../db/postgresStore.js';
 import { financialRepository, financialTransactionService } from '../domains/finance/financial.service.js';
@@ -26,7 +27,8 @@ import {
   safeUser,
   orderParticipantSafeUser,
   isStaffUser,
-  formatApiError
+  formatApiError,
+  escapeHtml
 } from '../middleware/auth.js';
 import {
   tryAcquireOrderLock,
@@ -68,15 +70,6 @@ import {
 } from '../services/workstreamService.js';
 import { workspaceService } from '../../src/server/workspaceService.js';
 import { handleSubmitReview } from './reviewRoutes.js';
-
-function escapeHtml(text: string): string {
-  if (typeof text !== 'string') return '';
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
 
 const router = Router();
 
@@ -146,18 +139,20 @@ router.get('/orders/:id', requireAuth, async (req: Request, res: Response) => {
 
     const authUserId = resolveAuthenticatedUserId(req)!;
     const caller = await store.getUser(authUserId);
-    const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin';
+    const isAdmin = isStaffUser(caller);
     if (!isAdmin && order.buyerId !== authUserId && order.sellerId !== authUserId) {
       return res.status(403).json({ error: 'Forbidden: Access to this order is restricted to participants.' });
     }
 
     const enriched = enrichOrderWithServiceInfo(order, isAdmin);
-    const [buyer, seller, orderMessages, dispute] = await Promise.all([
+    const [buyer, seller, wsMessages, directMessages, dispute] = await Promise.all([
       store.getUser(order.buyerId),
       store.getUser(order.sellerId),
+      order.workspaceId ? store.listMessagesForWorkspace(order.workspaceId) : Promise.resolve([]),
       store.listMessages(order.id),
       store.getDisputeByOrderId(order.id)
     ]);
+    const orderMessages = wsMessages.length > 0 ? wsMessages : directMessages;
 
     res.json({
       ...enriched,
@@ -168,6 +163,90 @@ router.get('/orders/:id', requireAuth, async (req: Request, res: Response) => {
     });
   } catch (err: any) {
     res.status(500).json(formatApiError(err, 'Failed to get order details'));
+  }
+});
+
+// Single Order Immutable Invoice / Receipt
+router.get('/orders/:id/invoice', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const order = await store.getOrder(req.params.id);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    const authUserId = resolveAuthenticatedUserId(req)!;
+    const caller = await store.getUser(authUserId);
+    const isAdmin = isStaffUser(caller);
+    if (!isAdmin && order.buyerId !== authUserId && order.sellerId !== authUserId) {
+      return res.status(403).json({ error: 'Forbidden: Access to this invoice is restricted to order participants.' });
+    }
+
+    const [buyer, seller] = await Promise.all([
+      store.getUser(order.buyerId),
+      store.getUser(order.sellerId)
+    ]);
+
+    const createdClean = (order.createdAt || '').slice(0, 10).replace(/-/g, '') || new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const shortOrdId = (order.id || '').replace(/^ord_/, '').toUpperCase().slice(0, 8);
+    const invoiceNumber = `INV-${createdClean}-${shortOrdId}`;
+
+    const rawAmount = Number(order.amount || 0);
+    const serviceFee = Number((order as any).serviceFee ?? order.feeBreakdown?.buyerFee ?? order.feeBreakdown?.serviceFee ?? 0);
+    const smallOrderFee = Number((order as any).smallOrderFee ?? order.feeBreakdown?.smallOrderFee ?? 0);
+    const platformCommission = Number(order.feeBreakdown?.platformCommission ?? 0);
+    const buyerTotal = Math.round((rawAmount + serviceFee + smallOrderFee) * 100) / 100;
+    const sellerNet = Math.max(0, Math.round((rawAmount - platformCommission) * 100) / 100);
+
+    const invoice = {
+      id: `inv_${order.id}`,
+      invoiceNumber,
+      orderId: order.id,
+      workspaceId: order.workspaceId || `ws-${order.id}`,
+      title: order.title,
+      status: order.status === 'completed' ? 'paid' : order.status === 'cancelled' ? 'refunded' : 'in_escrow',
+      issueDate: (order.createdAt || new Date().toISOString()).slice(0, 10),
+      dueDate: (order.dueDate || order.createdAt || new Date().toISOString()).slice(0, 10),
+      completedAt: order.completedAt || null,
+      buyer: {
+        id: order.buyerId,
+        name: buyer?.name || (order as any).buyerUsername || 'Buyer',
+        email: buyer?.email || 'buyer@fivepa.com',
+        country: (buyer as any)?.country || 'Global'
+      },
+      seller: {
+        id: order.sellerId,
+        name: seller?.name || (order as any).sellerUsername || 'Seller',
+        email: seller?.email || 'seller@fivepa.com',
+        country: (seller as any)?.country || 'Global'
+      },
+      items: [
+        {
+          description: order.title,
+          quantity: 1,
+          unitPrice: rawAmount,
+          amount: rawAmount
+        },
+        ...(Array.isArray((order as any).selectedExtras) && (order as any).selectedExtras.length > 0
+          ? (order as any).selectedExtras.map((ex: any) => ({
+              description: `Extra: ${ex.title || 'Add-on service'}`,
+              quantity: 1,
+              unitPrice: Number(ex.price || 0),
+              amount: Number(ex.price || 0)
+            }))
+          : [])
+      ],
+      subtotal: rawAmount,
+      serviceFee,
+      smallOrderFee,
+      tax: 0,
+      buyerTotal,
+      platformCommission,
+      sellerNet,
+      currency: 'USD',
+      notes: 'FivePA 100% Protected Escrow Transaction. Funds held safely in escrow until client approval.'
+    };
+
+    res.json(invoice);
+  } catch (err: any) {
+    res.status(500).json(formatApiError(err, 'Failed to generate order invoice'));
   }
 });
 
@@ -211,7 +290,31 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
     }
 
     let rawAmount = Number(req.body?.amount);
-    const isInquiry = rawAmount === 0 && /^inquiry:/i.test(title);
+    const isInquiry = (Boolean(req.body?.isInquiry) && (!Number.isFinite(rawAmount) || rawAmount === 0)) || (rawAmount === 0 && /^inquiry:/i.test(title));
+    if (isInquiry) rawAmount = 0;
+
+    if (isInquiry && !req.body?.workspaceId && !req.body?.forceNew) {
+      const existingInqRes = await postgresStore.getPool().query(
+        `SELECT o.* FROM orders o
+         LEFT JOIN escrows e ON e.order_id = o.id
+         WHERE o.buyer_id = $1
+           AND o.seller_id = $2
+           AND COALESCE(o.gig_id, '') = $3
+           AND COALESCE(o.project_id, '') = $4
+           AND COALESCE(o.amount, 0) = 0
+           AND o.status IN ('in_progress', 'payment_pending')
+           AND (e.order_id IS NULL OR COALESCE(e.remaining, 0) = 0)
+         ORDER BY o.updated_at DESC NULLS LAST, o.created_at DESC, o.id DESC
+         LIMIT 1`,
+        [buyerId, sellerId, String(req.body?.gigId || ''), String(req.body?.projectId || '')]
+      );
+      if (existingInqRes.rows.length > 0) {
+        const existingOrd = await store.getOrderById(existingInqRes.rows[0].id);
+        if (existingOrd) {
+          return res.status(200).json(enrichOrderWithServiceInfo(existingOrd));
+        }
+      }
+    }
 
     const rawIdempKey = String(
       req.headers['idempotency-key'] ||
@@ -347,8 +450,19 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
           `INSERT INTO workspaces (workspace_id, buyer_id, seller_id, order_ids, title, created_at, updated_at, metadata)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
            ON CONFLICT (workspace_id) DO UPDATE SET
-             order_ids = (SELECT COALESCE(jsonb_agg(DISTINCT elem), '[]'::jsonb) FROM (SELECT jsonb_array_elements_text(COALESCE(workspaces.order_ids, '[]'::jsonb)) AS elem UNION SELECT jsonb_array_elements_text(EXCLUDED.order_ids) AS elem) s)`,
-          [workspaceId, buyerId, sellerId, JSON.stringify([id]), title, today, new Date().toISOString(), JSON.stringify({ originType: 'gig', originId: req.body?.gigId || id, status: 'active', activeOrderId: id })]
+             order_ids = (
+               SELECT COALESCE(jsonb_agg(elem ORDER BY min_ord), '[]'::jsonb)
+               FROM (
+                 SELECT elem, MIN(ord) AS min_ord
+                 FROM (
+                   SELECT elem, ord FROM jsonb_array_elements_text(COALESCE(workspaces.order_ids, '[]'::jsonb)) WITH ORDINALITY AS t1(elem, ord)
+                   UNION ALL
+                   SELECT elem, ord + 1000000 FROM jsonb_array_elements_text(EXCLUDED.order_ids) WITH ORDINALITY AS t2(elem, ord)
+                 ) combined
+                 GROUP BY elem
+               ) deduped
+             )`,
+          [workspaceId, buyerId, sellerId, JSON.stringify([id]), title, today, new Date().toISOString(), JSON.stringify({ originType: 'gig', originId: req.body?.gigId || id, status: 'active', activeOrderId: id, isInquiry })]
         );
       } else if (req.body?.workspaceId) {
         const wsRes = await client.query('SELECT * FROM workspaces WHERE workspace_id = $1 FOR UPDATE', [req.body.workspaceId]);
@@ -358,14 +472,47 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
           throw new Error('The provided workspace does not match the buyer and seller of this order.');
         }
         workspaceId = ws.workspace_id;
+        const currentMeta = typeof ws.metadata === 'string' ? JSON.parse(ws.metadata) : (ws.metadata || {});
+        const updatedMeta = { ...currentMeta, activeOrderId: id, status: 'active' };
+        await client.query(
+          `UPDATE workspaces SET
+             order_ids = (
+               SELECT COALESCE(jsonb_agg(elem ORDER BY min_ord), '[]'::jsonb)
+               FROM (
+                 SELECT elem, MIN(ord) AS min_ord
+                 FROM (
+                   SELECT elem, ord FROM jsonb_array_elements_text(COALESCE(workspaces.order_ids, '[]'::jsonb)) WITH ORDINALITY AS t1(elem, ord)
+                   UNION ALL
+                   SELECT elem, ord + 1000000 FROM jsonb_array_elements_text($1::jsonb) WITH ORDINALITY AS t2(elem, ord)
+                 ) combined
+                 GROUP BY elem
+               ) deduped
+             ),
+             updated_at = $2,
+             last_activity_at = $2,
+             metadata = $3
+           WHERE workspace_id = $4`,
+          [JSON.stringify([id]), new Date().toISOString(), JSON.stringify(updatedMeta), workspaceId]
+        );
       } else {
         workspaceId = 'ws_' + randomUUID().slice(0, 12);
         await client.query(
           `INSERT INTO workspaces (workspace_id, buyer_id, seller_id, order_ids, title, created_at, updated_at, metadata)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
            ON CONFLICT (workspace_id) DO UPDATE SET
-             order_ids = (SELECT COALESCE(jsonb_agg(DISTINCT elem), '[]'::jsonb) FROM (SELECT jsonb_array_elements_text(COALESCE(workspaces.order_ids, '[]'::jsonb)) AS elem UNION SELECT jsonb_array_elements_text(EXCLUDED.order_ids) AS elem) s)`,
-          [workspaceId, buyerId, sellerId, JSON.stringify([id]), title, today, new Date().toISOString(), JSON.stringify({ originType: isProject ? 'project' : 'gig', originId: req.body?.projectId || id, status: 'active', activeOrderId: id })]
+             order_ids = (
+               SELECT COALESCE(jsonb_agg(elem ORDER BY min_ord), '[]'::jsonb)
+               FROM (
+                 SELECT elem, MIN(ord) AS min_ord
+                 FROM (
+                   SELECT elem, ord FROM jsonb_array_elements_text(COALESCE(workspaces.order_ids, '[]'::jsonb)) WITH ORDINALITY AS t1(elem, ord)
+                   UNION ALL
+                   SELECT elem, ord + 1000000 FROM jsonb_array_elements_text(EXCLUDED.order_ids) WITH ORDINALITY AS t2(elem, ord)
+                 ) combined
+                 GROUP BY elem
+               ) deduped
+             )`,
+          [workspaceId, buyerId, sellerId, JSON.stringify([id]), title, today, new Date().toISOString(), JSON.stringify({ originType: isProject ? 'project' : 'gig', originId: req.body?.projectId || id, status: 'active', activeOrderId: id, isInquiry })]
         );
       }
 
@@ -404,10 +551,10 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
           createdAt: today,
           dueDate: serverDerivedDueDate,
           escrowProtectionStartDate: today,
-          escrowProtectionEndDate: new Date(Date.now() + DEFAULT_SITE_SETTINGS.commission.escrowProtectionDays * 86400000).toISOString().split('T')[0],
+          escrowProtectionEndDate: new Date(Date.now() + (siteSettings.getSettings().commission.escrowProtectionDays || DEFAULT_SITE_SETTINGS.commission.escrowProtectionDays) * 86400000).toISOString().split('T')[0],
           gigId: req.body.gigId,
           projectId: req.body.projectId,
-          feeBreakdown: calculateOrderFees(rawAmount),
+          feeBreakdown: await quoteOrderWithLiveSettings(rawAmount).catch(() => calculateOrderFees(rawAmount)),
           ...(requirements ? { requirements } : {}),
           selectedExtras: selectedExtrasDetails
         };
@@ -418,7 +565,7 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
 
       await client.query(
         `INSERT INTO orders (
-          id, title, buyer_id, seller_id, amount, status, created_at, due_date, completed_at, 
+          id, title, buyer_id, seller_id, client_id, freelancer_id, amount, status, created_at, due_date, completed_at, 
           requirements, deliverables, deliverable_files, revisions, admin_notes, is_muted, 
           escrow_protection_start_date, escrow_protection_end_date, gig_id, project_id, 
           service_url, gig_slug, seller_username, buyer_username, service_title, service_thumbnail, 
@@ -428,19 +575,22 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
           order_type, gig_order_id, project_order_id, proposal_id,
           extension_requests, free_extension_used, cancellation_request, cancellation_history,
           cancellation_type, review_window_restarted_at, response_deadline,
-          service_fee, small_order_fee, selected_extras
+          service_fee, small_order_fee, selected_extras, updated_at
         ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
+          $1, $2, $3, $4, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
           $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37,
           $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48,
-          $49, $50, $51
+          $49, $50, $51, NOW()
         ) ON CONFLICT (id) DO UPDATE SET
           title = EXCLUDED.title,
+          client_id = COALESCE(EXCLUDED.client_id, orders.client_id, EXCLUDED.buyer_id),
+          freelancer_id = COALESCE(EXCLUDED.freelancer_id, orders.freelancer_id, EXCLUDED.seller_id),
           amount = EXCLUDED.amount,
           service_fee = EXCLUDED.service_fee,
           small_order_fee = EXCLUDED.small_order_fee,
           selected_extras = EXCLUDED.selected_extras,
-          status = CASE WHEN orders.status IN ('completed', 'cancelled', 'refunded') THEN orders.status ELSE EXCLUDED.status END`,
+          status = CASE WHEN orders.status IN ('completed', 'cancelled', 'refunded') THEN orders.status ELSE EXCLUDED.status END,
+          updated_at = NOW()`,
         [
           newOrd.id, newOrd.title, newOrd.buyerId, newOrd.sellerId, newOrd.amount, newOrd.status,
           newOrd.createdAt, newOrd.dueDate, newOrd.completedAt || null, newOrd.requirements || null,
@@ -478,6 +628,7 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
 
           enriched.status = 'funded_in_escrow';
           await client.query('UPDATE orders SET status = $1 WHERE id = $2', ['funded_in_escrow', id]);
+          await syncUserBalances([buyerId, sellerId].filter(Boolean), client);
           await recordOutboxEvent(client, 'ORDER_ESCROW_FUNDED', 'order', id, {
             title,
             amount: rawAmount,
@@ -613,8 +764,8 @@ const handleOrderExtendTime = async (req: Request, res: Response) => {
 
     await recordMessage(sysMsg);
 
-    registerAuditLog({
-      id: 'log_' + randomUUID(),
+    await registerAuditLog({
+      id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
       actor: adminActor(req),
       role: (req as any).authenticatedUser?.role || 'admin',
       action: 'ORDER_DEADLINE_EXTENDED',
@@ -876,7 +1027,7 @@ router.post('/orders/:id/deliverable', requireAuth, requireActiveStatus, async (
       }
 
       const orderRow = orderRes.rows[0];
-      const order = (store as any).mapOrderRow ? (store as any).mapOrderRow(orderRow) : await store.getOrder(orderId);
+      const order = (store as any).mapOrderRow ? (store as any).mapOrderRow(orderRow) : await store.getOrder(orderId, client);
       if (!order) {
         const err: any = new Error('Order not found');
         err.status = 404;
@@ -918,7 +1069,7 @@ router.post('/orders/:id/deliverable', requireAuth, requireActiveStatus, async (
 
       const isDraft = Boolean(req.body.isDraft);
       const uploadedFiles = validatedFiles.map((f: any, idx: number) => ({
-        id: 'deliv_' + Date.now() + '_' + idx,
+        id: 'deliv_' + Date.now() + '_' + idx + '_' + randomUUID().slice(0, 6),
         name: f.name,
         size: f.size,
         url: f.url,
@@ -1048,7 +1199,9 @@ router.post('/orders/:id/deliverable', requireAuth, requireActiveStatus, async (
           ...prevMeta,
           note: trimmedNotes || prevMeta.note,
           files: uploadedFiles.length > 0 ? uploadedFiles : prevMeta.files,
-          reference: trimmedReference || prevMeta.reference
+          reference: trimmedReference || prevMeta.reference,
+          originOrderId: prevMeta.originOrderId || order.id,
+          ...(order.workspaceId ? { workspaceId: order.workspaceId } : {})
         };
         await postgresStore.getPool().query(
           `UPDATE workstream_offers 
@@ -1060,6 +1213,8 @@ router.post('/orders/:id/deliverable', requireAuth, requireActiveStatus, async (
           id: row.id,
           number: row.number,
           orderId: row.order_id,
+          originOrderId: updatedMeta.originOrderId,
+          workspaceId: order.workspaceId,
           kind: row.kind,
           title: invTitle,
           amount: invAmt,
@@ -1076,7 +1231,9 @@ router.post('/orders/:id/deliverable', requireAuth, requireActiveStatus, async (
         const meta = {
           note: trimmedNotes || undefined,
           files: uploadedFiles.length > 0 ? uploadedFiles : undefined,
-          reference: trimmedReference || undefined
+          reference: trimmedReference || undefined,
+          originOrderId: order.id,
+          ...(order.workspaceId ? { workspaceId: order.workspaceId } : {})
         };
         await postgresStore.getPool().query(
           `INSERT INTO workstream_offers (id, order_id, kind, number, title, amount, status, created_by, created_at, metadata)
@@ -1087,6 +1244,8 @@ router.post('/orders/:id/deliverable', requireAuth, requireActiveStatus, async (
           id: newInvId,
           number: invNum,
           orderId: order.id,
+          originOrderId: order.id,
+          workspaceId: order.workspaceId,
           kind: 'invoice',
           title: invTitle,
           amount: invAmt,
@@ -1204,7 +1363,7 @@ const handleOpenDispute = async (req: Request, res: Response) => {
     const reason = escapeHtml(rawReason);
 
     const existingDispute = await store.getDisputeByOrderId(order.id);
-    if (existingDispute && (existingDispute.status === 'open' || existingDispute.status === 'under_investigation')) {
+    if (existingDispute && (existingDispute.status === 'open' || existingDispute.status === 'under_investigation' || (existingDispute.status as string) === 'under_review')) {
       return res.status(400).json({ error: 'An active dispute already exists for this order.' });
     }
 
@@ -1263,7 +1422,7 @@ const handleOpenDispute = async (req: Request, res: Response) => {
 
       // Re-verify existing active dispute under FOR UPDATE lock
       const dispCheck = await client.query(
-        "SELECT id FROM disputes WHERE order_id = $1 AND status IN ('open', 'under_investigation') FOR UPDATE",
+        "SELECT id FROM disputes WHERE order_id = $1 AND status IN ('open', 'under_investigation', 'under_review') FOR UPDATE",
         [order.id]
       );
       if (dispCheck.rows.length > 0) {
@@ -1386,8 +1545,8 @@ const handleOrderPauseTimer = async (req: Request, res: Response) => {
 
   await recordMessage(sysMsg);
 
-  registerAuditLog({
-    id: 'log_' + Date.now(),
+  await registerAuditLog({
+    id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
     actor: adminActor(req),
     role: (req as any).authenticatedUser?.role || 'admin',
     action: order.isTimerPaused ? 'ORDER_TIMER_PAUSED' : 'ORDER_TIMER_RESUMED',
@@ -1407,22 +1566,37 @@ const handleOrderForceComplete = async (req: Request, res: Response) => {
   if (!tryAcquireOrderLock(orderId, res)) return;
 
   try {
-    const order = await store.getOrder(orderId);
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (order.status === 'completed') {
-      return res.status(400).json({ error: 'Order is already completed; funds were already released.' });
-    }
-    if (order.status === 'cancelled') {
-      return res.status(400).json({ error: 'Cannot force-complete a cancelled/refunded order.' });
-    }
-
     const reason = String(req.body.reason || 'Admin administrative force-release in seller favor.');
-    const result = await releaseOrderFunds(order, adminActor(req), reason, false, req.body.requestKey, true);
-    await closeActiveDispute(order.id, 'resolved_release', reason);
+    const actor = adminActor(req);
 
-    res.json({ success: true, order: enrichOrderWithServiceInfo(order), result });
+    const txResult = await postgresStore.executeInTransaction(async (client) => {
+      const orderLockRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+      if (orderLockRes.rows.length === 0) {
+        const err: any = new Error('Order not found');
+        err.statusCode = 404;
+        throw err;
+      }
+      const order = (store as any).mapOrderRow ? (store as any).mapOrderRow(orderLockRes.rows[0]) : await store.getOrder(orderId, client);
+      if (!order) {
+        const err: any = new Error('Order not found');
+        err.statusCode = 404;
+        throw err;
+      }
+      if (order.status === 'completed') {
+        throw new Error('Order is already completed; funds were already released.');
+      }
+      if (order.status === 'cancelled') {
+        throw new Error('Cannot force-complete a cancelled/refunded order.');
+      }
+
+      const result = await releaseOrderFunds(order, actor, reason, false, req.body.requestKey, true, client);
+      await closeActiveDispute(order.id, 'resolved_release', reason, client);
+      return { order, result };
+    });
+
+    res.json({ success: true, order: enrichOrderWithServiceInfo(txResult.order), result: txResult.result });
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    res.status(err?.statusCode || 400).json({ error: err.message });
   } finally {
     releaseOrderLock(orderId);
   }
@@ -1436,34 +1610,46 @@ const handleOrderForceCancel = async (req: Request, res: Response) => {
   if (!tryAcquireOrderLock(orderId, res)) return;
 
   try {
-    const order = await store.getOrder(orderId);
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (order.status === 'completed') {
-      return res.status(400).json({ error: 'Cannot force-cancel an already completed order.' });
-    }
-    if (order.status === 'cancelled') {
-      return res.status(400).json({ error: 'Order is already cancelled/refunded.' });
-    }
-
     const reason = String(req.body.reason || 'Admin cancelled order and refunded buyer wallet');
     const isPartial = req.body.refundType === 'partial';
-    let result: any;
-    let refundAmount: number;
+    const actor = adminActor(req);
 
-    if (isPartial) {
-      refundAmount = Number(req.body.customAmount);
-      result = await splitOrderFunds(order, refundAmount, adminActor(req), reason);
-      await closeActiveDispute(order.id, 'resolved_partial', reason);
-      await pushSystemMessage(order.id, `⚖️ Order resolved by Administration. $${refundAmount} refunded to buyer; the remainder was released to the freelancer. Reason: ${reason}`, 'dispute_resolved');
-    } else {
-      result = await refundOrderFunds(order, undefined, adminActor(req), reason, req.body.requestKey, undefined, true);
-      refundAmount = result.refunded;
-      await closeActiveDispute(order.id, 'resolved_refund', reason);
-    }
+    const txResult = await postgresStore.executeInTransaction(async (client) => {
+      const orderLockRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+      if (orderLockRes.rows.length === 0) {
+        const err: any = new Error('Order not found');
+        err.statusCode = 404;
+        throw err;
+      }
+      const order = (store as any).mapOrderRow ? (store as any).mapOrderRow(orderLockRes.rows[0]) : await store.getOrder(orderId, client);
+      if (!order) {
+        const err: any = new Error('Order not found');
+        err.statusCode = 404;
+        throw err;
+      }
+      if (order.status === 'completed') {
+        throw new Error('Cannot force-cancel an already completed order.');
+      }
+      if (order.status === 'cancelled') {
+        throw new Error('Order is already cancelled/refunded.');
+      }
 
-    res.json({ success: true, order: enrichOrderWithServiceInfo(order), result });
+      let result: any;
+      if (isPartial) {
+        const refundAmount = Number(req.body.customAmount);
+        result = await splitOrderFunds(order, refundAmount, actor, reason, req.body.requestKey, client);
+        await closeActiveDispute(order.id, 'resolved_partial', reason, client);
+        await pushSystemMessage(order.id, `⚖️ Order resolved by Administration. $${refundAmount} refunded to buyer; the remainder was released to the freelancer. Reason: ${reason}`, 'dispute_resolved', client);
+      } else {
+        result = await refundOrderFunds(order, undefined, actor, reason, req.body.requestKey, undefined, true, client);
+        await closeActiveDispute(order.id, 'resolved_refund', reason, client);
+      }
+      return { order, result };
+    });
+
+    res.json({ success: true, order: enrichOrderWithServiceInfo(txResult.order), result: txResult.result });
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    res.status(err?.statusCode || 400).json({ error: err.message });
   } finally {
     releaseOrderLock(orderId);
   }
@@ -1536,7 +1722,7 @@ router.post('/orders/:id/cancel-request', requireAuth, requireActiveStatus, rate
       title: 'Cancellation Requested',
       message: `${requestedBy === 'buyer' ? 'Buyer' : 'Seller'} requested cancellation of order #${order.id}. Reason: ${reason}. You have 48 hours to respond.`,
       type: 'order',
-      link: `/messages/${order.id}`
+      link: `/workstream/${order.id}`
     });
 
     const requestsLast24h = (order.cancellationHistory || []).filter(h => Date.now() - new Date(h.requestedAt).getTime() < 24 * 3600 * 1000).length;
@@ -1545,12 +1731,12 @@ router.post('/orders/:id/cancel-request', requireAuth, requireActiveStatus, rate
         recipientId,
         'Action needed: cancellation requested on your order',
         `${requestedBy === 'buyer' ? 'The buyer' : 'The seller'} asked to cancel order #${order.id}.\n\nReason: ${String(reason).trim().slice(0, 300)}\n\nYou have 48 hours to accept or decline. If you do not respond, the order is cancelled automatically and the payment is refunded.`,
-        `/messages/${order.id}`
+        `/workstream/${order.id}`
       );
     }
 
-    registerAuditLog({
-      id: 'log_' + Date.now(),
+    await registerAuditLog({
+      id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
       actor: caller?.name || requestedBy,
       role: caller?.role || requestedBy,
       action: 'GIG_CANCELLATION_REQUESTED',
@@ -1592,7 +1778,7 @@ router.post('/orders/:id/cancel-request/respond', requireAuth, requireActiveStat
         throw err;
       }
       const orderRow = orderRes.rows[0];
-      const order = (store as any).mapOrderRow ? (store as any).mapOrderRow(orderRow) : await store.getOrder(orderId);
+      const order = (store as any).mapOrderRow ? (store as any).mapOrderRow(orderRow) : await store.getOrder(orderId, client);
       if (!order) {
         const err: any = new Error('Order not found');
         err.statusCode = 404;
@@ -1735,11 +1921,11 @@ router.post('/orders/:id/cancel-request/respond', requireAuth, requireActiveStat
         title: 'Cancellation Accepted',
         message: `Your cancellation request for order #${order.id} was accepted.${refundedAmt > 0 ? ` Full refund issued ($${refundedAmt}).` : ' Order closed.'}`,
         type: 'order',
-        link: `/messages/${order.id}`
+        link: `/workstream/${order.id}`
       });
 
-      registerAuditLog({
-        id: 'log_' + Date.now(),
+      await registerAuditLog({
+        id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
         actor: txResult.caller?.name || (txResult.isBuyer ? 'Buyer' : 'Seller'),
         role: txResult.caller?.role || 'user',
         action: 'GIG_CANCELLATION_ACCEPTED',
@@ -1756,11 +1942,11 @@ router.post('/orders/:id/cancel-request/respond', requireAuth, requireActiveStat
         title: 'Cancellation Rejected',
         message: `Your cancellation request for order #${order.id} was rejected. Reason: ${reason}. Order continues normally.`,
         type: 'order',
-        link: `/messages/${order.id}`
+        link: `/workstream/${order.id}`
       });
 
-      registerAuditLog({
-        id: 'log_' + randomUUID(),
+      await registerAuditLog({
+        id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
         actor: txResult.caller?.name || (txResult.isBuyer ? 'Buyer' : 'Seller'),
         role: txResult.caller?.role || 'user',
         action: 'GIG_CANCELLATION_REJECTED',
@@ -1797,7 +1983,7 @@ const handleOrderCancel = async (req: Request, res: Response) => {
       }
 
       const orderRow = orderRes.rows[0];
-      const order = (store as any).mapOrderRow ? (store as any).mapOrderRow(orderRow) : await store.getOrder(orderId);
+      const order = (store as any).mapOrderRow ? (store as any).mapOrderRow(orderRow) : await store.getOrder(orderId, client);
       if (!order) {
         const err: any = new Error('Order not found');
         err.statusCode = 404;
@@ -1821,7 +2007,7 @@ const handleOrderCancel = async (req: Request, res: Response) => {
       }
 
       const dispRes = await client.query(
-        "SELECT 1 FROM disputes WHERE order_id = $1 AND status IN ('open', 'under_review') LIMIT 1",
+        "SELECT 1 FROM disputes WHERE order_id = $1 AND status IN ('open', 'under_investigation', 'under_review') LIMIT 1",
         [order.id]
       );
       if (!isStaff && dispRes.rows.length > 0) {
@@ -1830,7 +2016,7 @@ const handleOrderCancel = async (req: Request, res: Response) => {
         throw err;
       }
 
-      const hasFundedEscrow = await orderHasEscrow(order.id);
+      const hasFundedEscrow = await orderHasEscrow(order.id, client);
       const isGigOrder = order.orderType === 'gig' || Boolean(order.gigOrderId) || Boolean(order.gigId);
 
       if (!isStaff && order.status !== 'payment_pending') {
@@ -1866,12 +2052,19 @@ const handleOrderCancel = async (req: Request, res: Response) => {
       }
 
       const actor = caller?.name || `user:${authUserId}`;
+      const effectiveCancelType = order.cancellationType || 'direct';
+      order.cancellationType = effectiveCancelType;
       if (hasFundedEscrow) {
         await refundOrderFunds(order, undefined, actor, reason, undefined, undefined, false, client);
+        await client.query(
+          `UPDATE orders SET cancellation_type = COALESCE(cancellation_type, $1), updated_at = NOW() WHERE id = $2`,
+          [effectiveCancelType, order.id]
+        );
+        order.status = 'cancelled';
       } else {
         const updateRes = await client.query(
-          `UPDATE orders SET status = 'cancelled', cancellation_type = $1 WHERE id = $2 AND status NOT IN ('completed', 'cancelled')`,
-          [order.cancellationType || null, order.id]
+          `UPDATE orders SET status = 'cancelled', cancellation_type = $1, updated_at = NOW() WHERE id = $2 AND status NOT IN ('completed', 'cancelled')`,
+          [effectiveCancelType, order.id]
         );
         if (updateRes.rowCount === 0) {
           const err: any = new Error('Order status changed concurrently; cannot cancel order.');
@@ -1880,12 +2073,15 @@ const handleOrderCancel = async (req: Request, res: Response) => {
         }
         order.status = 'cancelled';
       }
+      (order as any).cancellationReason = reason;
+      (order as any).cancelledBy = caller?.id || 'system';
+      (order as any).cancelledAt = new Date().toISOString();
+      await cancelPendingOffersForOrder(order.id, caller?.id, client);
 
       return { order };
     });
 
     const { order } = txResult;
-    await cancelPendingOffersForOrder(order.id, caller?.id);
     await emitSystemEvent(order.id, 'order_cancelled', `Order was cancelled. Reason: ${reason}`);
     res.json({ success: true, order: enrichOrderWithServiceInfo(order) });
   } catch (err: any) {
@@ -1902,6 +2098,11 @@ router.post('/orders/:id/review', requireAuth, handleSubmitReview);
 router.put('/orders/:id', requireAuth, rateLimit(20, 60_000), async (req: Request, res: Response) => {
   if (req.body?.status === 'cancelled') {
     return handleOrderCancel(req, res);
+  }
+  if (req.body?.status === 'completed' || req.body?.status === 'refunded') {
+    return res.status(400).json({
+      error: `Cannot set order status to "${req.body.status}" directly without settling escrow. Use the escrow release or refund endpoint instead.`
+    });
   }
   const orderId = req.params.id;
   const order = await store.getOrder(orderId);

@@ -63,6 +63,7 @@ export function useWorkstream(props?: any) {
 
   const files = useWorkstreamFiles({
     selectedOrder: currentSelectedOrder,
+    orders: list.hydratedWorkstreamItems,
     messages: activeMessages
   });
 

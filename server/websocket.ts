@@ -54,7 +54,7 @@ function checkWsIpRateLimit(ip: string, max = 50, windowMs = 60000): boolean {
 }
 
 // Periodic cleanup for expired IP rate-limit entries
-setInterval(() => {
+const wsCleanupInterval = setInterval(() => {
   const now = Date.now();
   for (const [ip, rec] of wsConnectionBuckets.entries()) {
     if (now > rec.resetAt) {
@@ -62,6 +62,9 @@ setInterval(() => {
     }
   }
 }, 300000);
+if (wsCleanupInterval && typeof wsCleanupInterval.unref === 'function') {
+  wsCleanupInterval.unref();
+}
 
 export function initWebSocketServer(server: Server): WebSocketServer {
   wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
@@ -147,6 +150,9 @@ export function initWebSocketServer(server: Server): WebSocketServer {
             try { ws.close(1008, 'Authentication timeout'); } catch {}
           }
         }, timeoutMs);
+        if (authTimeout && typeof authTimeout.unref === 'function') {
+          authTimeout.unref();
+        }
       }
 
       setupWebSocketHandlers(ws, authTimeout);
@@ -181,7 +187,7 @@ export async function broadcastMessage(message: Message, orderId: string) {
       const clientUserId = (client as any).authenticatedUserId;
       if (!clientUserId) continue;
       const clientRole = (client as any).role;
-      const isParticipant = clientUserId === senderId || clientUserId === buyerId || clientUserId === sellerId;
+      const isParticipant = clientUserId === senderId || clientUserId === buyerId || clientUserId === sellerId || clientUserId === (order as any).clientId || clientUserId === (order as any).freelancerId;
       const isSubscribedStaff =
         isStaffUser({ role: clientRole }) &&
         (orderId.startsWith('support_admin_') ||
@@ -467,6 +473,7 @@ function setupWebSocketHandlers(ws: WebSocket, authTimeout?: NodeJS.Timeout) {
   });
 
   ws.on('close', () => {
+    if (authTimeout) clearTimeout(authTimeout);
     clients.delete(ws);
   });
 }

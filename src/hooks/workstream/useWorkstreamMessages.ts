@@ -58,12 +58,21 @@ export function useWorkstreamMessages(options: UseWorkstreamMessagesOptions = {}
       const data = await res.json();
       const newOrderMessages: Message[] = Array.isArray(data) ? data : [];
 
-      // Isolated cache merge: preserve all messages for other workstreams, update this order's messages
+      // Merge Workspace-wide messages while preserving messages from other Workspaces and each message's original orderId
       setMessages(prev => {
-        const otherMessages = prev.filter(m => m.orderId !== orderId);
         const byId = new Map<string, Message>();
-        for (const m of [...otherMessages, ...newOrderMessages]) {
+        for (const m of prev) {
           const key = m?.metadata?.clientMessageId || m?.id;
+          if (key) {
+            byId.set(key, m);
+          }
+        }
+        for (const m of newOrderMessages) {
+          const clientKey = m?.metadata?.clientMessageId;
+          if (clientKey && byId.has(clientKey)) {
+            byId.delete(clientKey);
+          }
+          const key = m?.id || clientKey;
           if (key) {
             byId.set(key, m);
           }
@@ -74,10 +83,11 @@ export function useWorkstreamMessages(options: UseWorkstreamMessagesOptions = {}
           const tB = b.timestamp ? new Date(b.timestamp).getTime() : NaN;
           const validA = !isNaN(tA);
           const validB = !isNaN(tB);
-          if (!validA && !validB) return 0;
+          if (!validA && !validB) return String(a.id || '').localeCompare(String(b.id || ''));
           if (!validA) return 1;
           if (!validB) return -1;
-          return tA - tB;
+          if (tA !== tB) return tA - tB;
+          return String(a.id || '').localeCompare(String(b.id || ''));
         });
       });
     } catch (err) {

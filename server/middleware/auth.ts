@@ -8,17 +8,86 @@ import { disconnectUserSessionSocket } from '../websocket.js';
 
 export const IS_PRODUCTION = INIT_IS_PRODUCTION || resolveIsProduction(import.meta.url);
 
-const EPHEMERAL_DEV_JWT_SECRET = createHmac('sha256', 'wph-dev-only-ephemeral-secret')
-  .update(process.cwd())
-  .digest('hex');
+const WEAK_JWT_SECRET_PLACEHOLDERS = new Set([
+  'changeme',
+  'secret',
+  'default',
+  'jwt_secret',
+  'your-jwt-secret',
+  'your_jwt_secret',
+  'dev_mode_fixed_jwt_secret',
+  'wph-dev-only-ephemeral-secret',
+  'replace-with-strong-secret',
+  'password',
+  '12345678',
+  '1234567890123456',
+  'admin',
+  'administrator',
+  'supersecret',
+  'mysecretkey123456',
+  'testsecretkey1234',
+  'secretkey1234567890',
+  'production_jwt_secret',
+  'gateway_encryption_key'
+]);
 
-function resolveJwtSecret(): string {
-  const fromEnv = process.env.JWT_SECRET;
-  const isProdNow = IS_PRODUCTION || resolveIsProduction(import.meta.url);
-  if (isProdNow && (!fromEnv || fromEnv.length < 32)) {
-    throw new Error('FATAL: JWT_SECRET must be configured in production and be at least 32 chars.');
+const EPHEMERAL_DEV_JWT_SECRET = randomBytes(32).toString('hex');
+
+function hasLowEntropySecret(secret: string): boolean {
+  const trimmed = secret.trim();
+  const uniqueChars = new Set(trimmed).size;
+  if (uniqueChars < 8) return true;
+
+  for (let patternLen = 1; patternLen <= 8; patternLen++) {
+    const pattern = trimmed.slice(0, patternLen);
+    const repeated = pattern.repeat(Math.ceil(trimmed.length / patternLen)).slice(0, trimmed.length);
+    if (trimmed === repeated) return true;
   }
-  return fromEnv && fromEnv.length >= 16 ? fromEnv : EPHEMERAL_DEV_JWT_SECRET;
+
+  const alphaSeq = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  if (alphaSeq.includes(trimmed.toLowerCase())) return true;
+  const numSeq = '0123456789012345678901234567890123456789';
+  if (numSeq.includes(trimmed)) return true;
+
+  return false;
+}
+
+export function isValidJwtSecret(secret: unknown, isProductionCheck = false): secret is string {
+  if (typeof secret !== 'string') return false;
+  const trimmed = secret.trim();
+  const minLen = isProductionCheck ? 32 : 16;
+  if (trimmed.length < minLen) return false;
+
+  const normalized = trimmed.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (WEAK_JWT_SECRET_PLACEHOLDERS.has(trimmed.toLowerCase()) || WEAK_JWT_SECRET_PLACEHOLDERS.has(normalized)) {
+    return false;
+  }
+
+  if (hasLowEntropySecret(trimmed)) return false;
+
+  return true;
+}
+
+export function assertProductionJwtSecret(): string {
+  const fromEnv = process.env.JWT_SECRET;
+  if (!isValidJwtSecret(fromEnv, true)) {
+    throw new Error(
+      'FATAL: Production requires an explicit, high-entropy JWT_SECRET environment variable (minimum 32 characters, non-placeholder, non-repetitive). Predictable or ephemeral fallback secrets are disabled in production.'
+    );
+  }
+  return fromEnv.trim();
+}
+
+export function resolveJwtSecret(): string {
+  const isProd = IS_PRODUCTION || process.env.NODE_ENV === 'production' || resolveIsProduction(import.meta.url);
+  const fromEnv = process.env.JWT_SECRET;
+  if (isValidJwtSecret(fromEnv, isProd)) {
+    return fromEnv.trim();
+  }
+  if (isProd) {
+    return assertProductionJwtSecret();
+  }
+  return EPHEMERAL_DEV_JWT_SECRET;
 }
 
 export const JWT_SECRET: string = resolveJwtSecret();
@@ -265,15 +334,40 @@ export function resolveAuthenticatedUserId(req: Request): string | null {
 }
 
 const rateBuckets = new Map<string, { count: number; resetAt: number }>();
+const MAX_RATE_BUCKETS = 10_000;
+let lastRateBucketSweep = 0;
+
+function sweepExpiredRateBuckets(now: number) {
+  if (now - lastRateBucketSweep < 60_000 && rateBuckets.size < MAX_RATE_BUCKETS) {
+    return;
+  }
+  lastRateBucketSweep = now;
+  for (const [k, v] of rateBuckets.entries()) {
+    if (now > v.resetAt) {
+      rateBuckets.delete(k);
+    }
+  }
+  if (rateBuckets.size >= MAX_RATE_BUCKETS) {
+    const excess = rateBuckets.size - MAX_RATE_BUCKETS + 1000;
+    let removed = 0;
+    for (const k of rateBuckets.keys()) {
+      rateBuckets.delete(k);
+      removed++;
+      if (removed >= excess) break;
+    }
+  }
+}
+
 export function rateLimit(max: number, windowMs: number, prefix: string = '') {
   return (req: Request, res: Response, next: NextFunction) => {
     if (process.env.NODE_ENV === 'test') {
       return next();
     }
+    const now = Date.now();
+    sweepExpiredRateBuckets(now);
     const identity = (req as any).authenticatedUserId || req.ip || req.socket?.remoteAddress || 'anon';
     const route = prefix || req.route?.path || req.path;
     const key = `${route}:${identity}`;
-    const now = Date.now();
     const record = rateBuckets.get(key) || { count: 0, resetAt: now + windowMs };
     if (now > record.resetAt) {
       record.count = 0;

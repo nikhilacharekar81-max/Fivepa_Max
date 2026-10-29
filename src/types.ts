@@ -466,7 +466,18 @@ export interface Message {
   text: string;
   timestamp: string;
   type?: 'message' | 'system' | 'file' | 'deliverable';
-  fileInfo?: { name: string; size: string; url: string; type?: string; category?: string };
+  fileInfo?: {
+    name: string;
+    size: string;
+    url: string;
+    type?: string;
+    category?: string;
+    orderId?: string;
+    orderTitle?: string;
+    workspaceId?: string;
+    uploaderId?: string;
+    source?: string;
+  };
   metadata?: {
     amount?: number;
     action?: string;
@@ -495,6 +506,10 @@ export interface Message {
     reply?: any;
     status?: string;
     autoProcessed?: boolean;
+    workspaceId?: string;
+    originOrderId?: string;
+    resultingOrderId?: string;
+    newOrderId?: string;
   };
   status?: 'sending' | 'sent' | 'failed';
 }
@@ -521,6 +536,8 @@ export interface WorkstreamOffer {
   id: string;
   number: string;
   orderId: string;
+  originOrderId?: string;
+  resultingOrderId?: string;
   workspaceId?: string;
   proposalId?: string;
   kind: WorkstreamOfferKind;

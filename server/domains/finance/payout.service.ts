@@ -12,6 +12,7 @@ import {
 } from '../../middleware/auth.js';
 import { verifyAndConsumeWithdrawalCode } from '../../services/authService.js';
 import { syncUserBalances, registerAuditLog } from '../../services/orderService.js';
+import { paymentGatewayManager } from './paymentGateways.js';
 
 export const ALLOWED_METHODS: Record<string, keyof typeof DEFAULT_SITE_SETTINGS.wallets.allowedPayoutMethods> = {
   'UPI': 'upi',
@@ -29,8 +30,8 @@ export function formatPayoutRow(r: any): Payout {
   return mapPayoutRow(r);
 }
 
-export function payoutAudit(req: Request, action: string, p: Payout, details: string) {
-  registerAuditLog({
+export async function payoutAudit(req: Request, action: string, p: Payout, details: string): Promise<void> {
+  await registerAuditLog({
     id: 'FAUD-' + randomUUID().slice(0, 12),
     actor: adminActor(req),
     role: 'super_admin',
@@ -250,24 +251,20 @@ export async function handlePayoutRequest(req: Request, res: Response) {
       });
     }
 
-    let record = await store.getPayoutById(activePayoutId);
-    if (!record) {
-      record = {
-        id: activePayoutId,
-        freelancerId,
-        amount: payoutResult.amount ?? numAmount,
-        method: rawMethod as Payout['method'],
-        status: 'pending',
-        createdAt: new Date().toISOString(),
-        accountDetails: payoutResult.accountDetails || accountDetails
-      };
-      await store.savePayout(record);
-    }
+    const record: Payout = (await store.getPayoutById(activePayoutId)) || {
+      id: activePayoutId,
+      freelancerId,
+      amount: payoutResult.amount ?? numAmount,
+      method: rawMethod as Payout['method'],
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      accountDetails: payoutResult.accountDetails || accountDetails
+    };
 
     await syncUserBalances([freelancerId]);
 
-    registerAuditLog({
-      id: 'log_' + Date.now(),
+    await registerAuditLog({
+      id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
       actor: user.name,
       role: user.role,
       action: 'PAYOUT_REQUESTED',
@@ -312,7 +309,7 @@ export const approvePayout = async (req: Request, res: Response) => {
       return mapPayoutRow(updated.rows[0]);
     });
 
-    payoutAudit(req, 'PAYOUT_APPROVED', updatedPayout, `Approved payout of $${updatedPayout.amount} via ${updatedPayout.method} for freelancer ${updatedPayout.freelancerId}`);
+    await payoutAudit(req, 'PAYOUT_APPROVED', updatedPayout, `Approved payout of $${updatedPayout.amount} via ${updatedPayout.method} for freelancer ${updatedPayout.freelancerId}`);
     res.json(updatedPayout);
   } catch (err: any) {
     const status = typeof err?.status === 'number' ? err.status : 400;
@@ -328,6 +325,29 @@ export const processPayout = async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Explicit providerReference is required in production to process a payout.' });
     }
 
+    const preLookup = await postgresStore.getPool().query('SELECT * FROM payouts WHERE id = $1', [payoutId]);
+    if (preLookup.rows.length === 0) {
+      return res.status(404).json({ error: 'Payout not found' });
+    }
+    const candidatePayout = preLookup.rows[0];
+    if (candidatePayout.status !== 'pending' && candidatePayout.status !== 'approved') {
+      return res.status(400).json({ error: `Cannot process payout in status "${candidatePayout.status}"` });
+    }
+    if (Number(candidatePayout.amount) >= 500 && candidatePayout.status !== 'approved') {
+      return res.status(400).json({ error: 'Payouts of $500.00 or more require explicit administrative approval before processing.' });
+    }
+
+    const effectiveProviderRef = providerReference || `GW-SETTLE-${payoutId}`;
+    const preVerification = await paymentGatewayManager.verifyPayoutSettlement({
+      method: candidatePayout.method,
+      providerReference: effectiveProviderRef,
+      amount: Number(candidatePayout.amount),
+      payoutId
+    });
+    if (!preVerification || !preVerification.verified) {
+      return res.status(400).json({ error: `Payout settlement could not be verified with payment provider for payout ${payoutId}` });
+    }
+
     const { journal, freelancerId } = await postgresStore.executeInTransaction(async (client) => {
       const pCheck = await client.query('SELECT * FROM payouts WHERE id = $1 FOR UPDATE', [payoutId]);
       if (pCheck.rows.length === 0) throw { status: 404, message: 'Payout not found' };
@@ -338,18 +358,22 @@ export const processPayout = async (req: Request, res: Response) => {
       if (Number(preRow.amount) >= 500 && preRow.status !== 'approved') {
         throw { status: 400, message: 'Payouts of $500.00 or more require explicit administrative approval before processing.' };
       }
+      if (Number(preRow.amount) !== Number(candidatePayout.amount) || preRow.method !== candidatePayout.method) {
+        throw { status: 409, message: 'Payout details changed concurrently during verification.' };
+      }
       await client.query('SELECT * FROM wallets WHERE user_id = $1 FOR UPDATE', [preRow.freelancer_id]);
       const settled = await financialTransactionService.settlePayout({
         payoutId,
         actor: adminActor(req),
-        providerReference: providerReference || `GW-SETTLE-${payoutId}`
+        providerReference: effectiveProviderRef,
+        preVerified: true
       }, client);
       return { journal: settled.journal, freelancerId: preRow.freelancer_id };
     });
 
     const p = await store.getPayoutById(payoutId);
     if (p) {
-      payoutAudit(req, 'PAYOUT_PROCESSED', p, `Processed payout of $${p.amount} via ${p.method}`);
+      await payoutAudit(req, 'PAYOUT_PROCESSED', p, `Processed payout of $${p.amount} via ${p.method}`);
     }
     await syncUserBalances([freelancerId]);
     res.json({ success: true, payout: p, journal, ...(p || {}) });
@@ -383,7 +407,7 @@ export const rejectPayout = async (req: Request, res: Response) => {
 
     const updated = await store.getPayoutById(payoutId);
     if (updated) {
-      payoutAudit(req, 'PAYOUT_REJECTED', updated, `Rejected payout of $${updated.amount}; funds returned to wallet`);
+      await payoutAudit(req, 'PAYOUT_REJECTED', updated, `Rejected payout of $${updated.amount}; funds returned to wallet`);
     }
     await syncUserBalances([freelancerId]);
     res.json({ success: true, payout: updated, ...(updated || {}) });
@@ -430,7 +454,7 @@ export const failPayout = async (req: Request, res: Response) => {
 
     const p = await store.getPayoutById(payoutId);
     if (p) {
-      payoutAudit(req, 'PAYOUT_FAILED', p, `Payout of $${p.amount} failed; funds returned to wallet`);
+      await payoutAudit(req, 'PAYOUT_FAILED', p, `Payout of $${p.amount} failed; funds returned to wallet`);
     }
     await syncUserBalances([txResult.row.freelancer_id]);
     res.json(p || mapPayoutRow(txResult.row));
@@ -459,7 +483,7 @@ export const retryPayout = async (req: Request, res: Response) => {
 
     const updated = await store.getPayoutById(payoutId);
     if (updated) {
-      payoutAudit(req, 'PAYOUT_RETRIED', updated, `Re-queued failed payout of $${updated.amount}`);
+      await payoutAudit(req, 'PAYOUT_RETRIED', updated, `Re-queued failed payout of $${updated.amount}`);
     }
     await syncUserBalances([pRow.freelancer_id]);
     res.json(updated || mapPayoutRow(pRow));

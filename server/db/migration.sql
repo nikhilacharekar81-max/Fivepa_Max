@@ -157,11 +157,19 @@ CREATE TABLE IF NOT EXISTS orders (
   review_window_expires_at VARCHAR(32),
   review JSONB,
   service_fee NUMERIC(10,2) DEFAULT 0,
-  small_order_fee NUMERIC(10,2) DEFAULT 0
+  small_order_fee NUMERIC(10,2) DEFAULT 0,
+  client_id VARCHAR(64),
+  freelancer_id VARCHAR(64),
+  selected_extras JSONB,
+  updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS service_fee NUMERIC(10,2) DEFAULT 0;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS small_order_fee NUMERIC(10,2) DEFAULT 0;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS client_id VARCHAR(64);
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS freelancer_id VARCHAR(64);
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS selected_extras JSONB;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 
 CREATE TABLE IF NOT EXISTS messages (
   id VARCHAR(64) PRIMARY KEY,
@@ -613,6 +621,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_order_reviewer ON reviews (order_i
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS client_id VARCHAR(64);
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS freelancer_id VARCHAR(64);
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS selected_extras JSONB;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 ALTER TABLE payouts ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ;
 ALTER TABLE payouts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 ALTER TABLE gigs ADD COLUMN IF NOT EXISTS featured BOOLEAN DEFAULT FALSE;
@@ -650,8 +659,6 @@ CREATE TABLE IF NOT EXISTS outbox_events (
   processed_at TIMESTAMPTZ
 );
 
-CREATE INDEX IF NOT EXISTS idx_payment_checkout_sessions_provider_tx_id ON payment_checkout_sessions (provider_tx_id) WHERE provider_tx_id IS NOT NULL AND status = 'completed';
-CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_order_reviewer ON reviews (order_id, reviewer_id) WHERE order_id IS NOT NULL AND reviewer_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_reconciliation_exceptions_status ON reconciliation_exceptions(status);
 CREATE INDEX IF NOT EXISTS idx_reconciliation_exceptions_entity ON reconciliation_exceptions(entity_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_messages_client_msg_id ON messages (order_id, sender_id, (metadata->>'clientMessageId')) WHERE metadata->>'clientMessageId' IS NOT NULL;
@@ -934,4 +941,13 @@ BEGIN
   END LOOP;
 END $$;
 
-
+CREATE INDEX IF NOT EXISTS idx_workspaces_buyer ON workspaces (buyer_id);
+CREATE INDEX IF NOT EXISTS idx_workspaces_seller ON workspaces (seller_id);
+CREATE INDEX IF NOT EXISTS idx_workspaces_parties ON workspaces (buyer_id, seller_id);
+CREATE INDEX IF NOT EXISTS idx_workspaces_updated ON workspaces (updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_workspace_id ON orders (workspace_id);
+CREATE INDEX IF NOT EXISTS idx_orders_workspace_updated ON orders (workspace_id, updated_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_buyer_seller ON orders (buyer_id, seller_id);
+CREATE INDEX IF NOT EXISTS idx_workstream_offers_workspace ON workstream_offers (workspace_id);
+CREATE INDEX IF NOT EXISTS idx_uploads_workspace_id ON uploads (workspace_id);
+CREATE INDEX IF NOT EXISTS idx_uploads_order_id ON uploads (order_id);

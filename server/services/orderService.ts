@@ -5,6 +5,7 @@ import {
   messages,
   disputes,
   auditLogs,
+  saveOrdersToDisk,
   type Order,
   type Gig,
   type User,
@@ -12,6 +13,11 @@ import {
   type AuditLog,
   type Message
 } from '../store.js';
+import {
+  LATE_ORDER_PROTECTION_HOURS,
+  parseDeadlineInstant,
+  isOrderVeryLate
+} from '../../src/utils/deadlineUtils.js';
 import { postgresStore } from '../db/postgresStore.js';
 import {
   financialTransactionService,
@@ -26,6 +32,7 @@ import { createNotification, sendOrderEmail } from './notificationService.js';
 import { recalculateUserRating } from './reviewService.js';
 import { broadcastMessage } from '../websocket.js';
 import { diagnosticService } from './diagnosticService.js';
+import { cancelPendingOffersForOrder } from './workstreamService.js';
 
 export interface ClearingEarning {
   orderId: string;
@@ -39,16 +46,13 @@ export function getUnclearedEarnings(userId: string): number {
   return getRecentClearingTotalSync(userId);
 }
 
-export async function getUnclearedEarningsFromDb(userId: string): Promise<number> {
-  const dbAmount = await store.getUnclearedEarningsAmount(userId);
-  if (dbAmount > 0) return dbAmount;
-  return getUnclearedEarnings(userId);
+export async function getUnclearedEarningsFromDb(userId: string, client?: any): Promise<number> {
+  return await store.getUnclearedEarningsAmount(userId, client);
 }
 
-export async function getActiveEscrowRemaining(order: Order): Promise<number> {
-  const esc = await financialRepository.getEscrow(order.id);
-  if (esc) return esc.remaining;
-  return (order.status === 'completed' || order.status === 'cancelled') ? 0 : Number(order.amount || 0);
+export async function getActiveEscrowRemaining(order: Order, client?: any): Promise<number> {
+  const esc = await financialRepository.getEscrow(order.id, client);
+  return esc ? Number(esc.remaining || 0) : 0;
 }
 
 export const orderIndex = new Map<string, Order>();
@@ -82,79 +86,68 @@ export function registerOrder(o: Order) {
   return;
 }
 
-export async function recordOrder(o: Order): Promise<void> {
-  await workspaceService.ensureWorkspaceForOrderAsync(o);
+export async function recordOrder(o: Order, client?: any): Promise<void> {
+  await workspaceService.ensureWorkspaceForOrderAsync(o, client);
   registerOrder(o);
 }
 
-export async function registerAuditLog(log: AuditLog): Promise<void> {
+export async function registerAuditLog(log: AuditLog, client?: any): Promise<void> {
   try {
-    await store.addAuditLog(log);
+    await store.addAuditLog(log, client);
   } catch (err) {
     console.error('[PostgresStore] Failed to save audit log:', err);
   }
 }
 
-export function saveOrdersToDisk() { return Promise.resolve(); }
+export { saveOrdersToDisk };
 export function saveUsersToPostgres() { return Promise.resolve(); }
 export function saveGigsToPostgres() { return Promise.resolve(); }
 
-export async function syncUserBalances(userIds?: string[]) {
+export async function syncUserBalances(userIds?: string[], externalClient?: any) {
+  const dbRunner = externalClient || postgresStore.getPool();
+  const useSavepoint = Boolean(externalClient);
+  const spName = 'sp_sync_user_balances';
   try {
-    const pool = postgresStore.getPool();
+    if (useSavepoint) {
+      await dbRunner.query(`SAVEPOINT ${spName}`);
+    }
     const hasSpecificUsers = Array.isArray(userIds) && userIds.length > 0;
 
     if (hasSpecificUsers) {
-      const distinctIds = Array.from(new Set(userIds.filter(Boolean)));
-      if (distinctIds.length === 0) return;
-
-      await pool.query(`
-        UPDATE users u
-        SET wallet_balance = w.available_balance
-        FROM wallets w
-        WHERE u.id = w.user_id AND u.id = ANY($1)
-      `, [distinctIds]);
-
-      const walletRows = await pool.query(
-        'SELECT user_id, available_balance FROM wallets WHERE user_id = ANY($1)',
-        [distinctIds]
-      );
-      const balanceMap = new Map<string, number>();
-      for (const r of walletRows.rows) {
-        balanceMap.set(r.user_id, Number(r.available_balance));
-      }
-
-      for (const u of (users || [])) {
-        if (!u || !balanceMap.has(u.id)) continue;
-        u.walletBalance = balanceMap.get(u.id)!;
+      const distinctIds = Array.from(new Set(userIds.filter(Boolean))).sort();
+      if (distinctIds.length > 0) {
+        await dbRunner.query(`
+          UPDATE users u
+          SET wallet_balance = w.available_balance
+          FROM wallets w
+          WHERE u.id = w.user_id
+            AND u.id = ANY($1::text[])
+            AND u.wallet_balance IS DISTINCT FROM w.available_balance
+        `, [distinctIds]);
       }
     } else {
-      await pool.query(`
+      await dbRunner.query(`
         UPDATE users u
         SET wallet_balance = w.available_balance
         FROM wallets w
         WHERE u.id = w.user_id
+          AND u.wallet_balance IS DISTINCT FROM w.available_balance
       `);
-
-      const walletRows = await pool.query('SELECT user_id, available_balance FROM wallets');
-      const balanceMap = new Map<string, number>();
-      for (const r of walletRows.rows) {
-        balanceMap.set(r.user_id, Number(r.available_balance));
-      }
-
-      for (const u of (users || [])) {
-        if (!u || !balanceMap.has(u.id)) continue;
-        u.walletBalance = balanceMap.get(u.id)!;
-      }
+    }
+    if (useSavepoint) {
+      await dbRunner.query(`RELEASE SAVEPOINT ${spName}`);
     }
   } catch (err) {
+    if (useSavepoint) {
+      try { await dbRunner.query(`ROLLBACK TO SAVEPOINT ${spName}`); } catch {}
+    }
     console.error('[syncUserBalances] Error syncing balances:', err);
   }
 }
 
-export async function ensureWallet(userId: string) {
+export async function ensureWallet(userId: string, client?: any) {
   try {
-    await financialTransactionService.ensureWallet(userId);
+    await financialTransactionService.ensureWallet(userId, client);
   } catch (err) {
     console.error(`[ensureWallet] Failed for user ${userId}:`, err);
   }
@@ -179,7 +172,8 @@ export async function resolveGigOrderPrice(gigId: string, extraIds: unknown): Pr
   }
   const basePrice = Number(r.price || 0);
   const baseDeliveryDays = Math.max(1, Math.round(Number(r.delivery_days || r.deliveryDays || 7)));
-  const extras = Array.isArray(r.extras) ? r.extras : [];
+  const parsedExtras = typeof r.extras === 'string' ? (() => { try { return JSON.parse(r.extras); } catch { return []; } })() : r.extras;
+  const extras = Array.isArray(parsedExtras) ? parsedExtras : [];
   const requestedIds = Array.isArray(extraIds) 
     ? Array.from(new Set(extraIds.map(String).filter(Boolean)))
     : [];
@@ -256,43 +250,7 @@ export function isAutoAcceptEnabled(): boolean {
   return getReviewWindowDays() > 0;
 }
 
-export const LATE_ORDER_PROTECTION_HOURS = 48;
-
-/**
- * Parses an order deadline into an authoritative UTC timestamp in milliseconds.
- * - Full ISO timestamps (e.g. 2026-10-30T14:30:00.000Z) are parsed directly.
- * - Legacy date-only records (e.g. 2026-10-30) are handled conservatively:
- *   If the order's creation timestamp has a valid time-of-day, that time-of-day is preserved.
- *   Otherwise, the date-only record is treated as end-of-day (23:59:59.999Z) so the deadline
- *   is never prematurely triggered earlier than intended.
- * - Invalid or unparseable inputs return null.
- */
-export function parseDeadlineInstant(dueDate: unknown, referenceCreatedAt?: unknown): number | null {
-  if (!dueDate || typeof dueDate !== 'string') return null;
-  const trimmed = dueDate.trim();
-  if (!trimmed) return null;
-
-  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
-    if (referenceCreatedAt && typeof referenceCreatedAt === 'string' && referenceCreatedAt.includes('T')) {
-      const createdDate = new Date(referenceCreatedAt);
-      if (!isNaN(createdDate.getTime())) {
-        const timePart = referenceCreatedAt.split('T')[1];
-        if (timePart) {
-          const candidate = new Date(`${trimmed}T${timePart}`);
-          if (!isNaN(candidate.getTime())) {
-            return candidate.getTime();
-          }
-        }
-      }
-    }
-    const endOfDay = new Date(`${trimmed}T23:59:59.999Z`);
-    return isNaN(endOfDay.getTime()) ? null : endOfDay.getTime();
-  }
-
-  const parsed = new Date(trimmed);
-  const time = parsed.getTime();
-  return isNaN(time) ? null : time;
-}
+export { LATE_ORDER_PROTECTION_HOURS, parseDeadlineInstant, isOrderVeryLate };
 
 /**
  * Calculates a new extended deadline instant from an existing deadline.
@@ -316,13 +274,13 @@ export function assertOrderOpen(order: Order) {
   if (order.status === 'cancelled') throw new Error('Order is already cancelled; funds were already handled.');
 }
 
-export async function fundOrderEscrowWithEvent(params: { orderId: string; orderTitle: string; amount: number; buyerId: string; sellerId: string; actor: string; skipMinimum?: boolean; idempotencyKey?: string }) {
-  return await financialTransactionService.fundEscrow(params);
+export async function fundOrderEscrowWithEvent(params: { orderId: string; orderTitle: string; amount: number; buyerId: string; sellerId: string; actor: string; skipMinimum?: boolean; idempotencyKey?: string }, externalClient?: any) {
+  return await financialTransactionService.fundEscrow(params, externalClient);
 }
 
-export async function topUpOrderEscrowWithEvent(params: { orderId: string; orderTitle: string; amount: number; buyerId: string; sellerId: string; actor: string; skipMinimum?: boolean; idempotencyKey?: string }) {
-  const res = await financialTransactionService.topUpEscrow(params);
-  await emitSystemEvent(params.orderId, 'escrow_funded', `🔒 Additional $${params.amount.toLocaleString()} funded into escrow for "${params.orderTitle}".`, { amount: params.amount, isTopUp: true });
+export async function topUpOrderEscrowWithEvent(params: { orderId: string; orderTitle: string; amount: number; buyerId: string; sellerId: string; actor: string; skipMinimum?: boolean; idempotencyKey?: string }, externalClient?: any) {
+  const res = await financialTransactionService.topUpEscrow(params, externalClient);
+  await emitSystemEvent(params.orderId, 'escrow_funded', `🔒 Additional $${params.amount.toLocaleString()} funded into escrow for "${params.orderTitle}".`, { amount: params.amount, isTopUp: true }, externalClient);
   return res;
 }
 
@@ -358,13 +316,19 @@ export async function releaseOrderFunds(
     order.acceptedVersion = order.deliveryHistory[order.deliveryHistory.length - 1].version;
   }
 
-  await syncUserBalances([order.buyerId, order.sellerId].filter(Boolean));
+  const dbRunner = externalClient || postgresStore.getPool();
+  await dbRunner.query(
+    'UPDATE orders SET completed_at = COALESCE(completed_at, $1), accepted_version = COALESCE($2, accepted_version) WHERE id = $3',
+    [order.completedAt, order.acceptedVersion ?? null, order.id]
+  );
+
+  await syncUserBalances([order.buyerId, order.sellerId].filter(Boolean), externalClient);
 
   if (approvedByBuyer) {
     await emitSystemEvent(order.id, 'deliverable_approved', `✅ Deliverables approved by buyer.`, {
       freelancerNet: result.freelancerNet,
       acceptedVersion: order.acceptedVersion
-    });
+    }, externalClient);
   }
 
   await emitSystemEvent(order.id, 'escrow_released', `🎉 Escrow funds ($${order.amount.toLocaleString()}) released to seller! Workstream marked as completed.`, {
@@ -372,9 +336,9 @@ export async function releaseOrderFunds(
     freelancerNet: result.freelancerNet,
     platformFee: result.platformFee,
     orderCompleted: true
-  });
+  }, externalClient);
 
-  await emitSystemEvent(order.id, 'order_completed', `✅ Order completed.`);
+  await emitSystemEvent(order.id, 'order_completed', `✅ Order completed.`, {}, externalClient);
   return result;
 }
 
@@ -401,7 +365,7 @@ export async function refundOrderFunds(
     order.status = 'cancelled';
   }
 
-  await syncUserBalances([order.buyerId, order.sellerId].filter(Boolean));
+  await syncUserBalances([order.buyerId, order.sellerId].filter(Boolean), externalClient);
   const dbRunner = externalClient || postgresStore.getPool();
   const cancelReqJson = cancellationData?.cancellationRequest !== undefined
     ? JSON.stringify(cancellationData.cancellationRequest)
@@ -429,21 +393,22 @@ export async function refundOrderFunds(
   await emitSystemEvent(order.id, 'escrow_refunded', `💸 Escrow refunded ($${result.refunded.toLocaleString()}) to buyer wallet. Reason: ${reason}`, {
     refunded: result.refunded,
     orderCancelled: order.status === 'cancelled'
-  });
+  }, externalClient);
 
   return result;
 }
 
-export async function splitOrderFunds(order: Order, refundAmount: number, actor: string, reason: string, requestKey?: string) {
+export async function splitOrderFunds(order: Order, refundAmount: number, actor: string, reason: string, requestKey?: string, externalClient?: any) {
   assertOrderOpen(order);
-  const result = await financialTransactionService.resolveEscrowSplit({ orderId: order.id, refundAmount, reason, actor });
+  const result = await financialTransactionService.resolveEscrowSplit({ orderId: order.id, refundAmount, reason, actor, idempotencyKey: requestKey, allowDisputeResolution: true }, externalClient);
   order.status = 'completed';
   if (!order.completedAt) {
     order.completedAt = new Date().toISOString();
   }
 
-  await syncUserBalances([order.buyerId, order.sellerId].filter(Boolean));
-  await postgresStore.getPool().query(
+  await syncUserBalances([order.buyerId, order.sellerId].filter(Boolean), externalClient);
+  const dbRunner = externalClient || postgresStore.getPool();
+  await dbRunner.query(
     'UPDATE orders SET status = $1, completed_at = COALESCE(completed_at, $2) WHERE id = $3 AND status NOT IN (\'completed\', \'cancelled\')',
     ['completed', order.completedAt, order.id]
   );
@@ -451,14 +416,14 @@ export async function splitOrderFunds(order: Order, refundAmount: number, actor:
   await emitSystemEvent(order.id, 'escrow_refunded', `💸 Partial refund of $${refundAmount.toLocaleString()} returned to buyer wallet. Reason: ${reason}`, {
     refunded: refundAmount,
     splitResolution: true
-  });
+  }, externalClient);
   await emitSystemEvent(order.id, 'escrow_released', `🎉 Remaining escrow funds ($${result.release.freelancerNet.toLocaleString()}) released to seller. Workstream marked as completed.`, {
     freelancerNet: result.release.freelancerNet,
     platformFee: result.release.platformFee,
     orderCompleted: true,
     splitResolution: true
-  });
-  await emitSystemEvent(order.id, 'order_completed', `✅ Order completed via dispute resolution.`);
+  }, externalClient);
+  await emitSystemEvent(order.id, 'order_completed', `✅ Order completed via dispute resolution.`, {}, externalClient);
 
   return result;
 }
@@ -542,16 +507,16 @@ export async function processCancellationTimeouts() {
           continue;
         }
         try {
-          await postgresStore.executeInTransaction(async (client) => {
+          const pendingNotifications = await postgresStore.executeInTransaction(async (client) => {
             const lockRes = await client.query(
               "SELECT * FROM orders WHERE id = $1 FOR UPDATE",
               [order.id]
             );
-            if (lockRes.rows.length === 0) return;
+            if (lockRes.rows.length === 0) return null;
             const freshRow = lockRes.rows[0];
 
             if (freshRow.status === 'completed' || freshRow.status === 'cancelled' || freshRow.status === 'disputed') {
-              return;
+              return null;
             }
 
             let cancelReq = freshRow.cancellation_request;
@@ -559,12 +524,12 @@ export async function processCancellationTimeouts() {
               try { cancelReq = JSON.parse(cancelReq); } catch {}
             }
             if (!cancelReq || cancelReq.status !== 'pending') {
-              return;
+              return null;
             }
 
             const respondByTimeMs = new Date(cancelReq.respondBy).getTime();
             if (now <= respondByTimeMs) {
-              return;
+              return null;
             }
 
             const activeDisputeRes = await client.query(
@@ -572,11 +537,11 @@ export async function processCancellationTimeouts() {
               [order.id]
             );
             if (activeDisputeRes.rows.length > 0) {
-              return;
+              return null;
             }
 
-            const freshOrder = (store as any).mapOrderRow ? (store as any).mapOrderRow(freshRow) : await store.getOrder(order.id);
-            if (!freshOrder) return;
+            const freshOrder = (store as any).mapOrderRow ? (store as any).mapOrderRow(freshRow) : await store.getOrder(order.id, client);
+            if (!freshOrder) return null;
 
             const requesterId = cancelReq.requesterId;
             const otherId = requesterId === freshOrder.buyerId ? freshOrder.sellerId : freshOrder.buyerId;
@@ -593,24 +558,26 @@ export async function processCancellationTimeouts() {
                 }
               }
               await client.query(
-                "UPDATE orders SET status = 'cancelled', cancellation_type = 'inquiry_cancelled', cancellation_request = $1, cancellation_history = $2 WHERE id = $3",
+                "UPDATE orders SET status = 'cancelled', cancellation_type = 'inquiry_cancelled', cancellation_request = $1, cancellation_history = $2, updated_at = NOW() WHERE id = $3",
                 [JSON.stringify(cancelReq), JSON.stringify(freshOrder.cancellationHistory || []), freshOrder.id]
               );
-              createNotification({
-                userId: requesterId,
-                title: 'Inquiry Cancelled',
-                message: `Inquiry thread #${freshOrder.id} request timed out and was closed.`,
-                type: 'order',
-                link: `/messages/${freshOrder.id}`
-              });
-              createNotification({
-                userId: otherId,
-                title: 'Inquiry Cancelled',
-                message: `Inquiry thread #${freshOrder.id} request timed out and was closed.`,
-                type: 'order',
-                link: `/messages/${freshOrder.id}`
-              });
-              return;
+              await cancelPendingOffersForOrder(freshOrder.id, 'system', client);
+              return [
+                {
+                  userId: requesterId,
+                  title: 'Inquiry Cancelled',
+                  message: `Inquiry thread #${freshOrder.id} request timed out and was closed.`,
+                  type: 'order',
+                  link: `/workstream/${freshOrder.id}`
+                },
+                {
+                  userId: otherId,
+                  title: 'Inquiry Cancelled',
+                  message: `Inquiry thread #${freshOrder.id} request timed out and was closed.`,
+                  type: 'order',
+                  link: `/workstream/${freshOrder.id}`
+                }
+              ];
             }
 
             const requestKey = `cancel_timeout_${freshOrder.id}_${cancelReq.requestedAt}`;
@@ -635,25 +602,34 @@ export async function processCancellationTimeouts() {
               }
             }
             await client.query(
-              "UPDATE orders SET cancellation_request = $1, cancellation_history = $2 WHERE id = $3",
+              "UPDATE orders SET cancellation_request = $1, cancellation_history = $2, cancellation_type = COALESCE(cancellation_type, 'auto_timeout'), updated_at = NOW() WHERE id = $3",
               [JSON.stringify(cancelReq), JSON.stringify(freshOrder.cancellationHistory || []), freshOrder.id]
             );
+            await cancelPendingOffersForOrder(freshOrder.id, 'system', client);
 
-            createNotification({
-              userId: requesterId,
-              title: 'Cancellation Auto-Cancelled',
-              message: `Order #${freshOrder.id} cancellation request timed out after 48h. Order cancelled & full refund issued ($${refundRes.refunded}).`,
-              type: 'order',
-              link: `/messages/${freshOrder.id}`
-            });
-            createNotification({
-              userId: otherId,
-              title: 'Cancellation Auto-Cancelled',
-              message: `Order #${freshOrder.id} cancellation request timed out after 48h. Order cancelled & full refund issued ($${refundRes.refunded}).`,
-              type: 'order',
-              link: `/messages/${freshOrder.id}`
-            });
+            return [
+              {
+                userId: requesterId,
+                title: 'Cancellation Auto-Cancelled',
+                message: `Order #${freshOrder.id} cancellation request timed out after 48h. Order cancelled & full refund issued ($${refundRes.refunded}).`,
+                type: 'order',
+                link: `/workstream/${freshOrder.id}`
+              },
+              {
+                userId: otherId,
+                title: 'Cancellation Auto-Cancelled',
+                message: `Order #${freshOrder.id} cancellation request timed out after 48h. Order cancelled & full refund issued ($${refundRes.refunded}).`,
+                type: 'order',
+                link: `/workstream/${freshOrder.id}`
+              }
+            ];
           });
+
+          if (pendingNotifications) {
+            for (const notif of pendingNotifications) {
+              await createNotification(notif);
+            }
+          }
         } catch (err) {
           console.error(`[CancellationTimeout] Failed to auto-cancel order ${order.id}:`, err);
         } finally {
@@ -708,8 +684,7 @@ export async function processAutoAcceptOrders(customNow?: number): Promise<Array
       if (order.cancellationRequest && order.cancellationRequest.status === 'pending') continue;
 
       const dispute = await store.getDisputeByOrderId(order.id);
-      const inMemoryDispute = (disputes || []).find(d => d.orderId === order.id && (d.status === 'open' || d.status === 'under_investigation'));
-      if ((dispute && (dispute.status === 'open' || dispute.status === 'under_investigation')) || inMemoryDispute) continue;
+      if (dispute && (dispute.status === 'open' || dispute.status === 'under_investigation' || (dispute.status as string) === 'under_review')) continue;
 
       const esc = await financialRepository.getEscrow(order.id);
       const hasEscrow = (esc && esc.remaining > 0 && esc.status !== 'released' && esc.status !== 'refunded');
@@ -752,9 +727,10 @@ export async function processAutoAcceptOrders(customNow?: number): Promise<Array
           );
           if (activeDisputeRes.rows.length > 0) return null;
 
-          const freshOrder = (store as any).mapOrderRow ? (store as any).mapOrderRow(freshRow) : await store.getOrder(order.id);
+          const freshOrder = (store as any).mapOrderRow ? (store as any).mapOrderRow(freshRow) : await store.getOrder(order.id, client);
           if (!freshOrder || freshOrder.status !== 'delivered') return null;
 
+          freshOrder.acceptedVersion = latestDelivery.version;
           const relResult = await releaseOrderFunds(
             freshOrder, 
             'System Auto-Accept', 
@@ -765,7 +741,7 @@ export async function processAutoAcceptOrders(customNow?: number): Promise<Array
             client
           );
           freshOrder.acceptedVersion = latestDelivery.version;
-          await store.saveOrder(freshOrder);
+          await store.saveOrder(freshOrder, client);
 
           return { freshOrder, relResult };
         });
@@ -798,7 +774,7 @@ export async function processAutoAcceptOrders(customNow?: number): Promise<Array
           details: `Auto-accepted deliverables (version ${latestDelivery.version}) after ${days}-day buyer review window expired`,
           timestamp: new Date(now).toISOString()
         };
-        registerAuditLog(autoLog);
+        await registerAuditLog(autoLog);
 
         processed.push({
           orderId: freshOrder.id,
@@ -819,8 +795,8 @@ export async function processAutoAcceptOrders(customNow?: number): Promise<Array
   return processed;
 }
 
-export async function atomicUpdateOrder(orderId: string, updates: Record<string, any>, allowedStatuses: string[]): Promise<boolean> {
-  const pool = postgresStore.getPool();
+export async function atomicUpdateOrder(orderId: string, updates: Record<string, any>, allowedStatuses: string[], client?: any): Promise<boolean> {
+  const dbRunner = client || postgresStore.getPool();
   const keys = Object.keys(updates);
   const setClause = keys.map((k, i) => `${k} = $${i + 2}`).join(', ');
   const values = keys.map(k => updates[k]);
@@ -830,6 +806,6 @@ export async function atomicUpdateOrder(orderId: string, updates: Record<string,
     SET ${setClause}
     WHERE id = $1 AND status = ANY($${keys.length + 2})
   `;
-  const res = await pool.query(query, [orderId, ...values, allowedStatuses]);
+  const res = await dbRunner.query(query, [orderId, ...values, allowedStatuses]);
   return res.rowCount !== null && res.rowCount > 0;
 }

@@ -118,10 +118,17 @@ export const WorkstreamFilesTab: React.FC<WorkstreamFilesTabProps> = ({
                 {getFileIcon(file.name)}
               </div>
               <div className="flex-1 min-w-0">
-                <div className="font-bold text-xs text-fiverr-dark truncate group-hover:text-emerald-700 transition">
-                  {file.name}
+                <div className="flex items-center gap-2">
+                  <div className="font-bold text-xs text-fiverr-dark truncate group-hover:text-emerald-700 transition">
+                    {file.name}
+                  </div>
+                  {file.orderId && (
+                    <span className="shrink-0 px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 text-[9px] font-mono border border-slate-200">
+                      #{file.orderId}
+                    </span>
+                  )}
                 </div>
-                <div className="text-[10px] text-slate-400 mt-1 font-mono flex items-center gap-2">
+                <div className="text-[10px] text-slate-400 mt-1 font-mono flex items-center gap-2 flex-wrap">
                   <span>{file.size}</span>
                   <span>•</span>
                   <span>{file.uploadedBy}</span>

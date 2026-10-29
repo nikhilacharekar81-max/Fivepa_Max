@@ -40,6 +40,7 @@ interface WorkstreamActivityStreamProps {
   onReplyReview?: (reviewId: string, replyText: string) => Promise<{ ok: boolean; error?: string }>;
   onRetryMessage?: (msg: WorkstreamMessage) => void;
   order?: WorkstreamItem;
+  workspaceOrders?: WorkstreamItem[];
   onOpenDeliverModal?: () => void;
   onOpenReleaseModal?: () => void;
   onOpenRevisionModal?: () => void;
@@ -67,6 +68,7 @@ export const WorkstreamActivityStream: React.FC<WorkstreamActivityStreamProps> =
   onReplyReview,
   onRetryMessage,
   order,
+  workspaceOrders = [],
   onOpenDeliverModal,
   onOpenReleaseModal,
   onOpenRevisionModal,
@@ -75,6 +77,7 @@ export const WorkstreamActivityStream: React.FC<WorkstreamActivityStreamProps> =
   onStartVideoCall,
   onRespondToExtension
 }) => {
+  const hasMultipleOrders = workspaceOrders.length > 1;
   const scrollEndRef = useRef<HTMLDivElement>(null);
   const [activeFilter, setActiveFilter] = useState<ActivityFilter>('all');
   const [busyOfferId, setBusyOfferId] = useState<string | null>(null);
@@ -256,9 +259,18 @@ export const WorkstreamActivityStream: React.FC<WorkstreamActivityStreamProps> =
                 {headerIcon}
               </div>
               <div>
-                <h3 className="text-base font-bold text-gray-900 leading-tight">
-                  {headerTitle}
-                </h3>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h3 className="text-base font-bold text-gray-900 leading-tight">
+                    {headerTitle}
+                  </h3>
+                  {(hasMultipleOrders || (offer.originOrderId && offer.resultingOrderId && offer.originOrderId !== offer.resultingOrderId)) && (
+                    <span className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200 text-[10px] font-mono">
+                      {offer.originOrderId && offer.resultingOrderId && offer.originOrderId !== offer.resultingOrderId
+                        ? `#${offer.originOrderId} → #${offer.resultingOrderId}`
+                        : `Order #${offer.orderId || msg.orderId}`}
+                    </span>
+                  )}
+                </div>
                 <p className="text-xs text-gray-400 font-normal mt-0.5">
                   {relTime}
                 </p>
@@ -575,6 +587,11 @@ export const WorkstreamActivityStream: React.FC<WorkstreamActivityStreamProps> =
                   {info.badgeLabel && (
                     <span className={`px-2 py-0.5 rounded-full border text-[10px] font-bold ${info.badgeCls}`}>
                       {info.badgeLabel}
+                    </span>
+                  )}
+                  {(hasMultipleOrders || (msg.orderId && order?.id && msg.orderId !== order.id)) && msg.orderId && (
+                    <span className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200 text-[10px] font-mono">
+                      Order #{msg.orderId}
                     </span>
                   )}
                 </div>
@@ -1160,7 +1177,14 @@ export const WorkstreamActivityStream: React.FC<WorkstreamActivityStreamProps> =
                     onError={(e) => { (e.target as HTMLImageElement).src = DEFAULT_AVATAR; }}
                   />
                   <div className={`flex flex-col gap-1 ${isMe ? 'items-end' : 'items-start'} max-w-[75%]`}>
-                    <span className="text-[10px] font-bold text-slate-400 px-1">{senderName}</span>
+                    <div className="flex items-center gap-1.5 px-1">
+                      <span className="text-[10px] font-bold text-slate-400">{senderName}</span>
+                      {(hasMultipleOrders || (msg.orderId && order?.id && msg.orderId !== order.id)) && msg.orderId && (
+                        <span className="px-1.5 py-0.2 rounded bg-slate-100 text-slate-500 border border-slate-200 text-[9px] font-mono">
+                          #{msg.orderId}
+                        </span>
+                      )}
+                    </div>
                     <div className={`px-4 py-3 rounded-2xl text-xs ${
                       isFailed
                         ? 'bg-rose-50 border border-rose-300 text-rose-900 rounded-tr-none'

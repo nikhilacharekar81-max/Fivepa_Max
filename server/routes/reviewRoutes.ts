@@ -201,18 +201,18 @@ export const handleSubmitReview = async (req: Request, res: Response) => {
       await postgresStore.getPool().query('UPDATE orders SET seller_review = $1 WHERE id = $2', [JSON.stringify(newReview), order.id]);
     }
 
-    recalculateUserRating(resolvedTargetUserId);
+    await recalculateUserRating(resolvedTargetUserId);
     const targetGigId = order.gigId || newReview.gigId;
     if (targetGigId) {
       await recalculateGigRating(targetGigId);
     }
 
-    createNotification({
+    await createNotification({
       userId: resolvedTargetUserId,
       type: 'review',
       title: 'New Review Received',
       message: `${caller.name} left a ${numRating}-star review for order "${order.title}".`,
-      link: `/messages/${order.id}`,
+      link: `/workstream/${order.id}`,
       dedupKey: `review_${newReview.id}`,
       actorId: caller.id
     });
@@ -232,8 +232,7 @@ export const handleSubmitReview = async (req: Request, res: Response) => {
         isCancelledOrder: false
       }
     };
-    recordMessage(sysMsg);
-    await store.addMessage(sysMsg);
+    await recordMessage(sysMsg);
     broadcastMessage(sysMsg, order.id);
 
     res.status(201).json({ success: true, review: newReview, order: enrichOrderWithServiceInfo(order) });
@@ -280,7 +279,7 @@ router.put('/reviews/:id', requireAuth, async (req: Request, res: Response) => {
     await store.saveReview(review);
 
     if (review.targetUserId) {
-      recalculateUserRating(review.targetUserId);
+      await recalculateUserRating(review.targetUserId);
     }
 
     const targetGigId = review.gigId || (review.orderId ? (await store.getOrder(review.orderId))?.gigId : undefined);
@@ -290,10 +289,16 @@ router.put('/reviews/:id', requireAuth, async (req: Request, res: Response) => {
 
     if (review.orderId) {
       const order = await store.getOrder(review.orderId);
-      if (order && order.review && order.review.id === review.id) {
-        order.review.rating = newRating;
-        order.review.comment = newComment;
-        await postgresStore.getPool().query('UPDATE orders SET review = $1 WHERE id = $2', [JSON.stringify(order.review), order.id]);
+      if (order) {
+        if (order.review && order.review.id === review.id) {
+          order.review.rating = newRating;
+          order.review.comment = newComment;
+          await postgresStore.getPool().query('UPDATE orders SET review = $1 WHERE id = $2', [JSON.stringify(order.review), order.id]);
+        } else if ((order as any).sellerReview && (order as any).sellerReview.id === review.id) {
+          (order as any).sellerReview.rating = newRating;
+          (order as any).sellerReview.comment = newComment;
+          await postgresStore.getPool().query('UPDATE orders SET seller_review = $1 WHERE id = $2', [JSON.stringify((order as any).sellerReview), order.id]);
+        }
       }
     }
 
@@ -362,6 +367,9 @@ router.post('/reviews/:id/reply', requireAuth, async (req: Request, res: Respons
         if (order.review && order.review.id === review.id) {
           order.review.reply = replyObj;
           await postgresStore.getPool().query('UPDATE orders SET review = $1 WHERE id = $2', [JSON.stringify(order.review), order.id]);
+        } else if ((order as any).sellerReview && (order as any).sellerReview.id === review.id) {
+          (order as any).sellerReview.reply = replyObj;
+          await postgresStore.getPool().query('UPDATE orders SET seller_review = $1 WHERE id = $2', [JSON.stringify((order as any).sellerReview), order.id]);
         }
 
         const sysMsg: Message = {
@@ -395,7 +403,11 @@ router.patch('/admin/reviews/:id/moderation', requireRole(['admin', 'super_admin
     await store.saveReview(review);
 
     if (review.targetUserId) {
-      recalculateUserRating(review.targetUserId);
+      await recalculateUserRating(review.targetUserId);
+    }
+    const targetGigId = review.gigId || (review.orderId ? (await store.getOrder(review.orderId))?.gigId : undefined);
+    if (targetGigId) {
+      await recalculateGigRating(targetGigId);
     }
     res.json({ success: true, review });
   } catch (err: any) {

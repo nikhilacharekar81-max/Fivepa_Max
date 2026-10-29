@@ -1,1 +1,44 @@
 @import "tailwindcss";
+
+@theme {
+  --color-emerald-50: #eefbf4;
+  --color-emerald-100: #d5f6e3;
+  --color-emerald-200: #aff0cc;
+  --color-emerald-300: #79e4ae;
+  --color-emerald-400: #3cd18a;
+  --color-emerald-500: #1dbf73;
+  --color-emerald-600: #10a35e;
+  --color-emerald-700: #10814d;
+  --color-emerald-800: #126640;
+  --color-emerald-900: #115436;
+  --color-emerald-950: #082f1d;
+
+  --color-green-50: #eefbf4;
+  --color-green-100: #d5f6e3;
+  --color-green-200: #aff0cc;
+  --color-green-300: #79e4ae;
+  --color-green-400: #3cd18a;
+  --color-green-500: #1dbf73;
+  --color-green-600: #10a35e;
+  --color-green-700: #10814d;
+  --color-green-800: #126640;
+  --color-green-900: #115436;
+  --color-green-950: #082f1d;
+
+  --color-teal-50: #eefbf4;
+  --color-teal-100: #d5f6e3;
+  --color-teal-200: #aff0cc;
+  --color-teal-300: #79e4ae;
+  --color-teal-400: #3cd18a;
+  --color-teal-500: #1dbf73;
+  --color-teal-600: #10a35e;
+  --color-teal-700: #10814d;
+  --color-teal-800: #126640;
+  --color-teal-900: #115436;
+  --color-teal-950: #082f1d;
+
+  --color-fiverr-green: #1dbf73;
+  --color-fiverr-dark: #1e293b;
+  --color-fiverr-muted: #64748b;
+  --color-brand-green: #1dbf73;
+}

@@ -14,6 +14,7 @@ import {
   requireAdmin,
   adminActor,
   resolveAuthenticatedUserId,
+  isStaffUser,
   escapeHtml
 } from '../middleware/auth.js';
 import { siteSettings } from '../../src/server/siteSettings.js';
@@ -81,12 +82,8 @@ gigRouter.get('/gigs/:id', async (req: Request, res: Response) => {
     if (!gig) return res.status(404).json({ error: 'Gig not found' });
 
     const authUserId = resolveAuthenticatedUserId(req);
-    let callerRole = null;
-    if (authUserId) {
-      const user = await store.getUser(authUserId);
-      if (user) callerRole = user.role;
-    }
-    const isAdmin = callerRole === 'admin' || callerRole === 'super_admin';
+    const user = authUserId ? await store.getUser(authUserId) : null;
+    const isAdmin = isStaffUser(user);
     const isOwner = authUserId && gig.freelancerId === authUserId;
 
     if (isGigPublic(gig)) {
@@ -173,7 +170,7 @@ gigRouter.post('/gigs', requireAuth, requireActiveStatus, async (req: Request, r
         return res.status(400).json({ error: daysCheck.error || 'Extra delivery days must be a whole number between 0 and 365.' });
       }
       extras.push({
-        id: String(ex?.id || `extra_${Date.now()}_${idx}`),
+        id: String(ex?.id || `extra_${Date.now()}_${idx}_${randomUUID().slice(0, 6)}`),
         title: String(ex?.title || '').slice(0, 200),
         price: Math.round(Math.min(100000, Math.max(0, Number(ex?.price) || 0)) * 100) / 100,
         deliveryDays: daysCheck.value
@@ -271,6 +268,19 @@ const handleGigUpdate = async (req: Request, res: Response) => {
     if (req.body.deliveryDays !== undefined) {
       updates.deliveryDays = Math.min(365, Math.max(1, Math.round(Number(req.body.deliveryDays)) || 7));
     }
+    if (req.body.packages !== undefined && typeof req.body.packages === 'object') {
+      const activeSettings = siteSettings.getSettings();
+      const minGigPrice = activeSettings.marketplace.minimumGigPrice ?? 1;
+      for (const tier of ['basic', 'standard', 'premium']) {
+        if (req.body.packages[tier]) {
+          const p = Number(req.body.packages[tier].price);
+          if (!Number.isFinite(p) || p < minGigPrice) {
+            return res.status(400).json({ error: `Package tier '${tier}' price ($${p}) must be a valid number >= $${minGigPrice}.` });
+          }
+        }
+      }
+      updates.packages = req.body.packages;
+    }
     if (req.body.extras !== undefined && Array.isArray(req.body.extras)) {
       const parsedExtras: { id: string; title: string; price: number; deliveryDays: number }[] = [];
       const rawExtras = req.body.extras.slice(0, 20);
@@ -282,7 +292,7 @@ const handleGigUpdate = async (req: Request, res: Response) => {
           return res.status(400).json({ error: daysCheck.error || 'Extra delivery days must be a whole number between 0 and 365.' });
         }
         parsedExtras.push({
-          id: String(ex?.id || `extra_${Date.now()}_${idx}`),
+          id: String(ex?.id || `extra_${Date.now()}_${idx}_${randomUUID().slice(0, 6)}`),
           title: String(ex?.title || '').slice(0, 200),
           price: Math.round(Math.min(100000, Math.max(0, Number(ex?.price) || 0)) * 100) / 100,
           deliveryDays: daysCheck.value
@@ -336,8 +346,8 @@ const handleGigUpdate = async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'Gig not found or cannot be updated.' });
     }
 
-    registerAuditLog({
-      id: 'log_' + Date.now(),
+    await registerAuditLog({
+      id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
       actor: caller.name,
       role: caller.role,
       action: 'GIG_UPDATED',
@@ -369,8 +379,8 @@ gigRouter.delete('/gigs/:id', requireAuth, requireActiveStatus, async (req: Requ
 
     await store.deleteGig(req.params.id);
 
-    registerAuditLog({
-      id: 'log_' + Date.now(),
+    await registerAuditLog({
+      id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
       actor: caller.name,
       role: caller.role,
       action: 'GIG_DELETED',
@@ -396,13 +406,29 @@ gigRouter.patch('/gigs/:id/feature', requireAuth, requireActiveStatus, async (re
       return res.status(500).json({ error: 'Feature fee is not configured.' });
     }
 
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    const callerIdempKey = (
+      req.headers['idempotency-key'] ||
+      req.headers['x-idempotency-key'] ||
+      req.body?.idempotencyKey ||
+      req.body?.requestKey
+    ) as string | undefined;
+    const trimmedIdempKey = callerIdempKey && String(callerIdempKey).trim() ? String(callerIdempKey).trim() : undefined;
+
+    const callerOpId = (
+      req.body?.operationId ||
+      req.headers['x-request-id'] ||
+      (req as any).requestId
+    ) as string | undefined;
+    const trimmedOpId = callerOpId && String(callerOpId).trim() ? String(callerOpId).trim() : undefined;
+
     const result = await financialTransactionService.chargeFeaturedGigFee({
       gigId: req.params.id,
       sellerId: caller.id,
       feeAmount: fee,
-      featuredUntil: expiresAt,
-      actor: `user:${caller.id}`
+      extensionDays: 7,
+      actor: `user:${caller.id}`,
+      idempotencyKey: trimmedIdempKey,
+      operationId: trimmedOpId
     });
 
     res.json(result);

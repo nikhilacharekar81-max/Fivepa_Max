@@ -18,18 +18,29 @@ export function registerMessage(m: Message) {
   return;
 }
 
-export async function recordMessage(m: Message): Promise<Message> {
-  await store.addMessage(m);
+export async function recordMessage(m: Message, client?: any): Promise<Message> {
+  await store.addMessage(m, client);
   if (m.orderId) {
+    const dbRunner = client || postgresStore.getPool();
     try {
-      await postgresStore.getPool().query(
-        "UPDATE orders SET updated_at = NOW() WHERE id = $1",
-        [m.orderId]
-      );
+      if (client) {
+        await client.query('SAVEPOINT sp_record_msg_touch');
+        await client.query('UPDATE orders SET updated_at = NOW() WHERE id = $1', [m.orderId]);
+        await client.query('RELEASE SAVEPOINT sp_record_msg_touch');
+      } else {
+        await dbRunner.query('UPDATE orders SET updated_at = NOW() WHERE id = $1', [m.orderId]);
+      }
     } catch {
-      // Ignore timestamp touch failure
+      if (client) {
+        try { await client.query('ROLLBACK TO SAVEPOINT sp_record_msg_touch'); } catch {}
+      }
     }
-    broadcastMessage(m, m.orderId);
+    const targetOrderId = m.orderId;
+    if (client || postgresStore.isActiveTransaction()) {
+      postgresStore.onCommit(() => broadcastMessage(m, targetOrderId));
+    } else {
+      broadcastMessage(m, targetOrderId);
+    }
   }
   return m;
 }
@@ -115,7 +126,13 @@ export function sanitizeAndCreateMessage(
   };
 }
 
-export async function emitSystemEvent(orderId: string, action: string, text: string, metadata: Record<string, any> = {}): Promise<void> {
+export async function emitSystemEvent(
+  orderId: string,
+  action: string,
+  text: string,
+  metadata: Record<string, any> = {},
+  client?: any
+): Promise<void> {
   const sysMsg: Message = {
     id: 'msg_' + randomUUID(),
     orderId,
@@ -126,10 +143,10 @@ export async function emitSystemEvent(orderId: string, action: string, text: str
     type: 'system',
     metadata: { ...metadata, action }
   };
-  await recordMessage(sysMsg);
-  notifyOrderParties(orderId, action, text, sysMsg.id);
+  await recordMessage(sysMsg, client);
+  await notifyOrderParties(orderId, action, text, sysMsg.id, client);
 }
 
-export async function pushSystemMessage(orderId: string, text: string, action = 'system_notice'): Promise<void> {
-  await emitSystemEvent(orderId, action, text);
+export async function pushSystemMessage(orderId: string, text: string, action = 'system_notice', client?: any): Promise<void> {
+  await emitSystemEvent(orderId, action, text, {}, client);
 }

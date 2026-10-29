@@ -4,17 +4,44 @@ import { type Notification } from '../../store.js';
 export class NotificationsRepo {
   constructor(private ctx: RepoContext) {}
 
-  async saveNotification(n: Notification): Promise<{ inserted: boolean; duplicate?: boolean }> {
+  async saveNotification(n: Notification, client?: any): Promise<{ inserted: boolean; duplicate?: boolean }> {
+    const dbRunner = client || this.ctx.getPool();
+    const useSavepoint = Boolean(client);
+    const spName = `sp_notif_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
     try {
-      await this.ctx.getPool().query(
+      if (useSavepoint) {
+        await dbRunner.query(`SAVEPOINT ${spName}`);
+      }
+      if (n.dedupKey) {
+        const res = await dbRunner.query(
+          `INSERT INTO notifications (id, user_id, type, title, message, link, read, created_at, dedup_key)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           ON CONFLICT (dedup_key) DO NOTHING`,
+          [n.id, n.userId, n.type, n.title, n.message, n.link || null, !!n.read, n.createdAt, n.dedupKey]
+        );
+        if (useSavepoint) {
+          await dbRunner.query(`RELEASE SAVEPOINT ${spName}`);
+        }
+        if (res.rowCount === 0) {
+          return { inserted: false, duplicate: true };
+        }
+        return { inserted: true };
+      }
+      await dbRunner.query(
         `INSERT INTO notifications (id, user_id, type, title, message, link, read, created_at, dedup_key)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (id) DO UPDATE SET
            read = EXCLUDED.read`,
-        [n.id, n.userId, n.type, n.title, n.message, n.link || null, !!n.read, n.createdAt, n.dedupKey || null]
+        [n.id, n.userId, n.type, n.title, n.message, n.link || null, !!n.read, n.createdAt, null]
       );
+      if (useSavepoint) {
+        await dbRunner.query(`RELEASE SAVEPOINT ${spName}`);
+      }
       return { inserted: true };
     } catch (err: any) {
+      if (useSavepoint) {
+        try { await dbRunner.query(`ROLLBACK TO SAVEPOINT ${spName}`); } catch {}
+      }
       const isDedupConflict =
         err?.code === '23505' &&
         (err?.constraint?.includes('dedup') ||

@@ -64,12 +64,7 @@ PPH_CATEGORIES.forEach(cat => {
 
 export default function App({ initialPath = '/', initialData }: AppProps) {
   // Navigation / Route state
-  const [currentPath, setCurrentPath] = useState<string>(() => {
-    if (typeof window !== 'undefined') {
-      return window.location.pathname + window.location.search;
-    }
-    return initialPath;
-  });
+  const [currentPath, setCurrentPath] = useState<string>(initialPath);
 
   const navigate = useCallback((to: string, e?: React.MouseEvent) => {
     if (e && (e.button !== 0 || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey)) {
@@ -135,24 +130,12 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
     refresh
   } = appData;
 
-  // Active / Impersonated User state
+  // Active / Impersonated User state (initialized identically on server and client to prevent hydration mismatch)
   const [currentUser, setCurrentUser] = useState<UserAccount | null>(() => {
-    if (typeof window !== 'undefined') {
-      try {
-        const stored = localStorage.getItem('current_user');
-        if (stored) {
-          const parsed = JSON.parse(stored);
-          if (parsed && parsed.id) return parsed;
-        }
-      } catch {}
-    }
     if (initialData?.users && initialData.users.length > 0) {
       const elena = initialData.users.find((u: any) => u.id === 'u3' || u.name?.includes('Elena Rostova'));
       const defaultUser = elena || initialData.users[0];
       if (defaultUser) {
-        if (typeof window !== 'undefined') {
-          localStorage.setItem('current_user', JSON.stringify(defaultUser));
-        }
         return defaultUser;
       }
     }
@@ -241,15 +224,16 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
   }, [loadUserSession, refresh]);
 
   // Liked Gigs state
-  const [likedGigIds, setLikedGigIds] = useState<string[]>(() => {
-    if (typeof window === 'undefined') return [];
-    try {
-      const stored = localStorage.getItem('worksphere_liked_gigs');
-      return stored ? JSON.parse(stored) : [];
-    } catch {
-      return [];
+  const [likedGigIds, setLikedGigIds] = useState<string[]>([]);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const stored = localStorage.getItem('worksphere_liked_gigs');
+        if (stored) setLikedGigIds(JSON.parse(stored));
+      } catch {}
     }
-  });
+  }, []);
 
   const handleToggleLike = useCallback((gigId: string, e?: React.MouseEvent) => {
     if (e) {
@@ -680,7 +664,7 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
             message: `Order #${newOrder.id} placed successfully! Funds are secured in escrow.`,
             orderId: newOrder.id
           });
-          navigate(`/messages/${newOrder.id}`);
+          navigate(`/workstream/${newOrder.id}`);
           void refresh(activeUser.id);
         } else {
           const errData = await res.json().catch(() => ({}));
@@ -708,14 +692,89 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
   );
 
   const handleContactSeller = useCallback(
-    (_freelancerId: string, _freelancerName: string, _gigTitle: string) => {
+    async (freelancerId: string, freelancerName: string, gigTitle?: string, gigId?: string, projectId?: string) => {
       if (!activeUser) {
         setIsLoginModalOpen(true);
         return;
       }
-      navigate('/messages');
+      if (activeUser.id === freelancerId) {
+        setOrderFeedback({
+          type: 'error',
+          message: 'You cannot open an inquiry with yourself.'
+        });
+        return;
+      }
+
+      const rawTitle = (gigTitle || `Consultation with ${freelancerName || 'Seller'}`).trim();
+      const inquiryTitle = /^inquiry:/i.test(rawTitle) ? rawTitle : `Inquiry: ${rawTitle}`;
+
+      try {
+        let token = getAuthToken();
+        const isPrivileged = ['admin', 'super_admin', 'support'].includes(activeUser.role || '');
+        if (!token && !isPrivileged) {
+          const session = await requestDemoSession(activeUser.id);
+          if (session?.token) {
+            token = session.token;
+            setAuthToken(token);
+          }
+        }
+        if (!token) {
+          setIsLoginModalOpen(true);
+          return;
+        }
+
+        const sendInquiryRequest = (tok: string) =>
+          fetch('/api/orders', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-device-id': getDeviceId(),
+              Authorization: `Bearer ${tok}`
+            },
+            body: JSON.stringify({
+              title: inquiryTitle,
+              amount: 0,
+              isInquiry: true,
+              buyerId: activeUser.id,
+              sellerId: freelancerId,
+              ...(gigId ? { gigId } : {}),
+              ...(projectId ? { projectId } : {})
+            })
+          });
+
+        let res = await sendInquiryRequest(token);
+        if (res.status === 401 && !isPrivileged) {
+          const recovered = await requestDemoSession(activeUser.id);
+          if (recovered?.token) {
+            token = recovered.token;
+            setAuthToken(token);
+            res = await sendInquiryRequest(token);
+          }
+        }
+
+        if (res.ok) {
+          const inquiryOrder = await res.json();
+          setOrders(prev => [inquiryOrder, ...prev.filter(o => o.id !== inquiryOrder.id)]);
+          setSelectedOrder(inquiryOrder);
+          workstream.fetchMessages(inquiryOrder.id);
+          navigate(`/workstream/${inquiryOrder.id}`);
+          void refresh(activeUser.id);
+        } else {
+          const errData = await res.json().catch(() => ({}));
+          setOrderFeedback({
+            type: 'error',
+            message: errData.error || 'Failed to open inquiry WorkStream.'
+          });
+        }
+      } catch (err: any) {
+        console.error('Contact seller inquiry failed:', err);
+        setOrderFeedback({
+          type: 'error',
+          message: err?.message || 'Network error while opening inquiry.'
+        });
+      }
     },
-    [activeUser, navigate]
+    [activeUser, navigate, refresh, setOrders, workstream]
   );
 
   // Parse path & route segments
@@ -734,17 +793,62 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
     if (cleanPath === '/forgot-password') setIsForgotPasswordModalOpen(true);
   }, [cleanPath]);
 
+  const resolveOrderFromRouteParam = useCallback(
+    (targetId: string | null) => {
+      if (!targetId) return null;
+      const allItems = workstream.hydratedWorkstreamItems.length > 0 ? workstream.hydratedWorkstreamItems : orders;
+      // 1. Exact Order ID match
+      const exactMatch =
+        workstream.hydratedWorkstreamItems.find(
+          o => o.id === targetId || (o as any).gigOrderId === targetId || (o as any).projectOrderId === targetId
+        ) ||
+        orders.find(
+          o => o.id === targetId || (o as any).gigOrderId === targetId || (o as any).projectOrderId === targetId
+        );
+      if (exactMatch) return exactMatch;
+
+      // 2. Workspace ID match -> resolve deterministically to the most recently updated / active order in that Workspace
+      const wsMatches = allItems.filter(o => o.workspaceId === targetId);
+      if (wsMatches.length > 0) {
+        const sorted = [...wsMatches].sort((a, b) => {
+          const tA = new Date((a as any).updatedAt || a.createdAt || 0).getTime();
+          const tB = new Date((b as any).updatedAt || b.createdAt || 0).getTime();
+          if (tA !== tB) return tA - tB;
+          return a.id.localeCompare(b.id);
+        });
+        return sorted[sorted.length - 1];
+      }
+      return null;
+    },
+    [orders, workstream.hydratedWorkstreamItems]
+  );
+
   useEffect(() => {
-    if ((cleanPath.startsWith('/messages/') || cleanPath.startsWith('/orders/')) && pathParts.length >= 2) {
+    if (
+      (cleanPath.startsWith('/workstream/') ||
+        cleanPath.startsWith('/workspace/') ||
+        cleanPath.startsWith('/messages/') ||
+        cleanPath.startsWith('/orders/')) &&
+      pathParts.length >= 2
+    ) {
       const targetOrderId = pathParts[1];
-      if (targetOrderId && selectedOrder?.id !== targetOrderId) {
-        const matched = orders.find(o => o.id === targetOrderId);
-        if (matched) {
+      if (targetOrderId) {
+        const matched = resolveOrderFromRouteParam(targetOrderId);
+        if (matched && selectedOrder?.id !== matched.id) {
           setSelectedOrder(matched);
         }
       }
+    } else if (
+      cleanPath === '/workstream' ||
+      cleanPath === '/workspace' ||
+      cleanPath === '/messages' ||
+      cleanPath === '/orders'
+    ) {
+      if (selectedOrder !== null) {
+        setSelectedOrder(null);
+      }
     }
-  }, [cleanPath, pathParts, orders, selectedOrder?.id]);
+  }, [cleanPath, pathParts, resolveOrderFromRouteParam, selectedOrder]);
 
   // Route flags
   const isGigsList = cleanPath === '/gigs' || cleanPath.startsWith('/categories');
@@ -811,6 +915,9 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
 
   // Determine current active view
   let mainContent: React.ReactNode = null;
+  const currentSearchQuery = currentPath.includes('?')
+    ? currentPath.slice(currentPath.indexOf('?'))
+    : (initialData?.query ? `?${initialData.query}` : '');
 
   if (cleanPath.startsWith('/admin')) {
     mainContent = (
@@ -893,7 +1000,7 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
         navigate={navigate}
         onOpenWorkstream={(ord) => {
           setSelectedOrder(ord);
-          navigate(`/messages/${ord.id}`);
+          navigate(`/workstream/${ord.id}`);
         }}
       />
     );
@@ -917,14 +1024,15 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
     cleanPath === '/workstream' ||
     cleanPath === '/workspace' ||
     cleanPath.startsWith('/messages/') ||
-    cleanPath.startsWith('/orders/')
+    cleanPath.startsWith('/orders/') ||
+    cleanPath.startsWith('/workstream/') ||
+    cleanPath.startsWith('/workspace/')
   ) {
     const routeOrderId = pathParts.length >= 2 ? pathParts[1] : null;
     const rawActiveOrder = routeOrderId
-      ? workstream.hydratedWorkstreamItems.find(o => o.id === routeOrderId) ||
-        orders.find(o => o.id === routeOrderId) ||
-        (selectedOrder?.id === routeOrderId ? selectedOrder : null)
-      : workstream.selectedOrder || selectedOrder;
+      ? resolveOrderFromRouteParam(routeOrderId) ||
+        (selectedOrder?.id === routeOrderId || selectedOrder?.workspaceId === routeOrderId ? selectedOrder : null)
+      : null;
 
     if (rawActiveOrder) {
       const hydratedActiveOrder = {
@@ -936,23 +1044,64 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
       const workstreamPartner = users.find(
         u => u.id === (activeUser?.id === hydratedActiveOrder.buyerId ? hydratedActiveOrder.sellerId : hydratedActiveOrder.buyerId)
       );
-      const orderSpecificMessages = workstream.messages.filter(m => m.orderId === hydratedActiveOrder.id);
+      const workspaceOrders = hydratedActiveOrder.workspaceId
+        ? workstream.hydratedWorkstreamItems
+            .filter(
+              o =>
+                o.workspaceId === hydratedActiveOrder.workspaceId &&
+                o.buyerId === hydratedActiveOrder.buyerId &&
+                o.sellerId === hydratedActiveOrder.sellerId
+            )
+            .sort((a, b) => {
+              const tA = new Date((a as any).updatedAt || a.createdAt || 0).getTime();
+              const tB = new Date((b as any).updatedAt || b.createdAt || 0).getTime();
+              if (tA !== tB) return tA - tB;
+              return a.id.localeCompare(b.id);
+            })
+        : [hydratedActiveOrder as any];
+      const workspaceOrderIds = new Set(workspaceOrders.map(o => o.id));
+      workspaceOrderIds.add(hydratedActiveOrder.id);
+
+      const workspaceMessages = workstream.messages.filter(
+        m =>
+          workspaceOrderIds.has(m.orderId) ||
+          (Boolean(hydratedActiveOrder.workspaceId) && m.metadata?.workspaceId === hydratedActiveOrder.workspaceId)
+      );
+
       mainContent = (
         <WorkstreamWorkspace
           order={hydratedActiveOrder as any}
-          messages={orderSpecificMessages as any}
+          workspaceOrders={workspaceOrders as any}
+          onSelectOrder={(oid) => {
+            const matched = orders.find(o => o.id === oid);
+            if (matched) setSelectedOrder(matched);
+            navigate(`/workstream/${oid}`);
+          }}
+          messages={workspaceMessages as any}
           files={workstream.activeSharedFiles}
           currentUser={activeUser}
           usersList={users}
           partner={workstreamPartner}
           onBack={() => {
             setSelectedOrder(null);
-            navigate('/messages');
+            navigate('/workstream');
           }}
           onSendMessage={workstream.sendMessage}
           onAttachFile={(file) => workstream.sendMessage(`Attached file: ${file.name}`, 'file', file)}
           sendEvent={workstream.sendEvent}
-          onOrderChanged={() => {
+          onOrderChanged={(updatedOrder, newOrder) => {
+            const targetOrder = newOrder || updatedOrder;
+            if (targetOrder && targetOrder.id) {
+              setOrders(prev => {
+                const withoutTarget = prev.filter(o => o.id !== targetOrder.id);
+                return [targetOrder, ...withoutTarget];
+              });
+              setSelectedOrder(targetOrder);
+              if (newOrder?.id && newOrder.id !== hydratedActiveOrder.id) {
+                workstream.fetchMessages(newOrder.id);
+                navigate(`/workstream/${newOrder.id}`);
+              }
+            }
             if (activeUser?.id) void refresh(activeUser.id);
           }}
           onReleaseEscrow={workstream.handleReleaseEscrow}
@@ -968,11 +1117,12 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
         <div className="max-w-7xl mx-auto py-8 px-4">
           <WorkstreamList
             workstreams={workstream.hydratedWorkstreamItems}
+            currentUser={activeUser}
             selectedOrderId={selectedOrder?.id}
             onSelectOrder={(id: string) => {
               const matched = orders.find(o => o.id === id);
               setSelectedOrder(matched || null);
-              navigate(`/messages/${id}`);
+              navigate(`/workstream/${id}`);
             }}
             starredIds={starredOrderIds}
             onToggleStar={toggleStarOrder}
@@ -989,7 +1139,7 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
         projects={projects}
         navigate={navigate}
         currentUser={activeUser}
-        query={typeof window !== 'undefined' ? window.location.search : ''}
+        query={currentSearchQuery}
       />
     );
   } else if (isFreelancersList) {
@@ -1001,7 +1151,7 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
         currentUser={activeUser}
         setIsSignupModalOpen={setIsSignupModalOpen}
         slugify={slugify}
-        query={typeof window !== 'undefined' ? window.location.search : ''}
+        query={currentSearchQuery}
       />
     );
   } else if (isProjectDetail) {
@@ -1075,7 +1225,7 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
           navigate={navigate}
           onOpenWorkstream={(ord) => {
             setSelectedOrder(ord);
-            navigate(`/messages/${ord.id}`);
+            navigate(`/workstream/${ord.id}`);
           }}
           onBalanceUpdate={refresh}
         />
@@ -1098,6 +1248,7 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
             gigs={gigs}
             reviews={reviews}
             onNavigate={navigate}
+            onContact={() => handleContactSeller(matchedUser.id, matchedUser.name, `Consultation with ${matchedUser.name}`)}
           />
         </div>
       );
@@ -1192,10 +1343,10 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
                 }`}
               />
               <span className="font-bold">{orderFeedback.message}</span>
-              {orderFeedback.orderId && cleanPath !== `/messages/${orderFeedback.orderId}` && (
+              {orderFeedback.orderId && cleanPath !== `/workstream/${orderFeedback.orderId}` && cleanPath !== `/messages/${orderFeedback.orderId}` && (
                 <button
                   type="button"
-                  onClick={(e) => navigate(`/messages/${orderFeedback.orderId}`, e)}
+                  onClick={(e) => navigate(`/workstream/${orderFeedback.orderId}`, e)}
                   className="underline font-bold text-emerald-700 hover:text-emerald-900 cursor-pointer ml-1"
                 >
                   View Workstream #{orderFeedback.orderId}

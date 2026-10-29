@@ -6,6 +6,7 @@ import { DEFAULT_AVATAR } from '../../constants';
 
 interface WorkstreamListProps {
   workstreams: WorkstreamItem[];
+  currentUser?: { id: string; role?: string } | null;
   selectedOrderId?: string;
   onSelectOrder: (orderId: string) => void;
   starredIds: string[];
@@ -24,6 +25,7 @@ interface WorkstreamListProps {
 
 export const WorkstreamList: React.FC<WorkstreamListProps> = ({
   workstreams,
+  currentUser,
   selectedOrderId,
   onSelectOrder,
   starredIds,
@@ -190,6 +192,7 @@ export const WorkstreamList: React.FC<WorkstreamListProps> = ({
                   const isStarred = starredIds.includes(w.id);
                   const isChecked = selectedCheckboxes.includes(w.id);
                   const isCurrent = selectedOrderId === w.id;
+                  const partner = currentUser?.id && w.sellerId === currentUser.id ? (w.buyer || w.seller) : (w.seller || w.buyer);
 
                   return (
                     <tr
@@ -222,14 +225,14 @@ export const WorkstreamList: React.FC<WorkstreamListProps> = ({
                       <td className="py-4 px-4">
                         <div className="flex items-center gap-3">
                           <img
-                            src={w.seller?.avatar || DEFAULT_AVATAR}
+                            src={partner?.avatar || DEFAULT_AVATAR}
                             className="w-8 h-8 rounded-full object-cover ring-1 ring-slate-200 shrink-0"
-                            alt={w.seller?.name || 'Partner'}
+                            alt={partner?.name || 'Partner'}
                             onError={(e) => { (e.target as HTMLImageElement).src = DEFAULT_AVATAR; }}
                           />
                           <div className="min-w-0">
                             <span className="font-bold text-fiverr-dark truncate block">
-                              {w.seller?.name || 'Collaborator'}
+                              {partner?.name || 'Collaborator'}
                             </span>
                             <span className="text-[10px] text-slate-400 font-mono">
                               Order #{w.id}

@@ -51,11 +51,17 @@ export function sendEmail(to: string, subject: string, text: string) {
     .catch(err => console.error('[email] send failed:', err?.message || err));
 }
 
-export async function sendOrderEmail(userId: string, subject: string, body: string, path?: string) {
-  const user = await store.getUser(userId);
+export async function sendOrderEmail(userId: string, subject: string, body: string, path?: string, client?: any) {
+  const user = await store.getUser(userId, client);
   if (!user || !user.email) return;
   const link = path && APP_URL ? `\n\nOpen the order: ${APP_URL}${path}` : '';
-  sendEmail(user.email, subject, `${body}${link}\n\n- WorkPerHour`);
+  const targetEmail = user.email;
+  const fullText = `${body}${link}\n\n- WorkPerHour`;
+  if (client || postgresStore.isActiveTransaction()) {
+    postgresStore.onCommit(() => sendEmail(targetEmail, subject, fullText));
+  } else {
+    sendEmail(targetEmail, subject, fullText);
+  }
 }
 
 export async function recordUserEmail(email: UserEmail): Promise<void> {
@@ -78,7 +84,8 @@ export async function createNotification({
   message,
   link,
   dedupKey,
-  actorId
+  actorId,
+  client
 }: {
   userId: string;
   type: string;
@@ -88,7 +95,8 @@ export async function createNotification({
   dedupKey?: string;
   actorId?: string;
   metadata?: any;
-}): Promise<void> {
+  client?: any;
+}, externalClient?: any): Promise<void> {
   if (actorId && actorId === userId) return;
   if (!userId) return;
 
@@ -104,8 +112,9 @@ export async function createNotification({
     dedupKey: dedupKey || undefined
   };
 
+  const dbClient = externalClient || client;
   try {
-    const saveResult = await postgresStore.saveNotification(newNotif);
+    const saveResult = await postgresStore.saveNotification(newNotif, dbClient);
     if (saveResult && saveResult.duplicate) {
       return;
     }
@@ -114,7 +123,11 @@ export async function createNotification({
     throw err;
   }
 
-  broadcastNotificationToUser(userId, newNotif);
+  if (dbClient || postgresStore.isActiveTransaction()) {
+    postgresStore.onCommit(() => broadcastNotificationToUser(userId, newNotif));
+  } else {
+    broadcastNotificationToUser(userId, newNotif);
+  }
 }
 
 export function notifyUser(message: Message, targetUserId: string) {
@@ -135,8 +148,8 @@ export function notifyUser(message: Message, targetUserId: string) {
   }
 }
 
-export async function notifyOrderParties(orderId: string, action: string, text: string, msgId: string) {
-  const order = await store.getOrder(orderId);
+export async function notifyOrderParties(orderId: string, action: string, text: string, msgId: string, client?: any) {
+  const order = await store.getOrder(orderId, client);
   if (!order) return;
   const map: Record<string, { to: ('buyer'|'seller')[]; title: string }> = {
     order_created:        { to: ['seller'],           title: 'New Order Received' },
@@ -154,14 +167,15 @@ export async function notifyOrderParties(orderId: string, action: string, text: 
   if (!rule) return;
   for (const who of rule.to) {
     const userId = who === 'buyer' ? order.buyerId : order.sellerId;
-    createNotification({
+    await createNotification({
       userId,
       type: 'order',
       title: rule.title,
       message: text,
-      link: `/messages/${orderId}`,
-      dedupKey: `${action}_${msgId}_${userId}`
-    });
+      link: `/workstream/${orderId}`,
+      dedupKey: `${action}_${msgId}_${userId}`,
+      client
+    }, client);
   }
 }
 

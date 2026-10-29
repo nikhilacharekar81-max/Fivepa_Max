@@ -31,7 +31,8 @@ import {
   rateLimit,
   resolveAuthenticatedUserId,
   IS_PRODUCTION,
-  formatApiError
+  formatApiError,
+  areSimulatedDepositsAllowed
 } from '../../middleware/auth.js';
 import {
   orderStateLocks,
@@ -61,14 +62,10 @@ import {
   processPayout,
   rejectPayout,
   failPayout,
-  retryPayout
+  retryPayout,
+  formatPayoutRow
 } from './payout.service.js';
 import { DEFAULT_FEE_CONFIG, calculateOrderFees, quoteOrderWithLiveSettings } from './fees.js';
-
-function areSimulatedDepositsAllowed(): boolean {
-  if (process.env.NODE_ENV === 'production') return false;
-  return true;
-}
 
 function formatRefundRow(r: any): Refund {
   return {
@@ -80,10 +77,6 @@ function formatRefundRow(r: any): Refund {
     status: r.status,
     createdAt: r.created_at
   };
-}
-
-function formatPayoutRow(r: any): Payout {
-  return mapPayoutRow(r);
 }
 
 function formatPaymentMethodRow(r: any): PaymentMethodRecord {
@@ -267,12 +260,14 @@ router.get('/payments/user/:userId', requireAuth, async (req: Request, res: Resp
     const paidToDate = userPaidOrders.reduce((sum, o) => sum + (o.amount || 0), 0);
     const paidThisMonth = userPaidOrders.filter(o => (o.createdAt || '').startsWith(currentYearMonth)).reduce((sum, o) => sum + (o.amount || 0), 0);
 
+    const resolveOrderNet = (o: Order) =>
+      Number((o.feeBreakdown as any)?.freelancerNet ?? calculateOrderFees(o.amount).freelancerNet);
     const userEarnedOrders = userOrders.filter(o => o.sellerId === userId && o.status === 'completed');
-    const earnedToDate = Number(u?.earned || 0) || userEarnedOrders.reduce((sum, o) => sum + financeLedger.quoteOrder(o.amount).freelancerNet, 0);
-    const earnedThisMonth = userEarnedOrders.filter(o => (o.createdAt || '').startsWith(currentYearMonth)).reduce((sum, o) => sum + financeLedger.quoteOrder(o.amount).freelancerNet, 0);
+    const earnedToDate = Number(u?.earned || 0) || userEarnedOrders.reduce((sum, o) => sum + resolveOrderNet(o), 0);
+    const earnedThisMonth = userEarnedOrders.filter(o => (o.createdAt || '').startsWith(currentYearMonth)).reduce((sum, o) => sum + resolveOrderNet(o), 0);
     const earnedPastTwoMonths = userEarnedOrders
       .filter(o => (o.completedAt || o.createdAt || '') >= twoMonthsAgoDate)
-      .reduce((sum, o) => sum + financeLedger.quoteOrder(o.amount).freelancerNet, 0);
+      .reduce((sum, o) => sum + resolveOrderNet(o), 0);
 
     let userMethods: PaymentMethodRecord[] = [];
     try {
@@ -501,8 +496,8 @@ router.post('/payments/deposit', requireAuth, requireFinancialActiveStatus, rate
     const newBalance = await financialRepository.getWalletBalance(targetUserId);
     const transaction = { id: `SIM-TXN-${key}` };
 
-    registerAuditLog({
-      id: 'log_' + Date.now(),
+    await registerAuditLog({
+      id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
       actor: caller.name,
       role: caller.role,
       action: 'FUNDS_DEPOSITED',
@@ -536,7 +531,7 @@ router.post('/payments/gateway/checkout', requireAuth, rateLimit(10, 60_000), as
     }
 
     const requestedPurpose = String(purpose || 'deposit').trim().toLowerCase();
-    if (!['deposit', 'order_payment', 'order'].includes(requestedPurpose)) {
+    if (!['deposit', 'order_payment', 'order', 'order_escrow'].includes(requestedPurpose)) {
       return res.status(400).json({ error: `Invalid checkout purpose "${purpose}".` });
     }
 
@@ -544,7 +539,7 @@ router.post('/payments/gateway/checkout', requireAuth, rateLimit(10, 60_000), as
       ? String(orderId).trim()
       : null;
 
-    if ((requestedPurpose === 'order_payment' || requestedPurpose === 'order') && !normalizedOrderId) {
+    if ((requestedPurpose === 'order_payment' || requestedPurpose === 'order' || requestedPurpose === 'order_escrow') && !normalizedOrderId) {
       return res.status(400).json({ error: 'orderId is required when checkout purpose is order payment.' });
     }
 
@@ -665,6 +660,70 @@ const handlePaymentWebhook = async (req: Request, res: Response) => {
   const lookupOrderKey = payload?.orderId ? String(payload.orderId).trim() : null;
 
   try {
+    // Pre-fetch and verify candidate checkout session strictly OUTSIDE the database transaction
+    // so external provider HTTP verification never holds database locks.
+    const pool = postgresStore.getPool();
+    const existingCompletedTx = await pool.query(
+      "SELECT id FROM payment_checkout_sessions WHERE provider_tx_id = $1 AND status = 'completed' LIMIT 1",
+      [txId]
+    );
+    if (existingCompletedTx.rows.length > 0) {
+      return res.json({ received: true, replayed: true });
+    }
+
+    let preSess: any = null;
+    if (lookupSessionKey) {
+      const preRes = await pool.query(
+        'SELECT * FROM payment_checkout_sessions WHERE id = $1 OR provider_tx_id = $1 LIMIT 1',
+        [lookupSessionKey]
+      );
+      if (preRes.rows.length > 0) preSess = preRes.rows[0];
+    }
+    if (!preSess) {
+      const preByTx = await pool.query(
+        'SELECT * FROM payment_checkout_sessions WHERE provider_tx_id = $1 LIMIT 1',
+        [txId]
+      );
+      if (preByTx.rows.length > 0) preSess = preByTx.rows[0];
+    }
+    if (!preSess && !lookupSessionKey && lookupOrderKey) {
+      const preByOrd = await pool.query(
+        "SELECT * FROM payment_checkout_sessions WHERE order_id = $1 AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+        [lookupOrderKey]
+      );
+      if (preByOrd.rows.length > 0) preSess = preByOrd.rows[0];
+    }
+
+    if (!preSess) {
+      return res.status(400).json({ error: 'Cannot process payment webhook: no matching stored checkout session found.' });
+    }
+
+    const preExpectedAmount = Number(preSess.expected_amount);
+    if (!preSess.user_id || !Number.isFinite(preExpectedAmount) || preExpectedAmount <= 0) {
+      return res.status(400).json({ error: 'Stored checkout session has invalid user or expected amount.' });
+    }
+    if (!preSess.currency || preSess.currency !== 'USD') {
+      return res.status(400).json({ error: 'Checkout session currency mismatch: must be USD.' });
+    }
+    if (preSess.gateway && String(preSess.gateway).toLowerCase() !== gateway) {
+      return res.status(400).json({ error: 'Checkout session gateway mismatch.' });
+    }
+
+    let preVerifiedSessionId: string | null = null;
+    if (preSess.status === 'pending') {
+      const preVerify = await paymentGatewayManager.verifyPaymentEvent({
+        gateway: preSess.gateway || gateway,
+        sessionId: preSess.provider_tx_id || preSess.id,
+        transactionId: txId,
+        expectedAmount: preExpectedAmount,
+        expectedCurrency: 'USD'
+      });
+      if (!preVerify.verified) {
+        return res.status(400).json({ error: `Provider payment verification failed: ${preVerify.error}` });
+      }
+      preVerifiedSessionId = String(preSess.id);
+    }
+
     const result = await postgresStore.executeInTransaction(async (client) => {
       // 1. Durably check if provider transaction ID was already processed in completed checkout sessions
       const existingTx = await client.query(
@@ -675,35 +734,12 @@ const handlePaymentWebhook = async (req: Request, res: Response) => {
         return { received: true, replayed: true };
       }
 
-      // 2. Locate and lock the authoritative stored checkout session (FAIL CLOSED if no stored session matches)
-      let sess: any = null;
-      if (lookupSessionKey) {
-        const sessRes = await client.query(
-          'SELECT * FROM payment_checkout_sessions WHERE id = $1 OR provider_tx_id = $1 FOR UPDATE',
-          [lookupSessionKey]
-        );
-        if (sessRes.rows.length > 0) {
-          sess = sessRes.rows[0];
-        }
-      }
-      if (!sess) {
-        const byTxRes = await client.query(
-          'SELECT * FROM payment_checkout_sessions WHERE provider_tx_id = $1 FOR UPDATE',
-          [txId]
-        );
-        if (byTxRes.rows.length > 0) {
-          sess = byTxRes.rows[0];
-        }
-      }
-      if (!sess && !lookupSessionKey && lookupOrderKey) {
-        const byOrderRes = await client.query(
-          "SELECT * FROM payment_checkout_sessions WHERE order_id = $1 AND status = 'pending' ORDER BY created_at DESC LIMIT 1 FOR UPDATE",
-          [lookupOrderKey]
-        );
-        if (byOrderRes.rows.length > 0) {
-          sess = byOrderRes.rows[0];
-        }
-      }
+      // 2. Lock the exact verified checkout session row
+      const lockedSessRes = await client.query(
+        'SELECT * FROM payment_checkout_sessions WHERE id = $1 FOR UPDATE',
+        [preSess.id]
+      );
+      const sess: any = lockedSessRes.rows[0] || null;
 
       if (!sess) {
         throw { status: 400, message: 'Cannot process payment webhook: no matching stored checkout session found.' };
@@ -740,7 +776,7 @@ const handlePaymentWebhook = async (req: Request, res: Response) => {
       if (lookupOrderKey && !authoritativeOrderId) {
         throw { status: 400, message: 'Checkout session is not linked to an order.' };
       }
-      if (payload?.purpose && ['order_payment', 'order'].includes(String(payload.purpose)) && !authoritativeOrderId) {
+      if (payload?.purpose && ['order_payment', 'order', 'order_escrow'].includes(String(payload.purpose)) && !authoritativeOrderId) {
         throw { status: 400, message: 'Checkout session is not an order payment session.' };
       }
 
@@ -772,22 +808,14 @@ const handlePaymentWebhook = async (req: Request, res: Response) => {
         throw { status: 400, message: `Checkout session already in status ${sess.status}` };
       }
 
-      // 4. Direct Provider API Object Authenticity Verification
-      const liveVerification = await paymentGatewayManager.verifyPaymentEvent({
-        gateway: sess.gateway || gateway,
-        sessionId: sess.provider_tx_id || sess.id,
-        transactionId: txId,
-        expectedAmount: authoritativeAmount,
-        expectedCurrency: 'USD'
-      });
-
-      if (!liveVerification.verified) {
-        throw { status: 400, message: `Provider payment verification failed: ${liveVerification.error}` };
+      // 4. Confirm session was verified outside the transaction and its amount/currency did not mutate
+      if (preVerifiedSessionId !== String(sess.id) || Math.round(authoritativeAmount * 100) !== Math.round(preExpectedAmount * 100)) {
+        throw { status: 409, message: 'Checkout session state changed concurrently during verification.' };
       }
 
       // 5. If linked to an Order, validate Order ownership, status, and authoritative total BEFORE crediting/settling
       let lockedOrder: any = null;
-      const isOrderPayment = Boolean(authoritativeOrderId) || authoritativePurpose === 'order_payment' || authoritativePurpose === 'order';
+      const isOrderPayment = Boolean(authoritativeOrderId) || ['order_payment', 'order', 'order_escrow'].includes(authoritativePurpose);
       if (isOrderPayment) {
         if (!authoritativeOrderId) {
           throw { status: 400, message: 'Order payment checkout session is missing order_id.' };
@@ -876,93 +904,132 @@ router.post('/payments/escrow/release', requireAuth, requireFinancialActiveStatu
     const pool = postgresStore.getPool();
     const callerRes = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
     const caller = callerRes.rows[0];
-    const order = await store.getOrder(orderId);
-    if (!order) return res.status(404).json({ error: 'Order not found' });
+    const initialOrder = await store.getOrder(orderId);
+    if (!initialOrder) return res.status(404).json({ error: 'Order not found' });
 
     const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin';
-    const isBuyer = userId === order.buyerId;
+    const isBuyer = userId === initialOrder.buyerId;
     if (!isAdmin && !isBuyer) {
       return res.status(403).json({ error: 'Forbidden: Only the order buyer or administrator can release escrow.' });
     }
 
-    const validationError = validateOrderReleasePreconditions(order, isAdmin);
+    const validationError = validateOrderReleasePreconditions(initialOrder, isAdmin);
     if (validationError) {
       return res.status(validationError.status).json({ error: validationError.error });
     }
 
-    let revisionsResolved = false;
-    if (Array.isArray(order.revisions)) {
-      for (const rev of order.revisions) {
-        if (rev.status === 'requested') {
-          rev.status = 'resolved';
-          revisionsResolved = true;
-        }
-      }
-    }
-    if (revisionsResolved) {
-      const sysMsg: Message = {
-        id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
-        orderId: order.id,
-        senderId: 'system',
-        senderName: 'WorkSphere Review Desk',
-        text: `📝 Revision resolved by buyer.`,
-        timestamp: new Date().toISOString(),
-        type: 'system',
-        metadata: { action: 'revision_resolved' }
-      };
-      await recordMessage(sysMsg);
-    }
-
-    const esc = await financialRepository.getEscrow(order.id);
-    if (!esc || esc.remaining <= 0 || esc.status === 'released' || esc.status === 'refunded') {
-      return res.status(400).json({ error: 'No refundable or releasable escrow funds remain for this order.' });
-    }
-
-    const pendingOffersRes = await pool.query(
-      "SELECT * FROM workstream_offers WHERE order_id = $1 AND kind = 'invoice' AND status = 'pending'",
-      [order.id]
-    );
-    const pendingInvoices = pendingOffersRes.rows;
-
-    const pendingHigherInvoice = pendingInvoices.find(o => Number(o.amount) > esc.remaining);
-    if (pendingHigherInvoice) {
-      return res.status(400).json({
-        error: `Cannot release escrow directly: A final invoice (${pendingHigherInvoice.number} for $${pendingHigherInvoice.amount}) is awaiting payment. Please pay or decline the invoice in the workstream.`
-      });
-    }
-
-    const pendingMatchingInvoice = pendingInvoices[0];
-
-    const seller = await store.getUser(order.sellerId);
-    const buyer = await store.getUser(order.buyerId);
+    const seller = await store.getUser(initialOrder.sellerId);
+    const buyer = await store.getUser(initialOrder.buyerId);
 
     if (seller) await ensureWallet(seller.id);
     if (buyer) await ensureWallet(buyer.id);
 
     const actorName = isAdmin ? adminActor(req) : (buyer?.name || 'Authorized Buyer');
     const requestKey = req.body?.requestKey || req.body?.idempotencyKey;
-    const result = await releaseOrderFunds(order, actorName, 'Buyer approved work', true, requestKey);
 
-    if (pendingMatchingInvoice) {
-      await pool.query(
-        "UPDATE workstream_offers SET status = 'paid', resolved_at = $1, resolved_by = $2 WHERE id = $3",
-        [new Date().toISOString(), caller?.id || userId, pendingMatchingInvoice.id]
+    const txResult = await postgresStore.executeInTransaction(async (client) => {
+      const orderLockRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+      if (orderLockRes.rows.length === 0) {
+        const err: any = new Error('Order not found');
+        err.statusCode = 404;
+        throw err;
+      }
+      const order = (store as any).mapOrderRow ? (store as any).mapOrderRow(orderLockRes.rows[0]) : await store.getOrder(orderId, client);
+      if (!order) {
+        const err: any = new Error('Order not found');
+        err.statusCode = 404;
+        throw err;
+      }
+
+      const txValidationError = validateOrderReleasePreconditions(order, isAdmin);
+      if (txValidationError) {
+        const err: any = new Error(txValidationError.error);
+        err.statusCode = txValidationError.status;
+        throw err;
+      }
+
+      const activeDispRes = await client.query(
+        "SELECT 1 FROM disputes WHERE order_id = $1 AND status IN ('open', 'under_investigation', 'under_review') LIMIT 1",
+        [order.id]
       );
-    }
+      if (!isAdmin && activeDispRes.rows.length > 0) {
+        const err: any = new Error('Cannot release escrow: Order has an active unresolved dispute.');
+        err.statusCode = 400;
+        throw err;
+      }
 
-    registerAuditLog({
-      id: 'log_' + Date.now(),
-      actor: actorName,
-      role: caller?.role || 'buyer',
-      action: 'ESCROW_RELEASED_BY_BUYER',
-      target: `Order #${order.id}`,
-      details: `Escrow release authorized of $${order.amount}. $${result.freelancerNet} credited to ${seller?.name || 'freelancer'}, $${result.platformFee} platform fee.`,
-      timestamp: new Date().toLocaleString()
+      let revisionsResolved = false;
+      if (Array.isArray(order.revisions)) {
+        for (const rev of order.revisions) {
+          if (rev.status === 'requested') {
+            rev.status = 'resolved';
+            revisionsResolved = true;
+          }
+        }
+      }
+      if (revisionsResolved) {
+        const sysMsg: Message = {
+          id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+          orderId: order.id,
+          senderId: 'system',
+          senderName: 'WorkSphere Review Desk',
+          text: `📝 Revision resolved by buyer.`,
+          timestamp: new Date().toISOString(),
+          type: 'system',
+          metadata: { action: 'revision_resolved' }
+        };
+        await recordMessage(sysMsg, client);
+      }
+
+      const escRes = await client.query('SELECT * FROM escrows WHERE order_id = $1 FOR UPDATE', [order.id]);
+      const esc = escRes.rows[0];
+      if (!esc || Number(esc.remaining) <= 0 || esc.status === 'released' || esc.status === 'refunded') {
+        const err: any = new Error('No refundable or releasable escrow funds remain for this order.');
+        err.statusCode = 400;
+        throw err;
+      }
+
+      const pendingOffersRes = await client.query(
+        "SELECT * FROM workstream_offers WHERE order_id = $1 AND kind = 'invoice' AND status = 'pending' FOR UPDATE",
+        [order.id]
+      );
+      const pendingInvoices = pendingOffersRes.rows;
+
+      const pendingHigherInvoice = pendingInvoices.find(o => Number(o.amount) > Number(esc.remaining));
+      if (pendingHigherInvoice) {
+        const err: any = new Error(
+          `Cannot release escrow directly: A final invoice (${pendingHigherInvoice.number} for $${pendingHigherInvoice.amount}) is awaiting payment. Please pay or decline the invoice in the workstream.`
+        );
+        err.statusCode = 400;
+        throw err;
+      }
+
+      const pendingMatchingInvoice = pendingInvoices[0];
+      const result = await releaseOrderFunds(order, actorName, 'Buyer approved work', true, requestKey, isAdmin, client);
+
+      if (pendingMatchingInvoice) {
+        await client.query(
+          "UPDATE workstream_offers SET status = 'paid', resolved_at = $1, resolved_by = $2 WHERE id = $3",
+          [new Date().toISOString(), caller?.id || userId, pendingMatchingInvoice.id]
+        );
+      }
+
+      await registerAuditLog({
+        id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
+        actor: actorName,
+        role: caller?.role || 'buyer',
+        action: 'ESCROW_RELEASED_BY_BUYER',
+        target: `Order #${order.id}`,
+        details: `Escrow release authorized of $${order.amount}. $${result.freelancerNet} credited to ${seller?.name || 'freelancer'}, $${result.platformFee} platform fee.`,
+        timestamp: new Date().toLocaleString()
+      }, client);
+
+      return { order, result };
     });
 
-    res.json({ success: true, order: enrichOrderWithServiceInfo(order), freelancerNet: result.freelancerNet, platformFee: result.platformFee });
+    res.json({ success: true, order: enrichOrderWithServiceInfo(txResult.order), freelancerNet: txResult.result.freelancerNet, platformFee: txResult.result.platformFee });
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    res.status(err?.statusCode || 400).json({ error: err.message });
   } finally {
     releaseOrderLock(orderId);
   }
@@ -978,67 +1045,102 @@ router.post('/payments/escrow/refund', requireAuth, async (req: Request, res: Re
     const callerRes = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
     const caller = callerRes.rows[0];
     const { reason } = req.body;
-    const order = await store.getOrder(orderId);
-    if (!order) return res.status(404).json({ error: 'Order not found' });
+    const initialOrder = await store.getOrder(orderId);
+    if (!initialOrder) return res.status(404).json({ error: 'Order not found' });
 
-    const activeDispute = await store.getDisputeByOrderId(order.id);
-    if ((activeDispute && (activeDispute.status === 'open' || activeDispute.status === 'under_investigation')) || order.status === 'disputed') {
-      return res.status(400).json({ error: 'Cannot refund escrow: Order is under active dispute.' });
-    }
-    if (order.status === 'completed') {
-      return res.status(400).json({ error: 'Cannot refund: Order has already been completed.' });
-    }
-    if (order.status === 'cancelled') {
-      return res.status(400).json({ error: 'Cannot refund: Order has already been cancelled/refunded.' });
-    }
-
-    const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin';
-    const isSeller = userId === order.sellerId;
-    const isBuyer = userId === order.buyerId;
-
-    if (isBuyer && !isAdmin && ['delivered', 'draft_review'].includes(order.status)) {
-      return res.status(403).json({ error: 'Work has been delivered. Accept it, request a revision, or open a dispute.' });
-    }
-
-    const isGigOrder = order.orderType === 'gig' || Boolean(order.gigOrderId);
-    if (isGigOrder && isSeller && !isAdmin) return res.status(403).json({ error: 'Sellers must use the cancellation request.' });
-    const overdueThresholdHours = LATE_ORDER_PROTECTION_HOURS;
-    const deadlineMs = parseDeadlineInstant(order.dueDate, order.createdAt);
-    const isOverdueByThreshold = deadlineMs !== null ? (Date.now() > deadlineMs + overdueThresholdHours * 60 * 60 * 1000) : false;
-
-    if (!isAdmin && !isSeller) {
-      if (isBuyer && isOverdueByThreshold) {
-        if (isGigOrder && (!reason || !String(reason).trim())) {
-          return res.status(400).json({ error: 'Cancellation reason is required for very-late cancellation.' });
-        }
-        order.cancellationType = 'very_late';
-      } else if (isBuyer) {
-        return res.status(403).json({ error: `Forbidden: Buyer cannot cancel this order until ${overdueThresholdHours} hours have passed past the agreed due date.` });
-      } else {
-        return res.status(403).json({ error: 'Forbidden: Not authorized to refund this escrow.' });
-      }
-    }
-
-    const buyer = await store.getUser(order.buyerId);
+    const buyer = await store.getUser(initialOrder.buyerId);
     if (buyer) await ensureWallet(buyer.id);
 
-    const actorName = isAdmin ? adminActor(req) : (caller?.name || (isSeller ? 'Seller' : 'Buyer'));
-    const requestKey = req.body?.requestKey || req.body?.idempotencyKey || `REFUND-FULL-${order.id}-${order.amount}`;
-    const result = await refundOrderFunds(order, undefined, actorName, reason || (isSeller ? 'Seller cancelled order' : 'Escrow cancellation'), requestKey);
+    const txResult = await postgresStore.executeInTransaction(async (client) => {
+      const orderLockRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+      if (orderLockRes.rows.length === 0) {
+        const err: any = new Error('Order not found');
+        err.statusCode = 404;
+        throw err;
+      }
+      const order = (store as any).mapOrderRow ? (store as any).mapOrderRow(orderLockRes.rows[0]) : await store.getOrder(orderId, client);
+      if (!order) {
+        const err: any = new Error('Order not found');
+        err.statusCode = 404;
+        throw err;
+      }
 
-    registerAuditLog({
-      id: 'log_' + Date.now(),
-      actor: actorName,
-      role: caller?.role || (isSeller ? 'seller' : 'buyer'),
-      action: isSeller ? 'ESCROW_REFUNDED_BY_SELLER' : (isAdmin ? 'ESCROW_REFUNDED_BY_ADMIN' : 'ESCROW_REFUNDED_BY_BUYER'),
-      target: `Order #${order.id}`,
-      details: `Escrow refund executed of $${result.refunded} to buyer wallet. Reason: ${reason || 'Escrow cancellation'}`,
-      timestamp: new Date().toLocaleString()
+      const activeDispute = await store.getDisputeByOrderId(order.id, client);
+      if ((activeDispute && (activeDispute.status === 'open' || activeDispute.status === 'under_investigation' || (activeDispute.status as string) === 'under_review')) || order.status === 'disputed') {
+        const err: any = new Error('Cannot refund escrow: Order is under active dispute.');
+        err.statusCode = 400;
+        throw err;
+      }
+      if (order.status === 'completed') {
+        const err: any = new Error('Cannot refund: Order has already been completed.');
+        err.statusCode = 400;
+        throw err;
+      }
+      if (order.status === 'cancelled') {
+        const err: any = new Error('Cannot refund: Order has already been cancelled/refunded.');
+        err.statusCode = 400;
+        throw err;
+      }
+
+      const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin';
+      const isSeller = userId === order.sellerId;
+      const isBuyer = userId === order.buyerId;
+
+      if (isBuyer && !isAdmin && ['delivered', 'draft_review'].includes(order.status)) {
+        const err: any = new Error('Work has been delivered. Accept it, request a revision, or open a dispute.');
+        err.statusCode = 403;
+        throw err;
+      }
+
+      const isGigOrder = order.orderType === 'gig' || Boolean(order.gigOrderId);
+      if (isGigOrder && isSeller && !isAdmin) {
+        const err: any = new Error('Sellers must use the cancellation request.');
+        err.statusCode = 403;
+        throw err;
+      }
+      const overdueThresholdHours = LATE_ORDER_PROTECTION_HOURS;
+      const deadlineMs = parseDeadlineInstant(order.dueDate, order.createdAt);
+      const isOverdueByThreshold = deadlineMs !== null ? (Date.now() > deadlineMs + overdueThresholdHours * 60 * 60 * 1000) : false;
+
+      if (!isAdmin && !isSeller) {
+        if (isBuyer && isOverdueByThreshold) {
+          if (isGigOrder && (!reason || !String(reason).trim())) {
+            const err: any = new Error('Cancellation reason is required for very-late cancellation.');
+            err.statusCode = 400;
+            throw err;
+          }
+          order.cancellationType = 'very_late';
+        } else if (isBuyer) {
+          const err: any = new Error(`Forbidden: Buyer cannot cancel this order until ${overdueThresholdHours} hours have passed past the agreed due date.`);
+          err.statusCode = 403;
+          throw err;
+        } else {
+          const err: any = new Error('Forbidden: Not authorized to refund this escrow.');
+          err.statusCode = 403;
+          throw err;
+        }
+      }
+
+      const actorName = isAdmin ? adminActor(req) : (caller?.name || (isSeller ? 'Seller' : 'Buyer'));
+      const requestKey = req.body?.requestKey || req.body?.idempotencyKey || `REFUND-FULL-${order.id}-${order.amount}`;
+      const result = await refundOrderFunds(order, undefined, actorName, reason || (isSeller ? 'Seller cancelled order' : 'Escrow cancellation'), requestKey, undefined, false, client);
+
+      await registerAuditLog({
+        id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
+        actor: actorName,
+        role: caller?.role || (isSeller ? 'seller' : 'buyer'),
+        action: isSeller ? 'ESCROW_REFUNDED_BY_SELLER' : (isAdmin ? 'ESCROW_REFUNDED_BY_ADMIN' : 'ESCROW_REFUNDED_BY_BUYER'),
+        target: `Order #${order.id}`,
+        details: `Escrow refund executed of $${result.refunded} to buyer wallet. Reason: ${reason || 'Escrow cancellation'}`,
+        timestamp: new Date().toLocaleString()
+      }, client);
+
+      return { order, result };
     });
 
-    res.json({ success: true, order, refunded: result.refunded });
+    res.json({ success: true, order: txResult.order, refunded: txResult.result.refunded });
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    res.status(err?.statusCode || 400).json({ error: err.message });
   } finally {
     releaseOrderLock(orderId);
   }
@@ -1078,17 +1180,20 @@ router.get('/payments/transactions/:userId', requireAuth, async (req: Request, r
           });
         }
         if (ord.sellerId === userId && ord.status === 'completed') {
+          const ordQuote = (ord.feeBreakdown as any)?.freelancerNet !== undefined
+            ? (ord.feeBreakdown as any)
+            : await quoteOrderWithLiveSettings(ord.amount).catch(() => calculateOrderFees(ord.amount));
           syn.push({
             id: `txn_rel_${ord.id}`,
             type: 'escrow_release',
-            amount: financeLedger.quoteOrder(ord.amount).freelancerNet,
+            amount: ordQuote.freelancerNet,
             currency: 'USD',
             timestamp: `${ord.dueDate} 15:30:00`,
             status: 'completed',
             userId: userId,
             userName: ord.sellerUsername || 'Freelancer',
             userRole: 'freelancer',
-            description: `Escrow earnings (${financeLedger.quoteOrder(ord.amount).freelancerPercent}% net) from: ${ord.title}`,
+            description: `Escrow earnings (${ordQuote.freelancerPercent}% net) from: ${ord.title}`,
             relatedOrderId: ord.id
           });
         }
@@ -1120,7 +1225,9 @@ router.get('/payments/invoices/:userId', requireAuth, async (req: Request, res: 
     const orderInvoices = await Promise.all(userOrders.map(async o => {
       const isBuyer = o.buyerId === userId;
       const otherUser = await store.getUser(isBuyer ? o.sellerId : o.buyerId);
-      const quote = financeLedger.quoteOrder(o.amount);
+      const quote = (o.feeBreakdown as any)?.clientTotal !== undefined
+        ? (o.feeBreakdown as any)
+        : await quoteOrderWithLiveSettings(o.amount).catch(() => calculateOrderFees(o.amount));
       return {
         id: `inv_ord_${o.id}`,
         invoiceNumber: `INV-${o.id.replace('ord_', '').toUpperCase()}`,
@@ -1357,7 +1464,7 @@ router.post('/payments/invoices', requireAuth, async (req: Request, res: Respons
 
     const newInvoice: CustomInvoice = {
       id: 'inv_' + Date.now() + '_' + randomUUID().slice(0, 8),
-      invoiceNumber: `INV-${Date.now().toString().slice(-6)}`,
+      invoiceNumber: `INV-${Date.now().toString().slice(-6)}-${randomUUID().slice(0, 4).toUpperCase()}`,
       userId: authenticatedUserId,
       buyerId: resolvedBuyerId || undefined,
       sellerId: resolvedSellerId || undefined,
@@ -1741,9 +1848,10 @@ router.get('/admin/finance/escrow', requireAdmin, async (req: Request, res: Resp
 
       const esc = escrowMap.get(o.id);
       const fbComm = (o.feeBreakdown as any)?.commissionPercent;
+      const liveCommRate = siteSettings.getSettings()?.commission?.commissionPercent ?? DEFAULT_FEE_CONFIG.commissionPercent;
       const effectiveCommRate = (esc?.commissionPercent !== undefined && esc?.commissionPercent !== null)
         ? Number(esc.commissionPercent)
-        : (fbComm !== undefined && fbComm !== null ? Number(fbComm) : financeLedger.getPlatformCommissionRate());
+        : (fbComm !== undefined && fbComm !== null ? Number(fbComm) : liveCommRate);
 
       return {
         ...enriched,
@@ -1770,26 +1878,40 @@ router.post('/admin/finance/escrow/:orderId/release', requireAdmin, async (req: 
   const orderId = req.params.orderId;
   if (!tryAcquireOrderLock(orderId, res)) return;
   try {
-    const order = await store.getOrder(orderId);
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (order.status === 'completed') {
-      return res.status(400).json({ error: 'Order escrow has already been released and completed.' });
-    }
-    if (order.status === 'cancelled') {
-      return res.status(400).json({ error: 'Cannot release escrow: Order has already been cancelled/refunded.' });
-    }
-    const activeDispute = await store.getDisputeByOrderId(order.id);
-    if ((activeDispute && (activeDispute.status === 'open' || activeDispute.status === 'under_investigation')) || order.status === 'disputed') {
-      return res.status(400).json({ error: `Cannot release escrow: Order #${order.id} is under active dispute. Resolve the dispute first.` });
-    }
-    const esc = await financialRepository.getEscrow(order.id);
-    if (!esc || esc.remaining <= 0 || esc.status === 'released' || esc.status === 'refunded') {
-      return res.status(400).json({ error: 'No refundable or releasable escrow funds remain for this order.' });
-    }
-    const result = await releaseOrderFunds(order, adminActor(req), String(req.body.reason || 'Administrative escrow release'), false, req.body.requestKey);
-    res.json({ success: true, order, journal: result.journal, freelancerNet: result.freelancerNet, platformFee: result.platformFee });
+    const txResult = await postgresStore.executeInTransaction(async (client) => {
+      const orderLockRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+      if (orderLockRes.rows.length === 0) {
+        const err: any = new Error('Order not found');
+        err.statusCode = 404;
+        throw err;
+      }
+      const order = (store as any).mapOrderRow ? (store as any).mapOrderRow(orderLockRes.rows[0]) : await store.getOrder(orderId, client);
+      if (!order) {
+        const err: any = new Error('Order not found');
+        err.statusCode = 404;
+        throw err;
+      }
+      if (order.status === 'completed') {
+        throw new Error('Order escrow has already been released and completed.');
+      }
+      if (order.status === 'cancelled') {
+        throw new Error('Cannot release escrow: Order has already been cancelled/refunded.');
+      }
+      const activeDispute = await store.getDisputeByOrderId(order.id, client);
+      if ((activeDispute && (activeDispute.status === 'open' || activeDispute.status === 'under_investigation' || (activeDispute.status as string) === 'under_review')) || order.status === 'disputed') {
+        throw new Error(`Cannot release escrow: Order #${order.id} is under active dispute. Resolve the dispute first.`);
+      }
+      const escRes = await client.query('SELECT * FROM escrows WHERE order_id = $1 FOR UPDATE', [order.id]);
+      const esc = escRes.rows[0];
+      if (!esc || Number(esc.remaining) <= 0 || esc.status === 'released' || esc.status === 'refunded') {
+        throw new Error('No refundable or releasable escrow funds remain for this order.');
+      }
+      const result = await releaseOrderFunds(order, adminActor(req), String(req.body.reason || 'Administrative escrow release'), false, req.body.requestKey, false, client);
+      return { order, result };
+    });
+    res.json({ success: true, order: txResult.order, journal: txResult.result.journal, freelancerNet: txResult.result.freelancerNet, platformFee: txResult.result.platformFee });
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    res.status(err?.statusCode || 400).json({ error: err.message });
   } finally {
     releaseOrderLock(orderId);
   }

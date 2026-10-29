@@ -54,9 +54,16 @@ export function Header({
   // Close dropdowns on outside click
   const [notifications, setNotifications] = useState<any[]>([]);
   const [isNotificationsDropdownOpen, setIsNotificationsDropdownOpen] = useState(false);
-  const [soundEnabled, setSoundEnabled] = useState(() => 
-    typeof window !== 'undefined' ? localStorage.getItem('worksphere_notif_sound') !== 'false' : true
-  );
+  const [soundEnabled, setSoundEnabled] = useState(true);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const stored = localStorage.getItem('worksphere_notif_sound');
+      if (stored === 'false') {
+        setSoundEnabled(false);
+      }
+    }
+  }, []);
 
   const playNotificationSound = () => {
     try {
@@ -98,14 +105,17 @@ export function Header({
   };
 
   useEffect(() => {
-    if (!currentUser?.id || typeof window === 'undefined') {
+    const token = getAuthToken();
+    if (!currentUser?.id || !token || typeof window === 'undefined') {
       setNotifications([]);
       return;
     }
     const fetchNotifs = async () => {
+      const currentToken = getAuthToken();
+      if (!currentToken) return;
       try {
         const res = await fetch('/api/notifications', {
-          headers: { 'Authorization': `Bearer ${getAuthToken() || ''}` }
+          headers: { 'Authorization': `Bearer ${currentToken}` }
         });
         if (res.ok) {
           const data = await res.json();
@@ -467,7 +477,7 @@ export function Header({
                           setSelectedOrder(ord);
                           fetchMessages(ord.id);
                           setIsWorkstreamsDropdownOpen(false);
-                          navigate('/messages/' + ord.id, e);
+                          navigate('/workstream/' + ord.id, e);
                         }}
                         className="p-3 hover:bg-slate-50 transition-colors cursor-pointer flex items-start gap-3"
                       >

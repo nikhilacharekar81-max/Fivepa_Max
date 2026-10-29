@@ -60,6 +60,9 @@ export interface WorkstreamOffer {
   id: string;
   number: string;
   orderId: string;
+  originOrderId?: string;
+  resultingOrderId?: string;
+  workspaceId?: string;
   kind: WorkstreamOfferKind;
   title: string;
   amount: number;
@@ -79,6 +82,7 @@ export interface WorkstreamOffer {
   files?: Array<{ id?: string; name: string; size: string; url: string; uploadedAt?: string }>;
   reference?: string;
   rejectionReason?: string;
+  metadata?: Record<string, any>;
 }
 
 export interface WorkstreamItem extends Order {
@@ -97,8 +101,13 @@ export interface SharedFileItem {
   url: string;
   uploadedAt: string;
   uploadedBy: string;
+  uploaderId?: string;
   uploaderAvatar?: string;
   type?: string;
+  orderId?: string;
+  orderTitle?: string;
+  workspaceId?: string;
+  source?: 'deliverable' | 'delivery_history' | 'message' | 'offer';
 }
 
 export const WORKSTREAM_TAB_STATUSES = {

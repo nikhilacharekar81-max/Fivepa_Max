@@ -34,6 +34,7 @@ import {
 import { recordMessage } from '../services/messagingService.js';
 import { broadcastMessage, disconnectUserSockets } from '../websocket.js';
 import { notifyUserOnAdminAction } from '../services/notificationService.js';
+import { recalculateUserRating, recalculateGigRating } from '../services/reviewService.js';
 
 export let categories: Category[] = [
   {
@@ -172,13 +173,25 @@ export function setCategories(newCats: Category[]) {
   categories = newCats;
 }
 
+export function getCategories(): Category[] {
+  return categories;
+}
+
 const router = Router();
 
 // ==========================================
 // CATEGORIES ADMIN
 // ==========================================
 
-router.get('/categories', (_req: Request, res: Response) => {
+router.get('/categories', async (_req: Request, res: Response) => {
+  if (isPostgresEnabled()) {
+    try {
+      const persisted = await postgresStore.loadCategories();
+      if (persisted && Array.isArray(persisted) && persisted.length > 0) {
+        categories = persisted;
+      }
+    } catch {}
+  }
   res.json(categories);
 });
 
@@ -197,8 +210,8 @@ router.post('/admin/categories', requireAdmin, async (req: Request, res: Respons
   categories.push(newCat);
   await postgresStore.saveCategories(categories);
 
-  registerAuditLog({
-    id: 'log_' + Date.now(),
+  await registerAuditLog({
+    id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
     actor: adminActor(req),
     role: (req as any).authenticatedUser?.role || 'admin',
     action: 'CATEGORY_CREATED',
@@ -225,8 +238,8 @@ router.post('/admin/categories/bulk-delete', requireAdmin, async (req: Request, 
   }
   await postgresStore.saveCategories(categories);
 
-  registerAuditLog({
-    id: 'log_' + Date.now(),
+  await registerAuditLog({
+    id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
     actor: adminActor(req),
     role: (req as any).authenticatedUser?.role || 'admin',
     action: 'CATEGORIES_BULK_DELETED',
@@ -246,8 +259,8 @@ router.patch('/admin/categories/:id', requireAdmin, async (req: Request, res: Re
   if (typeof req.body.enabled === 'boolean') cat.enabled = req.body.enabled;
   await postgresStore.saveCategories(categories);
 
-  registerAuditLog({
-    id: 'log_' + Date.now(),
+  await registerAuditLog({
+    id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
     actor: adminActor(req),
     role: (req as any).authenticatedUser?.role || 'admin',
     action: 'CATEGORY_UPDATED',
@@ -265,8 +278,8 @@ router.patch('/admin/categories/:id/toggle', requireAdmin, async (req: Request, 
   cat.enabled = !cat.enabled;
   await postgresStore.saveCategories(categories);
 
-  registerAuditLog({
-    id: 'log_' + Date.now(),
+  await registerAuditLog({
+    id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
     actor: adminActor(req),
     role: (req as any).authenticatedUser?.role || 'admin',
     action: cat.enabled ? 'CATEGORY_ENABLED' : 'CATEGORY_DISABLED',
@@ -285,8 +298,8 @@ router.delete('/admin/categories/:id', requireAdmin, async (req: Request, res: R
   categories.splice(index, 1);
   await postgresStore.saveCategories(categories);
 
-  registerAuditLog({
-    id: 'log_' + Date.now(),
+  await registerAuditLog({
+    id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
     actor: adminActor(req),
     role: (req as any).authenticatedUser?.role || 'admin',
     action: 'CATEGORY_DELETED',
@@ -313,8 +326,8 @@ router.post('/admin/categories/:id/subcategories', requireAdmin, async (req: Req
   cat.subcategories.push(newSub);
   await postgresStore.saveCategories(categories);
 
-  registerAuditLog({
-    id: 'log_' + Date.now(),
+  await registerAuditLog({
+    id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
     actor: adminActor(req),
     role: (req as any).authenticatedUser?.role || 'admin',
     action: 'SUBCATEGORY_CREATED',
@@ -336,8 +349,8 @@ router.patch('/admin/categories/:id/subcategories/:subId', requireAdmin, async (
   if (typeof req.body.enabled === 'boolean') sub.enabled = req.body.enabled;
   await postgresStore.saveCategories(categories);
 
-  registerAuditLog({
-    id: 'log_' + Date.now(),
+  await registerAuditLog({
+    id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
     actor: adminActor(req),
     role: (req as any).authenticatedUser?.role || 'admin',
     action: 'SUBCATEGORY_UPDATED',
@@ -357,8 +370,8 @@ router.patch('/admin/categories/:id/subcategories/:subId/toggle', requireAdmin, 
   sub.enabled = !sub.enabled;
   await postgresStore.saveCategories(categories);
 
-  registerAuditLog({
-    id: 'log_' + Date.now(),
+  await registerAuditLog({
+    id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
     actor: adminActor(req),
     role: (req as any).authenticatedUser?.role || 'admin',
     action: sub.enabled ? 'SUBCATEGORY_ENABLED' : 'SUBCATEGORY_DISABLED',
@@ -379,8 +392,8 @@ router.delete('/admin/categories/:id/subcategories/:subId', requireAdmin, async 
   cat.subcategories.splice(subIndex, 1);
   await postgresStore.saveCategories(categories);
 
-  registerAuditLog({
-    id: 'log_' + Date.now(),
+  await registerAuditLog({
+    id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
     actor: adminActor(req),
     role: (req as any).authenticatedUser?.role || 'admin',
     action: 'SUBCATEGORY_DELETED',
@@ -408,7 +421,7 @@ const handlePostSiteSettings = async (req: Request, res: Response) => {
     await siteSettings.saveToDatabase();
 
     await registerAuditLog({
-      id: 'log_' + Date.now(),
+      id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
       actor,
       role: 'super_admin',
       action: 'SITE_FEE_SETTINGS_UPDATED',
@@ -459,7 +472,7 @@ router.patch('/admin/payment-gateways/:environment/:gateway', requireAdmin, asyn
     await paymentGatewayManager.saveToDatabase();
 
     await registerAuditLog({
-      id: 'log_' + Date.now(),
+      id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
       actor,
       role: 'super_admin',
       action: 'PAYMENT_GATEWAY_UPDATED',
@@ -486,8 +499,8 @@ router.post('/admin/payment-gateways/:environment/:gateway/test', requireAdmin, 
 
     const result = await paymentGatewayManager.testConnection(env, gw);
 
-    registerAuditLog({
-      id: 'log_' + Date.now(),
+    await registerAuditLog({
+      id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
       actor,
       role: 'super_admin',
       action: 'PAYMENT_GATEWAY_CONNECTION_TESTED',
@@ -532,7 +545,7 @@ router.post('/admin/memberships', requireAdmin, async (req: Request, res: Respon
     await siteSettings.saveToDatabase();
 
     await registerAuditLog({
-      id: 'log_' + Date.now(),
+      id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
       actor,
       role: 'super_admin',
       action: 'MEMBERSHIPS_QUOTAS_UPDATED',
@@ -634,8 +647,8 @@ router.post('/support-tickets', requireAuth, rateLimit(10, 60_000), async (req: 
 
     await store.saveSupportTicket(newTicket);
 
-    registerAuditLog({
-      id: 'log_' + Date.now(),
+    await registerAuditLog({
+      id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
       actor: userName,
       role: caller.role,
       action: isAppeal ? 'ACCOUNT_APPEAL_SUBMITTED' : 'SUPPORT_TICKET_OPENED',
@@ -709,7 +722,17 @@ router.patch('/admin/users/:id', requireAdmin, async (req: Request, res: Respons
       if (u.role === 'admin' && caller?.role !== 'super_admin' && caller?.id !== u.id) {
         return res.status(403).json({ error: 'Forbidden: Only super_admin can change another administrator’s email.' });
       }
-      u.email = escapeHtml(String(req.body.email));
+      const nextEmail = escapeHtml(String(req.body.email).trim());
+      if (nextEmail) {
+        const conflictRes = await postgresStore.getPool().query(
+          'SELECT id FROM users WHERE LOWER(email) = LOWER($1) AND id <> $2 LIMIT 1',
+          [nextEmail, u.id]
+        );
+        if (conflictRes.rows.length > 0) {
+          return res.status(409).json({ error: 'Email address is already registered to another user.' });
+        }
+      }
+      u.email = nextEmail;
     }
 
     if (req.body.name !== undefined) u.name = escapeHtml(String(req.body.name));
@@ -737,8 +760,8 @@ router.patch('/admin/users/:id', requireAdmin, async (req: Request, res: Respons
 
     await store.saveUser(u);
 
-    registerAuditLog({
-      id: 'log_' + Date.now(),
+    await registerAuditLog({
+      id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
       actor: caller?.name || adminActor(req),
       role: caller?.role || 'admin',
       action: 'USER_PROFILE_EDITED',
@@ -773,8 +796,8 @@ router.patch('/admin/users/:id/status', requireAdmin, async (req: Request, res: 
     u.status = newStatus as any;
     await store.saveUser(u);
 
-    registerAuditLog({
-      id: 'log_' + Date.now(),
+    await registerAuditLog({
+      id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
       actor: admin?.name || adminActor(req),
       role: admin?.role || 'admin',
       action: `USER_STATUS_${newStatus.toUpperCase()}`,
@@ -803,8 +826,8 @@ router.post('/admin/users/:id/impersonate', requireAdmin, async (req: Request, r
     if (!u) return res.status(404).json({ error: 'User not found' });
 
     const admin = (req as any).authenticatedUser;
-    registerAuditLog({
-      id: 'log_' + Date.now(),
+    await registerAuditLog({
+      id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
       actor: admin?.name || 'Admin',
       role: admin?.role || 'admin',
       action: 'USER_IMPERSONATED',
@@ -826,8 +849,8 @@ router.post('/admin/users/:id/stop-impersonate', requireAdmin, async (req: Reque
     if (!u) return res.status(404).json({ error: 'User not found' });
 
     const admin = (req as any).authenticatedUser;
-    registerAuditLog({
-      id: 'log_' + Date.now(),
+    await registerAuditLog({
+      id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
       actor: admin?.name || 'Admin',
       role: admin?.role || 'admin',
       action: 'USER_IMPERSONATION_ENDED',
@@ -850,8 +873,8 @@ router.patch('/admin/users/:id/verify', requireAdmin, async (req: Request, res: 
     await store.saveUser(u);
 
     const admin = (req as any).authenticatedUser;
-    registerAuditLog({
-      id: 'log_' + Date.now(),
+    await registerAuditLog({
+      id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
       actor: admin?.name || 'Admin',
       role: admin?.role || 'admin',
       action: u.verified ? 'USER_VERIFIED' : 'USER_UNVERIFIED',
@@ -866,7 +889,7 @@ router.patch('/admin/users/:id/verify', requireAdmin, async (req: Request, res: 
   }
 });
 
-router.delete('/admin/users/:id', requireAdmin, async (req: Request, res: Response) => {
+export async function handleDeleteUserAccount(req: Request, res: Response) {
   try {
     const target = await store.getUser(req.params.id);
     if (!target) return res.status(404).json({ error: 'User not found' });
@@ -918,9 +941,9 @@ router.delete('/admin/users/:id', requireAdmin, async (req: Request, res: Respon
     });
 
     const admin = (req as any).authenticatedUser;
-    registerAuditLog({
-      id: 'log_' + Date.now(),
-      actor: admin?.name || 'Admin',
+    await registerAuditLog({
+      id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
+      actor: admin?.name || adminActor(req),
       role: admin?.role || 'admin',
       action: 'USER_DELETED',
       target: `User ${target.name}`,
@@ -928,13 +951,15 @@ router.delete('/admin/users/:id', requireAdmin, async (req: Request, res: Respon
       timestamp: new Date().toLocaleString()
     });
 
-    disconnectUserSockets(req.params.id, 'Account deleted');
+    disconnectUserSockets(target.id, 'Account deleted');
     res.json({ success: true, id: target.id });
   } catch (err: any) {
     const status = err?.statusCode || 400;
-    res.status(status).json({ error: err.message });
+    res.status(status).json({ error: err.message || 'Failed to delete user' });
   }
-});
+}
+
+router.delete('/admin/users/:id', requireAdmin, handleDeleteUserAccount);
 
 // ==========================================
 // DISPUTE RESOLUTION
@@ -961,46 +986,61 @@ router.patch('/admin/disputes/:id/resolve', requireAdmin, async (req: Request, r
       try {
         acquireOrderLock(lockedOrderId);
       } catch (err: any) {
+        lockedOrderId = null;
         return res.status(409).json({ error: err.message });
       }
-      if (status === 'resolved_release') await releaseOrderFunds(order, adminActor(req), reason, false, undefined, true);
-      else if (status === 'resolved_refund') await refundOrderFunds(order, undefined, adminActor(req), reason);
-      else await splitOrderFunds(order, Number(req.body.refundAmount), adminActor(req), reason);
-    }
-    d.status = status;
-    d.resolutionNotes = notes;
-
-    await store.saveDispute(d);
-
-    if (order) {
-      const sysMsg: Message = {
-        id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
-        orderId: order.id,
-        senderId: 'system',
-        senderName: 'Dispute Resolution Desk',
-        text: `⚖️ Dispute resolved by administrator: ${status}. Notes: ${notes || 'No notes provided'}`,
-        timestamp: new Date().toISOString(),
-        type: 'system',
-        metadata: { action: 'dispute_resolved', status, notes }
-      };
-      recordMessage(sysMsg);
-      await store.addMessage(sysMsg);
-      broadcastMessage(sysMsg, order.id);
     }
 
-    registerAuditLog({
-      id: 'log_' + randomUUID().slice(0, 12),
-      actor: adminActor(req),
-      role: 'super_admin',
-      action: 'DISPUTE_RESOLVED',
-      target: `Dispute #${d.id}`,
-      details: `Resolved dispute with status ${status}. Notes: ${notes}`,
-      timestamp: new Date().toLocaleString()
+    const actor = adminActor(req);
+    await postgresStore.executeInTransaction(async (client) => {
+      const dispLockRes = await client.query('SELECT status FROM disputes WHERE id = $1 FOR UPDATE', [d.id]);
+      if (dispLockRes.rows.length > 0 && String(dispLockRes.rows[0].status || '').startsWith('resolved')) {
+        throw new Error(`Dispute is already ${dispLockRes.rows[0].status}.`);
+      }
+
+      if (status.startsWith('resolved') && order) {
+        if (status === 'resolved_release') {
+          await releaseOrderFunds(order, actor, reason, false, undefined, true, client);
+        } else if (status === 'resolved_refund') {
+          await refundOrderFunds(order, undefined, actor, reason, undefined, undefined, true, client);
+        } else {
+          await splitOrderFunds(order, Number(req.body.refundAmount), actor, reason, undefined, client);
+        }
+      }
+
+      d.status = status;
+      d.resolutionNotes = notes;
+      await store.saveDispute(d, client);
+
+      if (order) {
+        const sysMsg: Message = {
+          id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+          orderId: order.id,
+          senderId: 'system',
+          senderName: 'Dispute Resolution Desk',
+          text: `⚖️ Dispute resolved by administrator: ${status}. Notes: ${notes || 'No notes provided'}`,
+          timestamp: new Date().toISOString(),
+          type: 'system',
+          metadata: { action: 'dispute_resolved', status, notes }
+        };
+        await recordMessage(sysMsg, client);
+      }
+
+      await registerAuditLog({
+        id: 'log_' + randomUUID().slice(0, 12),
+        actor,
+        role: 'super_admin',
+        action: 'DISPUTE_RESOLVED',
+        target: `Dispute #${d.id}`,
+        details: `Resolved dispute with status ${status}. Notes: ${notes}`,
+        timestamp: new Date().toLocaleString()
+      }, client);
     });
 
     res.json(d);
   } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    const code = String(err.message || '').includes('already resolved') ? 409 : 400;
+    res.status(code).json({ error: err.message });
   } finally {
     if (lockedOrderId) releaseOrderLock(lockedOrderId);
   }
@@ -1137,7 +1177,7 @@ router.patch('/admin/gigs/:id', requireAdmin, async (req: Request, res: Response
 
     if (previousStatus !== 'deleted' && updatedGig.status === 'deleted') {
       await registerAuditLog({
-        id: 'log_' + Date.now(),
+        id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
         actor: adminActor(req),
         role: (req as any).authenticatedUser?.role || 'admin',
         action: 'GIG_DELETED',
@@ -1267,13 +1307,10 @@ router.post('/admin/refunds/:id/approve', requireAdmin, async (req: Request, res
         orderId: r.order_id,
         amount: immutableAmount,
         reason: r.reason || 'Admin approved refund',
-        actor: adminActor(req)
+        actor: adminActor(req),
+        allowDisputeResolution: true,
+        existingRefundId: r.id
       }, client);
-
-      await client.query(
-        "UPDATE refunds SET status = 'approved' WHERE id = $1",
-        [r.id]
-      );
 
       await client.query(
         `INSERT INTO audit_logs (id, actor, role, action, target, details, timestamp)
@@ -1384,6 +1421,13 @@ router.patch('/admin/reviews/:id/status', requireAdmin, async (req: Request, res
     if (!review) return res.status(404).json({ error: 'Review not found' });
     (review as any).moderationStatus = status || moderationStatus || 'approved';
     await store.saveReview(review);
+    if (review.targetUserId) {
+      await recalculateUserRating(review.targetUserId);
+    }
+    const targetGigId = review.gigId || (review.orderId ? (await store.getOrder(review.orderId))?.gigId : undefined);
+    if (targetGigId) {
+      await recalculateGigRating(targetGigId);
+    }
     res.json({ success: true, review });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -1396,6 +1440,13 @@ router.delete('/admin/reviews/:id', requireAdmin, async (req: Request, res: Resp
     if (!review) return res.status(404).json({ error: 'Review not found' });
     (review as any).moderationStatus = 'hidden';
     await store.saveReview(review);
+    if (review.targetUserId) {
+      await recalculateUserRating(review.targetUserId);
+    }
+    const targetGigId = review.gigId || (review.orderId ? (await store.getOrder(review.orderId))?.gigId : undefined);
+    if (targetGigId) {
+      await recalculateGigRating(targetGigId);
+    }
     res.json({ success: true, id: req.params.id });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -1454,7 +1505,17 @@ router.get('/admin/reports', requireAdmin, async (_req: Request, res: Response) 
 
 router.patch('/admin/reports/:id', requireAdmin, async (req: Request, res: Response) => {
   try {
-    res.json({ success: true, id: req.params.id, status: req.body.status || 'resolved' });
+    const nextStatus = req.body.status || 'resolved';
+    await registerAuditLog({
+      id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
+      actor: adminActor(req),
+      role: (req as any).authenticatedUser?.role || 'admin',
+      action: `REPORT_${String(nextStatus).toUpperCase()}`,
+      target: `Report #${req.params.id}`,
+      details: req.body.note || `Updated report #${req.params.id} status to ${nextStatus}`,
+      timestamp: new Date().toLocaleString()
+    });
+    res.json({ success: true, id: req.params.id, status: nextStatus });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -1463,6 +1524,15 @@ router.patch('/admin/reports/:id', requireAdmin, async (req: Request, res: Respo
 router.post('/admin/messages/moderate', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { threadId, action, note } = req.body;
+    await registerAuditLog({
+      id: 'log_' + Date.now() + '_' + randomUUID().slice(0, 8),
+      actor: adminActor(req),
+      role: (req as any).authenticatedUser?.role || 'admin',
+      action: `MESSAGE_MODERATION_${String(action || 'REVIEWED').toUpperCase()}`,
+      target: `Thread ${threadId || 'unknown'}`,
+      details: note || `Admin moderated thread ${threadId} with action: ${action || 'reviewed'}`,
+      timestamp: new Date().toLocaleString()
+    });
     res.json({ success: true, threadId, action, note });
   } catch (err: any) {
     res.status(500).json({ error: err.message });

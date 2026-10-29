@@ -10,13 +10,14 @@ import { initWebSocketServer } from './server/websocket.js';
 import { runBackgroundJobs } from './server/jobs/backgroundJobs.js';
 import { setupSSR } from './server/ssr.js';
 import { slugify } from './src/utils/slugify.js';
-import { postgresStore } from './server/db/postgresStore.js';
+import { postgresStore, assertProductionPostgresConfigured } from './server/db/postgresStore.js';
 import { apiRouter } from './server/routes/index.js';
 import { categories } from './server/routes/adminRoutes.js';
 import { rootRouter } from './server/routes/rootRoutes.js';
 import { siteSettings, DEFAULT_SITE_SETTINGS } from './src/server/siteSettings.js';
 import { isGigPublic, sanitizePublicGig } from './server/publicData.js';
-import { safeUser } from './server/middleware/auth.js';
+import { safeUser, assertProductionJwtSecret } from './server/middleware/auth.js';
+import { assertProductionGatewayEncryptionKey } from './server/domains/finance/paymentGateways.js';
 import {
   saveOrdersToDisk,
   hydrateStoreFromPostgres,
@@ -96,6 +97,9 @@ const IS_PROD = IS_PRODUCTION;
 
 if (IS_PROD) {
   (process.env as any).NODE_ENV = 'production';
+  assertProductionJwtSecret();
+  assertProductionGatewayEncryptionKey();
+  assertProductionPostgresConfigured();
 }
 
 let isShuttingDown = false;
@@ -170,7 +174,7 @@ initWebSocketServer(server);
 
 const portArgIndex = process.argv.findIndex(arg => arg === '--port' || arg === '-p');
 const cliPort = portArgIndex !== -1 && process.argv[portArgIndex + 1] ? Number(process.argv[portArgIndex + 1]) : null;
-const PORT = cliPort || (process.env.PORT && process.env.PORT !== '8080' ? Number(process.env.PORT) : 3000);
+const PORT = cliPort || (process.env.PORT ? Number(process.env.PORT) : 3000);
 
 process.on('unhandledRejection', (reason) => {
   console.error('[UnhandledRejection]', reason);
@@ -199,13 +203,48 @@ if (process.env.NODE_ENV !== 'test' && !server.listening) {
     process.exit(1);
   }
 
-  await setupSSR(app, IS_PROD, __dirname, async () => {
+  await setupSSR(app, IS_PROD, __dirname, async (pathname?: string) => {
     try {
       const pool = postgresStore.getPool();
+      const pathParts = (pathname || '').split('/').filter(Boolean).map(p => decodeURIComponent(p));
+      const candidateTokens = Array.from(new Set(pathParts.filter(p => p.length > 0 && p.length <= 120)));
+
       const [gigsRes, usersRes, projectsRes] = await Promise.all([
-        pool.query("SELECT * FROM gigs WHERE status IN ('active', 'published') LIMIT 50"),
-        pool.query("SELECT * FROM users WHERE status = 'active' LIMIT 50"),
-        pool.query("SELECT * FROM projects WHERE status = 'open' LIMIT 50")
+        candidateTokens.length > 0
+          ? pool.query(
+              `SELECT * FROM gigs
+               WHERE status IN ('active', 'published')
+                 AND (id = ANY($1::text[]) OR LOWER(COALESCE(slug, '')) = ANY($2::text[]))
+               UNION
+               (SELECT * FROM gigs WHERE status IN ('active', 'published') ORDER BY created_at DESC NULLS LAST LIMIT 50)`,
+              [candidateTokens, candidateTokens.map(t => t.toLowerCase())]
+            )
+          : pool.query("SELECT * FROM gigs WHERE status IN ('active', 'published') ORDER BY created_at DESC NULLS LAST LIMIT 50"),
+        candidateTokens.length > 0
+          ? pool.query(
+              `SELECT id, name, username, role, avatar, title, rating, reviews_count, hourly_rate, earned, completed_jobs, bio, skills, status, verified, email_verified, mobile_verified, created_at, is_flagged, is_available_now
+               FROM users
+               WHERE status = 'active'
+                 AND (id = ANY($1::text[]) OR LOWER(COALESCE(username, '')) = ANY($2::text[]))
+               UNION
+               (SELECT id, name, username, role, avatar, title, rating, reviews_count, hourly_rate, earned, completed_jobs, bio, skills, status, verified, email_verified, mobile_verified, created_at, is_flagged, is_available_now
+                FROM users WHERE status = 'active' ORDER BY created_at DESC NULLS LAST LIMIT 50)`,
+              [candidateTokens, candidateTokens.map(t => t.toLowerCase())]
+            )
+          : pool.query(
+              `SELECT id, name, username, role, avatar, title, rating, reviews_count, hourly_rate, earned, completed_jobs, bio, skills, status, verified, email_verified, mobile_verified, created_at, is_flagged, is_available_now
+               FROM users WHERE status = 'active' ORDER BY created_at DESC NULLS LAST LIMIT 50`
+            ),
+        candidateTokens.length > 0
+          ? pool.query(
+              `SELECT * FROM projects
+               WHERE status = 'open'
+                 AND (id = ANY($1::text[]) OR LOWER(COALESCE(slug, '')) = ANY($2::text[]))
+               UNION
+               (SELECT * FROM projects WHERE status = 'open' ORDER BY created_at DESC NULLS LAST LIMIT 50)`,
+              [candidateTokens, candidateTokens.map(t => t.toLowerCase())]
+            )
+          : pool.query("SELECT * FROM projects WHERE status = 'open' ORDER BY created_at DESC NULLS LAST LIMIT 50")
       ]);
       
       const gigs = gigsRes.rows.map(r => ({
@@ -238,8 +277,6 @@ if (process.env.NODE_ENV !== 'test' && !server.listening) {
           id: r.id,
           name: r.name,
           username: r.username,
-          email: r.email,
-          mobile: r.mobile,
           role: r.role,
           avatar: r.avatar || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
           title: r.title || '',
@@ -254,14 +291,9 @@ if (process.env.NODE_ENV !== 'test' && !server.listening) {
           verified: Boolean(r.verified),
           emailVerified: Boolean(r.email_verified),
           mobileVerified: Boolean(r.mobile_verified),
-          walletBalance: Number(r.wallet_balance || 0),
           createdAt: r.created_at,
           isFlagged: Boolean(r.is_flagged),
-          flagReason: r.flag_reason,
-          sessionVersion: Number(r.session_version || 1),
-          knownDevices: r.known_devices || [],
-          isAvailableNow: Boolean(r.is_available_now),
-          notificationPreferences: r.notification_preferences
+          isAvailableNow: Boolean(r.is_available_now)
         }));
 
       const projects = projectsRes.rows.map(r => ({
@@ -286,10 +318,10 @@ if (process.env.NODE_ENV !== 'test' && !server.listening) {
           acceptedProposalId: r.accepted_proposal_id || undefined
         }));
       
-      return { gigs, users, projects, categories: [] };
+      return { gigs, users, projects, categories };
     } catch (err) {
       console.error('[SSR] Error fetching data for SSR:', err);
-      return { gigs: [], users: [], projects: [], categories: [] };
+      return { gigs: [], users: [], projects: [], categories };
     }
   });
 

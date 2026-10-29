@@ -12,7 +12,7 @@ import {
   type Message
 } from '../store.js';
 import { postgresStore } from '../db/postgresStore.js';
-import { calculateOrderFees } from '../domains/finance/fees.js';
+import { calculateOrderFees, quoteOrderWithLiveSettings } from '../domains/finance/fees.js';
 import { financialRepository } from '../services/financialService.js';
 import { siteSettings } from '../../src/server/siteSettings.js';
 import { workspaceService } from '../../src/server/workspaceService.js';
@@ -23,7 +23,8 @@ import {
   isStaffUser,
   canAccessOrderWorkstream,
   resolveAuthenticatedUserId,
-  formatApiError
+  formatApiError,
+  escapeHtml
 } from '../middleware/auth.js';
 import {
   tryAcquireOrderLock,
@@ -68,17 +69,8 @@ import {
   generateCollisionSafeOfferNumber
 } from '../services/workstreamService.js';
 
-function escapeHtml(text: string): string {
-  if (typeof text !== 'string') return '';
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
-async function saveOfferToDb(offer: WorkstreamOffer): Promise<void> {
-  await store.saveOffer(offer);
+async function saveOfferToDb(offer: WorkstreamOffer, client?: any): Promise<void> {
+  await store.saveOffer(offer, client);
 }
 
 const router = Router();
@@ -100,26 +92,51 @@ router.get('/workspaces', requireAuth, async (req: Request, res: Response) => {
     ]);
 
     const ordersByWorkspace = new Map<string, Order[]>();
+    const ordersById = new Map<string, Order>();
     for (const o of allOrders) {
-      const wsId = o.workspaceId;
+      const enriched = enrichOrderWithServiceInfo(o, isAdmin);
+      ordersById.set(enriched.id, enriched);
+      const wsId = enriched.workspaceId;
       if (wsId) {
         const list = ordersByWorkspace.get(wsId) || [];
-        list.push(enrichOrderWithServiceInfo(o, isAdmin));
+        list.push(enriched);
         ordersByWorkspace.set(wsId, list);
       }
     }
 
     const enrichedWorkspaces = workspaces.map(ws => {
-      const candidateOrders = ordersByWorkspace.get(ws.workspaceId) || [];
-      const wsOrders = candidateOrders.filter(o =>
-        (o.buyerId === ws.buyerId && o.sellerId === ws.sellerId) ||
-        (o.buyerId === ws.sellerId && o.sellerId === ws.buyerId)
-      );
+      const candidateMap = new Map<string, Order>();
+      for (const o of ordersByWorkspace.get(ws.workspaceId) || []) {
+        if (o.buyerId === ws.buyerId && o.sellerId === ws.sellerId) {
+          candidateMap.set(o.id, o);
+        }
+      }
+      for (const oid of ws.orderIds || []) {
+        const o = ordersById.get(oid);
+        if (o && (!o.workspaceId || o.workspaceId === ws.workspaceId) && o.buyerId === ws.buyerId && o.sellerId === ws.sellerId) {
+          candidateMap.set(o.id, o);
+        }
+      }
+
+      const orderIdx = new Map<string, number>();
+      (ws.orderIds || []).forEach((oid, idx) => orderIdx.set(oid, idx));
+      const wsOrders = Array.from(candidateMap.values()).sort((a, b) => {
+        const idxA = orderIdx.has(a.id) ? orderIdx.get(a.id)! : Number.MAX_SAFE_INTEGER;
+        const idxB = orderIdx.has(b.id) ? orderIdx.get(b.id)! : Number.MAX_SAFE_INTEGER;
+        if (idxA !== idxB) return idxA - idxB;
+        const tA = new Date((a as any).updatedAt || a.createdAt || 0).getTime();
+        const tB = new Date((b as any).updatedAt || b.createdAt || 0).getTime();
+        if (tA !== tB) return tA - tB;
+        return a.id.localeCompare(b.id);
+      });
+
+      const activeOrder = wsOrders.find(o => o.id === ws.activeOrderId) || wsOrders[wsOrders.length - 1] || null;
       return {
         ...ws,
         orders: wsOrders,
-        orderIds: ws.orderIds && ws.orderIds.length > 0 ? ws.orderIds.filter(id => wsOrders.some(o => o.id === id)) : wsOrders.map(o => o.id),
-        activeOrder: wsOrders.find(o => o.id === ws.activeOrderId) || wsOrders[0] || null
+        orderIds: wsOrders.map(o => o.id),
+        activeOrderId: activeOrder?.id || ws.activeOrderId,
+        activeOrder
       };
     });
 
@@ -142,19 +159,16 @@ router.get('/workspaces/:id', requireAuth, async (req: Request, res: Response) =
       return res.status(403).json({ error: 'Forbidden: Only workspace participants may view this workspace.' });
     }
 
-    const allOrders = await store.listOrders();
-    const wsOrders = allOrders
-      .filter(o =>
-        (o.workspaceId === ws.workspaceId || (ws.orderIds && ws.orderIds.includes(o.id))) &&
-        ((o.buyerId === ws.buyerId && o.sellerId === ws.sellerId) || (o.buyerId === ws.sellerId && o.sellerId === ws.buyerId))
-      )
-      .map(o => enrichOrderWithServiceInfo(o, isAdmin));
+    const rawWsOrders = await store.listOrdersByWorkspaceId(ws.workspaceId);
+    const wsOrders = rawWsOrders.map(o => enrichOrderWithServiceInfo(o, isAdmin));
+    const activeOrder = wsOrders.find(o => o.id === ws.activeOrderId) || wsOrders[wsOrders.length - 1] || null;
 
     res.json({
       ...ws,
       orders: wsOrders,
-      orderIds: ws.orderIds && ws.orderIds.length > 0 ? ws.orderIds.filter(id => wsOrders.some(o => o.id === id)) : wsOrders.map(o => o.id),
-      activeOrder: wsOrders.find(o => o.id === ws.activeOrderId) || wsOrders[0] || null
+      orderIds: wsOrders.map(o => o.id),
+      activeOrderId: activeOrder?.id || ws.activeOrderId,
+      activeOrder
     });
   } catch (err: any) {
     res.status(500).json(formatApiError(err, 'Failed to fetch workspace details'));
@@ -185,7 +199,24 @@ router.post(
       const nameWithoutExt = path.basename(safeBase, path.extname(safeBase));
       const storedFilename = `${Date.now()}_${randomUUID().slice(0, 8)}_${nameWithoutExt}${ext}`;
 
-      const buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
+      let buffer: Buffer;
+      if (Buffer.isBuffer(req.body)) {
+        buffer = req.body;
+      } else if (typeof req.body === 'string') {
+        buffer = Buffer.from(req.body);
+      } else if (req.body && typeof req.body === 'object') {
+        const rawData = typeof req.body.dataUrl === 'string'
+          ? req.body.dataUrl
+          : (typeof req.body.content === 'string' ? req.body.content : '');
+        const b64Idx = rawData.indexOf(';base64,');
+        if (b64Idx !== -1) {
+          buffer = Buffer.from(rawData.slice(b64Idx + 8), 'base64');
+        } else {
+          buffer = Buffer.from(rawData);
+        }
+      } else {
+        buffer = Buffer.alloc(0);
+      }
       if (!buffer || buffer.length === 0) {
         return res.status(400).json({ error: 'No file data received' });
       }
@@ -229,7 +260,10 @@ router.post(
 
       let targetOrder: Order | null = null;
       if (orderId) {
-        targetOrder = (await store.getOrder(orderId)) || null;
+        targetOrder = (await store.getOrderById(orderId)) || null;
+        if (!targetOrder && !workspaceId) {
+          targetOrder = (await store.resolveWorkspaceActiveOrder(orderId)) || null;
+        }
         if (!targetOrder) {
           return res.status(404).json({ error: 'Associated order not found' });
         }
@@ -239,18 +273,23 @@ router.post(
         }
       }
 
+      let resolvedWorkspaceId: string | undefined = workspaceId || targetOrder?.workspaceId || undefined;
+
       if (workspaceId) {
-        const wsRes = await postgresStore.getPool().query('SELECT workspace_id, buyer_id, seller_id FROM workspaces WHERE workspace_id = $1', [workspaceId]);
+        const wsRes = await postgresStore.getPool().query('SELECT workspace_id, buyer_id, seller_id, order_ids FROM workspaces WHERE workspace_id = $1', [workspaceId]);
         if (wsRes.rows.length === 0) {
           if (targetOrder && (workspaceId === `ws-${targetOrder.id}` || workspaceId === targetOrder.workspaceId)) {
-            // Valid legacy workspace reference matching order
-          } else if (!targetOrder && workspaceId.startsWith('ws-')) {
-            const maybeOrder = await store.getOrder(workspaceId.slice(3));
+            resolvedWorkspaceId = workspaceId;
+          } else if (targetOrder) {
+            return res.status(403).json({ error: 'Forbidden: Mismatched orderId and workspaceId context.' });
+          } else if (workspaceId.startsWith('ws-')) {
+            const maybeOrder = await store.getOrderById(workspaceId.slice(3));
             if (maybeOrder) {
               const isParticipant = maybeOrder.buyerId === caller.id || maybeOrder.sellerId === caller.id || (maybeOrder as any).clientId === caller.id || (maybeOrder as any).freelancerId === caller.id;
               if (!isStaffUser(caller) && !isParticipant) {
                 return res.status(403).json({ error: 'Forbidden: You are not a participant of the specified workspace' });
               }
+              resolvedWorkspaceId = maybeOrder.workspaceId || workspaceId;
             } else {
               return res.status(404).json({ error: 'Associated workspace not found' });
             }
@@ -263,13 +302,16 @@ router.post(
             return res.status(403).json({ error: 'Forbidden: You are not a participant of the specified workspace' });
           }
           if (targetOrder) {
-            const orderMatchesWs = targetOrder.workspaceId === workspaceId ||
-              ((targetOrder.buyerId === wsRow.buyer_id && targetOrder.sellerId === wsRow.seller_id) ||
-               (targetOrder.buyerId === wsRow.seller_id && targetOrder.sellerId === wsRow.buyer_id));
-            if (!orderMatchesWs) {
-              return res.status(400).json({ error: 'Mismatched orderId and workspaceId context.' });
+            const wsOrderIds = Array.isArray(wsRow.order_ids) ? wsRow.order_ids.map(String) : [];
+            const orderBelongsToWorkspace =
+              (targetOrder.workspaceId === workspaceId || (!targetOrder.workspaceId && wsOrderIds.includes(targetOrder.id))) &&
+              targetOrder.buyerId === wsRow.buyer_id &&
+              targetOrder.sellerId === wsRow.seller_id;
+            if (!orderBelongsToWorkspace) {
+              return res.status(403).json({ error: 'Forbidden: Mismatched orderId and workspaceId context.' });
             }
           }
+          resolvedWorkspaceId = wsRow.workspace_id;
         }
       }
 
@@ -286,8 +328,8 @@ router.post(
           size: buffer.length,
           sha256,
           createdAt: new Date().toISOString(),
-          orderId: orderId || undefined,
-          workspaceId: workspaceId || undefined
+          orderId: targetOrder?.id || orderId || undefined,
+          workspaceId: resolvedWorkspaceId || undefined
         });
       } catch (recErr) {
         try { await deleteFileFromCloudStorage(storedFilename); } catch {}
@@ -299,11 +341,17 @@ router.post(
         ? `${(bytes / (1024 * 1024)).toFixed(1)} MB`
         : `${Math.max(1, Math.round(bytes / 1024))} KB`;
 
-      res.json({
+      const filePayload = {
         name: safeBase,
         size: sizeStr,
         url: fileUrl,
-        type: mimeType
+        type: mimeType,
+        orderId: targetOrder?.id || orderId || undefined,
+        workspaceId: resolvedWorkspaceId || undefined
+      };
+      res.json({
+        ...filePayload,
+        file: filePayload
       });
     } catch (err: any) {
       console.error('Workstream file upload error:', err);
@@ -320,7 +368,11 @@ router.get(['/workstream/files/:filename', '/uploads/workstream/:filename'], req
   if (!localExists && !dbRec) {
     return res.status(404).json({ error: 'File not found' });
   }
-  if (!(await canAccessWorkstreamFile((req as any).authenticatedUser, filename))) {
+  const context = {
+    workspaceId: typeof req.query.workspaceId === 'string' ? req.query.workspaceId : undefined,
+    orderId: typeof req.query.orderId === 'string' ? req.query.orderId : undefined
+  };
+  if (!(await canAccessWorkstreamFile((req as any).authenticatedUser, filename, context))) {
     return res.status(403).json({ error: 'Forbidden: You do not have access to this file.' });
   }
 
@@ -337,7 +389,7 @@ router.get(['/workstream/files/:filename', '/uploads/workstream/:filename'], req
     res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox");
   }
 
-  const forceDownload = req.query.download === '1' || !WORKSTREAM_INLINE_EXTENSIONS.has(ext) || ext === '.html' || ext === '.htm';
+  const forceDownload = req.query.download === '1' || !WORKSTREAM_INLINE_EXTENSIONS.has(ext) || ext === '.html' || ext === '.htm' || ext === '.svg';
   if (!localExists) {
     if (forceDownload) res.attachment(originalName); else res.type(ext);
     const stream = openCloudFileStream(filename);
@@ -372,14 +424,27 @@ router.delete(
   }
 );
 
-router.get('/messages/:orderId', requireAuth, async (req: Request, res: Response) => {
+router.get(['/messages/:orderId', '/workspaces/:orderId/messages'], requireAuth, async (req: Request, res: Response) => {
   try {
-    const order = await store.getOrder(req.params.orderId);
+    const paramId = req.params.orderId;
+    const order = await store.getOrder(paramId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
     if (!canAccessOrderWorkstream((req as any).authenticatedUser, order)) {
       return res.status(403).json({ error: 'Forbidden: You are not a participant of this Workstream.' });
     }
-    let msgs = await store.listMessages(req.params.orderId);
+
+    const orderOnly = req.query.orderOnly === 'true' || req.query.scope === 'order';
+    let msgs: Message[];
+    if (!orderOnly && order.workspaceId) {
+      const wsMsgs = await store.listMessagesForWorkspace(order.workspaceId);
+      if (wsMsgs.length > 0) {
+        msgs = wsMsgs;
+      } else {
+        msgs = await store.listMessages(order.id);
+      }
+    } else {
+      msgs = await store.listMessages(order.id);
+    }
 
     const before = typeof req.query.before === 'string' ? req.query.before : undefined;
     const limit = req.query.limit ? Math.min(200, Math.max(1, Number(req.query.limit))) : undefined;
@@ -427,7 +492,7 @@ router.post('/messages', requireAuth, rateLimit(120, 60_000), async (req: Reques
       return res.status(403).json({ error: 'Chat is currently paused.' });
     }
 
-    const fileCheck = await validateMessageFileInfo(req.body.fileInfo, caller);
+    const fileCheck = await validateMessageFileInfo(req.body.fileInfo, caller, order);
     if (!fileCheck.ok) return res.status(400).json({ error: (fileCheck as any).error });
 
     const clientMessageId = typeof req.body.clientMessageId === 'string' ? req.body.clientMessageId : undefined;
@@ -435,7 +500,7 @@ router.post('/messages', requireAuth, rateLimit(120, 60_000), async (req: Reques
       const pool = postgresStore.getPool();
       const existingRes = await pool.query(
         "SELECT * FROM messages WHERE order_id = $1 AND sender_id = $2 AND metadata->>'clientMessageId' = $3 LIMIT 1",
-        [orderId, caller.id, clientMessageId]
+        [order.id, caller.id, clientMessageId]
       );
       if (existingRes.rows.length > 0) {
         const r = existingRes.rows[0];
@@ -461,7 +526,10 @@ router.post('/messages', requireAuth, rateLimit(120, 60_000), async (req: Reques
     if (newMsg.fileInfo?.url) {
       const fn = workstreamFilenameFromUrl(newMsg.fileInfo.url);
       if (fn) {
-        await postgresStore.getPool().query("UPDATE uploads SET order_id = $1 WHERE filename = $2 AND order_id IS NULL", [order.id, fn]);
+        await postgresStore.getPool().query(
+          "UPDATE uploads SET order_id = COALESCE(order_id, $1), workspace_id = COALESCE(workspace_id, $3) WHERE filename = $2",
+          [order.id, fn, order.workspaceId || null]
+        );
       }
     }
     try {
@@ -482,7 +550,7 @@ router.post('/messages', requireAuth, rateLimit(120, 60_000), async (req: Reques
       type: 'message',
       title: 'New Message',
       message: `${caller.name} sent a message regarding order "${order.title}".`,
-      link: `/messages/${order.id}`,
+      link: `/workstream/${order.id}`,
       dedupKey: `msg_${newMsg.id}`,
       actorId: caller.id
     });
@@ -512,7 +580,7 @@ router.post('/orders/:id/message', requireAuth, rateLimit(120, 60_000), async (r
     if (order.isMuted && !isStaffUser(user)) {
       return res.status(403).json({ error: 'Chat is currently paused.' });
     }
-    const fileCheck = await validateMessageFileInfo(req.body.fileInfo, user);
+    const fileCheck = await validateMessageFileInfo(req.body.fileInfo, user, order);
     if (!fileCheck.ok) return res.status(400).json({ error: (fileCheck as any).error });
 
     const clientMessageId = typeof req.body.clientMessageId === 'string' ? req.body.clientMessageId : undefined;
@@ -546,7 +614,10 @@ router.post('/orders/:id/message', requireAuth, rateLimit(120, 60_000), async (r
     if (newMsg.fileInfo?.url) {
       const fn = workstreamFilenameFromUrl(newMsg.fileInfo.url);
       if (fn) {
-        await postgresStore.getPool().query("UPDATE uploads SET order_id = $1 WHERE filename = $2 AND order_id IS NULL", [order.id, fn]);
+        await postgresStore.getPool().query(
+          "UPDATE uploads SET order_id = COALESCE(order_id, $1), workspace_id = COALESCE(workspace_id, $3) WHERE filename = $2",
+          [order.id, fn, order.workspaceId || null]
+        );
       }
     }
     try {
@@ -576,8 +647,8 @@ router.get('/offers', requireAuth, async (req: Request, res: Response) => {
     const authUserId = (req as any).authenticatedUserId;
     const pool = postgresStore.getPool();
     const result = await pool.query(
-      `SELECT wo.* FROM workstream_offers wo
-       JOIN orders o ON wo.order_id = o.id
+      `SELECT DISTINCT wo.* FROM workstream_offers wo
+       JOIN orders o ON (wo.order_id = o.id OR wo.metadata->>'originOrderId' = o.id OR wo.metadata->>'resultingOrderId' = o.id)
        WHERE o.buyer_id = $1 OR o.seller_id = $1
        ORDER BY wo.created_at DESC`,
       [authUserId]
@@ -597,7 +668,10 @@ router.get('/orders/:id/offers', requireAuth, async (req: Request, res: Response
     if (!order) return res.status(404).json({ error: 'Order not found' });
     if (!canAccessOrderWorkstream(caller, order)) return res.status(403).json({ error: 'Forbidden' });
 
-    const orderOffers = await store.listOffersForOrder(order.id);
+    const orderOnly = req.query.orderOnly === 'true' || req.query.scope === 'order';
+    const orderOffers = (!orderOnly && order.workspaceId)
+      ? await store.listOffersForWorkspace(order.workspaceId, order.id)
+      : await store.listOffersForOrder(order.id);
     const offers = await Promise.all(orderOffers.map(viewOffer));
     const esc = await financialRepository.getEscrow(order.id);
     res.json({
@@ -620,10 +694,11 @@ router.post('/orders/:id/offers', requireAuth, requireActiveStatus, rateLimit(20
     const order = await store.getOrder(req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
     if (caller.id !== order.sellerId) return res.status(403).json({ error: 'Only the seller of this workstream can send this.' });
-    if (order.status === 'cancelled' && order.orderType !== 'gig' && !order.gigOrderId) return res.status(409).json({ error: 'Cannot send offers on a cancelled order.' });
-
     const kind = req.body?.kind as WorkstreamOfferKind;
     if (!['proposal', 'invoice', 'deposit'].includes(kind)) return res.status(400).json({ error: 'Invalid type.' });
+    if ((order.status === 'cancelled' || (order.status as string) === 'refunded') && kind === 'invoice') {
+      return res.status(409).json({ error: 'Cannot send a final invoice on a cancelled or refunded order. Send a proposal or deposit to start a follow-on order.' });
+    }
 
     const amount = Math.round(Number(req.body?.amount) * 100) / 100;
     const minAmount = Number(siteSettings.getFlattenedSettings().minOrderAmount) || 0;
@@ -646,7 +721,7 @@ router.post('/orders/:id/offers', requireAuth, requireActiveStatus, rateLimit(20
     const activeEscrow = await getActiveEscrowRemaining(order);
     const hasPaidFirstInvoice = await hasPaidInvoiceOrReleasedEscrow(order);
 
-    const existingOffers = await store.listOffersForOrder(order.id);
+    const existingOffers = (await store.listOffersForOrder(order.id)).filter(o => o.orderId === order.id);
 
     if (kind === 'invoice') {
       if (!funded || activeEscrow <= 0) return res.status(400).json({ error: 'Final invoices are for completed work on a funded workstream.' });
@@ -672,7 +747,7 @@ router.post('/orders/:id/offers', requireAuth, requireActiveStatus, rateLimit(20
         return res.status((validation as any).status || 400).json({ error: (validation as any).error });
       }
       uploadedFiles = validation.files.map((f: any, idx: number) => ({
-        id: 'deliv_' + Date.now() + '_' + idx,
+        id: 'deliv_' + Date.now() + '_' + idx + '_' + randomUUID().slice(0, 6),
         name: f.name,
         size: f.size,
         url: f.url,
@@ -689,6 +764,8 @@ router.post('/orders/:id/offers', requireAuth, requireActiveStatus, rateLimit(20
       id: 'off_' + randomUUID().slice(0, 12),
       number: generateCollisionSafeOfferNumber(kind),
       orderId: order.id,
+      originOrderId: order.id,
+      workspaceId: order.workspaceId,
       kind,
       title,
       amount,
@@ -699,7 +776,11 @@ router.post('/orders/:id/offers', requireAuth, requireActiveStatus, rateLimit(20
       responseDeadline,
       status: 'pending',
       createdBy: caller.id,
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      metadata: {
+        originOrderId: order.id,
+        ...(order.workspaceId ? { workspaceId: order.workspaceId } : {})
+      }
     };
     await saveOfferToDb(offer);
 
@@ -758,10 +839,384 @@ router.post('/orders/:id/offers', requireAuth, requireActiveStatus, rateLimit(20
   }
 });
 
+async function executeUnifiedOfferAccept(
+  offer: WorkstreamOffer,
+  order: Order,
+  caller: any,
+  idempotencyKey: string
+): Promise<{ status: number; body: any }> {
+  const isTerminal = ['completed', 'cancelled', 'refunded'].includes(order.status);
+  const isDisputed = order.status === 'disputed';
+  if ((isTerminal || isDisputed) && offer.kind !== 'proposal') {
+    return { status: 400, body: { error: `Cannot accept ${OFFER_LABEL[offer.kind]} on an order that is ${order.status}.` } };
+  }
+  if (order.orderType === 'project' && (order.status === 'completed' || order.status === 'cancelled') && offer.kind !== 'proposal') {
+    return { status: 400, body: { error: `Cannot accept ${offer.kind} on a ${order.status} project order.` } };
+  }
+  if (order.status === 'cancelled' && order.orderType !== 'gig' && !order.gigOrderId && offer.kind !== 'proposal') {
+    return { status: 400, body: { error: 'Cannot accept offers on a cancelled order (escrow has already been refunded).' } };
+  }
+  if (order.status === 'completed' && offer.kind === 'invoice') {
+    return { status: 400, body: { error: 'Cannot accept an invoice on a completed order (escrow has already been released).' } };
+  }
+
+  const now = new Date().toISOString();
+  await ensureWallet(order.buyerId);
+  await ensureWallet(order.sellerId);
+  const today = now.split('T')[0];
+  const protectionEnd = new Date(Date.now() + siteSettings.getSettings().commission.escrowProtectionDays * 86400000).toISOString().split('T')[0];
+  const hasExistingEscrow = await orderHasEscrow(order.id);
+  const isInitialFunding = !hasExistingEscrow && order.status !== 'cancelled' && (order.status as string) !== 'refunded' && order.status !== 'completed';
+  const isFollowOnAfterCompletion = hasExistingEscrow && (order.status === 'completed' || (await getActiveEscrowRemaining(order)) === 0);
+  const isCancelledOrRefundedFollowOn = order.status === 'cancelled' || (order.status as string) === 'refunded';
+
+  if (offer.kind === 'invoice') {
+    const validationError = validateOrderReleasePreconditions(order, false, true);
+    if (validationError) {
+      return { status: validationError.status, body: { error: validationError.error } };
+    }
+
+    const esc = await financialRepository.getEscrow(order.id);
+    const currentEscrow = esc ? esc.remaining : Number(order.amount || 0);
+    const invoiceAmount = Number(offer.amount);
+    const additionalAmount = Math.round((invoiceAmount - currentEscrow) * 100) / 100;
+
+    if (additionalAmount < 0) {
+      return { status: 400, body: { error: `Final invoice amount ($${invoiceAmount}) cannot be less than the current order escrow ($${currentEscrow}).` } };
+    }
+
+    await postgresStore.executeInTransaction(async (client) => {
+      const offerLockRes = await client.query('SELECT status FROM workstream_offers WHERE id = $1 FOR UPDATE', [offer.id]);
+      if (offerLockRes.rows.length > 0 && offerLockRes.rows[0].status !== 'pending') {
+        throw new Error(`This ${OFFER_LABEL[offer.kind]} is already ${offerLockRes.rows[0].status}.`);
+      }
+
+      if (additionalAmount > 0) {
+        const topUpRes = await topUpOrderEscrowWithEvent({
+          orderId: order.id,
+          orderTitle: `Invoice Top-up: ${offer.title}`,
+          amount: additionalAmount,
+          buyerId: order.buyerId,
+          sellerId: order.sellerId,
+          actor: `user:${order.buyerId}`,
+          idempotencyKey: `${idempotencyKey}-topup`
+        }, client);
+        order.amount = invoiceAmount;
+        if (topUpRes?.diff?.next) {
+          order.feeBreakdown = topUpRes.diff.next;
+          (order as any).serviceFee = topUpRes.diff.next.serviceFee ?? 0;
+          (order as any).smallOrderFee = topUpRes.diff.next.smallOrderFee ?? 0;
+        }
+      }
+
+      let invoiceRevisionsResolved = false;
+      if (Array.isArray(order.revisions)) {
+        for (const rev of order.revisions) {
+          if (rev.status === 'requested') {
+            rev.status = 'resolved';
+            invoiceRevisionsResolved = true;
+          }
+        }
+      }
+      if (invoiceRevisionsResolved) {
+        await emitSystemEvent(order.id, 'revision_resolved', `📝 Revision resolved via accepted invoice ${offer.number}.`, {}, client);
+      }
+
+      await releaseOrderFunds(order, caller.name, `Final invoice ${offer.number} accepted by buyer and escrow released`, false, `${idempotencyKey}-release`, false, client);
+
+      offer.status = 'paid';
+      offer.resolvedAt = now;
+      offer.resolvedBy = caller.id;
+      offer.originOrderId = offer.originOrderId || order.id;
+      offer.workspaceId = offer.workspaceId || order.workspaceId;
+
+      if (order.orderType === 'project') {
+        await createNotification({
+          userId: order.sellerId,
+          type: 'invoice_paid',
+          title: 'Invoice paid',
+          message: `Invoice ${offer.number} for "${order.title}" ($${invoiceAmount}) was approved and paid.`,
+          link: `/workstream/${order.id}`,
+          metadata: { orderId: order.id, offerId: offer.id, amount: invoiceAmount },
+          client
+        }, client);
+      }
+
+      await syncUserBalances([order.buyerId, order.sellerId].filter(Boolean), client);
+      await saveOfferToDb(offer, client);
+      await store.saveOrder(order, client);
+      const completionNote = additionalAmount > 0
+        ? `${offer.number} ($${invoiceAmount.toLocaleString()}) was paid (+$${additionalAmount.toLocaleString()} funded from wallet) and full escrow ($${invoiceAmount.toLocaleString()}) was released to the seller. Order completed!`
+        : `${offer.number} was accepted and escrow funds ($${invoiceAmount.toLocaleString()}) were released to the seller. Order completed!`;
+      await postOfferMessage(order, offer, null, completionNote, 'offer_paid', client);
+    });
+
+    return {
+      status: 200,
+      body: {
+        success: true,
+        offer: await viewOffer(offer),
+        order: enrichOrderWithServiceInfo(order)
+      }
+    };
+  } else if (isInitialFunding) {
+    if (order.status === 'funded_in_escrow' || (await orderHasEscrow(order.id))) {
+      return { status: 409, body: { error: 'Order escrow is already funded.' } };
+    }
+    if (order.status !== 'in_progress' && order.status !== 'payment_pending') {
+      return { status: 409, body: { error: 'Cannot fund escrow for order in current status.' } };
+    }
+    const newTitle = offer.kind === 'proposal' && (/^inquiry:/i.test(order.title) || !order.amount) ? offer.title : order.title;
+    const prevStatus = order.status;
+    const prevAmount = order.amount;
+    const prevTitle = order.title;
+
+    try {
+      await postgresStore.executeInTransaction(async (client) => {
+        const offerLockRes = await client.query('SELECT status FROM workstream_offers WHERE id = $1 FOR UPDATE', [offer.id]);
+        if (offerLockRes.rows.length > 0 && offerLockRes.rows[0].status !== 'pending') {
+          throw new Error(`This ${OFFER_LABEL[offer.kind]} is already ${offerLockRes.rows[0].status}.`);
+        }
+
+        order.previousStatus = prevStatus;
+        order.status = 'payment_pending';
+        order.title = newTitle;
+        order.amount = offer.amount;
+        await store.saveOrder(order, client);
+
+        await fundOrderEscrowWithEvent({
+          orderId: order.id,
+          orderTitle: newTitle,
+          amount: offer.amount,
+          buyerId: order.buyerId,
+          sellerId: order.sellerId,
+          actor: `user:${order.buyerId}`,
+          idempotencyKey
+        }, client);
+
+        const fundedOrderRow = await store.getOrder(order.id, client);
+        if (fundedOrderRow?.feeBreakdown) {
+          order.feeBreakdown = fundedOrderRow.feeBreakdown;
+          (order as any).serviceFee = (fundedOrderRow as any).serviceFee;
+          (order as any).smallOrderFee = (fundedOrderRow as any).smallOrderFee;
+        }
+
+        order.title = newTitle;
+        order.amount = offer.amount;
+        order.status = 'funded_in_escrow';
+        order.escrowProtectionStartDate = today;
+        order.escrowProtectionEndDate = protectionEnd;
+        if (offer.kind === 'proposal' && offer.deliveryDays) {
+          order.dueDate = new Date(Date.now() + offer.deliveryDays * 86400000).toISOString();
+        }
+        offer.orderId = order.id;
+        offer.originOrderId = offer.originOrderId || order.id;
+        offer.resultingOrderId = order.id;
+        offer.workspaceId = offer.workspaceId || order.workspaceId;
+        offer.status = 'accepted';
+        offer.resolvedAt = now;
+        offer.resolvedBy = caller.id;
+        if (offer.kind === 'proposal') {
+          const linkedProp = await findLinkedProposalForOffer(offer, order, client);
+          if (linkedProp) {
+            linkedProp.status = 'accepted';
+            linkedProp.workstreamOrderId = order.id;
+            linkedProp.offerId = offer.id;
+            order.proposalId = linkedProp.id;
+            await store.saveProposal(linkedProp, client);
+          }
+        }
+        await store.saveOrder(order, client);
+        await saveOfferToDb(offer, client);
+        await syncUserBalances([order.buyerId, order.sellerId].filter(Boolean), client);
+        await postOfferMessage(order, offer, null, `${offer.number} was accepted and escrow was funded ($${offer.amount}).`, 'offer_accepted', client);
+      });
+    } catch (fundingErr: any) {
+      order.status = prevStatus;
+      order.amount = prevAmount;
+      order.title = prevTitle;
+      return { status: 400, body: { error: fundingErr.message || 'Failed to fund escrow for offer.' } };
+    }
+    return {
+      status: 200,
+      body: {
+        success: true,
+        offer: await viewOffer(offer),
+        order: enrichOrderWithServiceInfo(order)
+      }
+    };
+  } else if (isFollowOnAfterCompletion || isCancelledOrRefundedFollowOn || ((order.status === 'completed' || order.status === 'cancelled' || (order.status as string) === 'refunded') && offer.kind === 'proposal')) {
+    const newOrderId = 'ord_' + randomUUID().slice(0, 12);
+    const isGigFollowOn = order.orderType === 'gig' || (Boolean(order.gigId) && !order.projectId);
+    const orderType: 'gig' | 'project' = isGigFollowOn ? 'gig' : 'project';
+    const gigOrderId = orderType === 'gig' ? newOrderId : undefined;
+    const projectOrderId = orderType === 'project' ? newOrderId : undefined;
+
+    const newOrder: Order = {
+      id: newOrderId,
+      workspaceId: order.workspaceId,
+      orderType,
+      ...(gigOrderId ? { gigOrderId } : {}),
+      ...(projectOrderId ? { projectOrderId } : {}),
+      title: offer.title,
+      buyerId: order.buyerId,
+      sellerId: order.sellerId,
+      amount: offer.amount,
+      status: 'payment_pending',
+      createdAt: today,
+      dueDate: offer.kind === 'proposal' && offer.deliveryDays
+        ? new Date(Date.now() + offer.deliveryDays * 86400000).toISOString()
+        : new Date(Date.now() + 7 * 86400000).toISOString(),
+      escrowProtectionStartDate: today,
+      escrowProtectionEndDate: protectionEnd,
+      feeBreakdown: await quoteOrderWithLiveSettings(offer.amount),
+      projectId: order.projectId,
+      gigId: order.gigId
+    };
+
+    const enrichedOrder = enrichOrderWithServiceInfo(newOrder);
+    const originOrderId = offer.originOrderId || order.id;
+
+    try {
+      await postgresStore.executeInTransaction(async (client) => {
+        const offerLockRes = await client.query('SELECT status FROM workstream_offers WHERE id = $1 FOR UPDATE', [offer.id]);
+        if (offerLockRes.rows.length > 0 && offerLockRes.rows[0].status !== 'pending') {
+          throw new Error(`This ${OFFER_LABEL[offer.kind]} is already ${offerLockRes.rows[0].status}.`);
+        }
+
+        await recordOrder(enrichedOrder, client);
+        await store.saveOrder(enrichedOrder, client);
+
+        await fundOrderEscrowWithEvent({
+          orderId: newOrder.id,
+          orderTitle: newOrder.title,
+          amount: newOrder.amount,
+          buyerId: newOrder.buyerId,
+          sellerId: newOrder.sellerId,
+          actor: `user:${newOrder.buyerId}`,
+          idempotencyKey
+        }, client);
+
+        const fundedRow = await store.getOrder(newOrder.id, client);
+        if (fundedRow?.feeBreakdown) {
+          enrichedOrder.feeBreakdown = fundedRow.feeBreakdown;
+          (enrichedOrder as any).serviceFee = (fundedRow as any).serviceFee;
+          (enrichedOrder as any).smallOrderFee = (fundedRow as any).smallOrderFee;
+        }
+
+        enrichedOrder.status = 'funded_in_escrow';
+        await store.saveOrder(enrichedOrder, client);
+        await syncUserBalances([newOrder.buyerId, newOrder.sellerId].filter(Boolean), client);
+
+        await emitSystemEvent(newOrder.id, 'order_created', `Order placed: ${newOrder.title}. Payment is held in escrow until the work is approved.`, { originOrderId }, client);
+
+        offer.originOrderId = originOrderId;
+        offer.resultingOrderId = newOrder.id;
+        offer.workspaceId = order.workspaceId;
+        offer.orderId = newOrder.id;
+        offer.status = 'accepted';
+        offer.resolvedAt = now;
+        offer.resolvedBy = caller.id;
+        offer.metadata = {
+          ...(offer.metadata || {}),
+          originOrderId,
+          resultingOrderId: newOrder.id,
+          ...(order.workspaceId ? { workspaceId: order.workspaceId } : {})
+        };
+
+        if (orderType === 'project') {
+          await createNotification({
+            userId: newOrder.sellerId,
+            type: 'proposal_accepted',
+            title: 'Follow-on proposal accepted',
+            message: `Your follow-on proposal "${offer.title}" was accepted and escrow has been funded.`,
+            link: `/workstream/${newOrderId}`,
+            metadata: { orderId: newOrderId, originOrderId, offerId: offer.id },
+            client
+          }, client);
+        }
+
+        await saveOfferToDb(offer, client);
+        await postOfferMessage(enrichedOrder, offer, null, `Follow-on ${OFFER_LABEL[offer.kind]} ${offer.number} ("${offer.title}") was accepted and $${offer.amount.toLocaleString()} was funded into escrow in a new Order (#${newOrderId}).`, 'offer_accepted', client);
+      });
+    } catch (fundingErr: any) {
+      return { status: 400, body: { error: fundingErr.message || 'Failed to fund escrow for follow-on order.' } };
+    }
+
+    const enrichedFollowOnResult = enrichOrderWithServiceInfo(enrichedOrder);
+    return {
+      status: 200,
+      body: {
+        success: true,
+        offer: await viewOffer(offer),
+        order: enrichedFollowOnResult,
+        newOrder: enrichedFollowOnResult,
+        originOrder: enrichOrderWithServiceInfo(order)
+      }
+    };
+  } else {
+    await postgresStore.executeInTransaction(async (client) => {
+      const offerLockRes = await client.query('SELECT status FROM workstream_offers WHERE id = $1 FOR UPDATE', [offer.id]);
+      if (offerLockRes.rows.length > 0 && offerLockRes.rows[0].status !== 'pending') {
+        throw new Error(`This ${OFFER_LABEL[offer.kind]} is already ${offerLockRes.rows[0].status}.`);
+      }
+
+      const topUpRes = await topUpOrderEscrowWithEvent({
+        orderId: order.id,
+        orderTitle: offer.title,
+        amount: offer.amount,
+        buyerId: order.buyerId,
+        sellerId: order.sellerId,
+        actor: `user:${order.buyerId}`,
+        idempotencyKey
+      }, client);
+
+      order.amount = Math.round((Number(order.amount || 0) + offer.amount) * 100) / 100;
+      if (topUpRes?.diff?.next) {
+        order.feeBreakdown = topUpRes.diff.next;
+        (order as any).serviceFee = topUpRes.diff.next.serviceFee ?? 0;
+        (order as any).smallOrderFee = topUpRes.diff.next.smallOrderFee ?? 0;
+      }
+      if (offer.kind === 'proposal' && offer.deliveryDays) {
+        order.dueDate = new Date(Date.now() + offer.deliveryDays * 86400000).toISOString();
+      }
+      offer.orderId = order.id;
+      offer.originOrderId = offer.originOrderId || order.id;
+      offer.resultingOrderId = order.id;
+      offer.workspaceId = offer.workspaceId || order.workspaceId;
+      offer.status = 'accepted';
+      offer.resolvedAt = now;
+      offer.resolvedBy = caller.id;
+      if (offer.kind === 'proposal') {
+        const linkedProp = await findLinkedProposalForOffer(offer, order, client);
+        if (linkedProp) {
+          linkedProp.status = 'accepted';
+          linkedProp.workstreamOrderId = order.id;
+          linkedProp.offerId = offer.id;
+          await store.saveProposal(linkedProp, client);
+        }
+      }
+      await syncUserBalances([order.buyerId, order.sellerId].filter(Boolean), client);
+      await store.saveOrder(order, client);
+      await saveOfferToDb(offer, client);
+      await postOfferMessage(order, offer, null, `${offer.number} was accepted and escrow was topped up with $${offer.amount}. All funds and milestones remain unified under Order #${order.id}.`, 'offer_accepted', client);
+    });
+
+    return {
+      status: 200,
+      body: {
+        success: true,
+        offer: await viewOffer(offer),
+        order: enrichOrderWithServiceInfo(order)
+      }
+    };
+  }
+}
+
 router.post('/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimit(20, 60_000), async (req: Request, res: Response) => {
   const initialOffer = await store.getOfferById(req.params.id);
   if (!initialOffer) return res.status(404).json({ error: 'Not found' });
-  const initialOrder = await store.getOrder(initialOffer.orderId);
+  const initialOrder = await store.getOrder(initialOffer.originOrderId || initialOffer.orderId);
   if (!initialOrder) return res.status(404).json({ error: 'Not found' });
 
   const lockedOrderId = initialOrder.id;
@@ -769,7 +1224,7 @@ router.post('/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimit
   try {
     const offer = await store.getOfferById(req.params.id);
     if (!offer) return res.status(404).json({ error: 'Not found' });
-    const order = await store.getOrder(offer.orderId);
+    const order = await store.getOrder(offer.originOrderId || offer.orderId);
     if (!order) return res.status(404).json({ error: 'Not found' });
 
     const caller = await offerCaller(req);
@@ -777,10 +1232,11 @@ router.post('/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimit
     if (!canAccessOrderWorkstream(caller, order)) return res.status(403).json({ error: 'Forbidden' });
     if (offer.status !== 'pending') {
       if (offer.status === 'accepted' || offer.status === 'paid') {
-        const associatedOrder = await store.getOrder(offer.orderId) || order;
-        return res.json({ 
-          offer: await viewOffer(offer), 
-          order: enrichOrderWithServiceInfo(associatedOrder) 
+        const associatedOrder = await store.getOrder(offer.resultingOrderId || offer.orderId) || order;
+        return res.json({
+          success: true,
+          offer: await viewOffer(offer),
+          order: enrichOrderWithServiceInfo(associatedOrder)
         });
       }
       return res.status(409).json({ error: `This ${OFFER_LABEL[offer.kind]} is already ${offer.status}.` });
@@ -804,7 +1260,7 @@ router.post('/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimit
         }
       }
       if (offer.kind === 'invoice' && (order.status === 'delivered' || order.status === 'draft_review')) {
-        const otherOffers = await store.listOffersForOrder(order.id);
+        const otherOffers = (await store.listOffersForOrder(order.id)).filter(o => o.orderId === order.id);
         const hasOtherPending = otherOffers.some(o => o.id !== offer.id && o.kind === 'invoice' && o.status === 'pending');
         if (!hasOtherPending && (await orderHasEscrow(order.id))) {
           order.status = 'in_progress';
@@ -827,23 +1283,6 @@ router.post('/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimit
     }
 
     if (caller.id !== order.buyerId) return res.status(403).json({ error: 'Only the buyer can respond to this.' });
-
-    if (action === 'accept') {
-      const isTerminal = ['completed', 'cancelled', 'refunded'].includes(order.status);
-      const isDisputed = order.status === 'disputed';
-      if ((isTerminal || isDisputed) && offer.kind !== 'proposal') {
-        return res.status(400).json({ error: `Cannot accept ${OFFER_LABEL[offer.kind]} on an order that is ${order.status}.` });
-      }
-    }
-    if (order.orderType === 'project' && (order.status === 'completed' || order.status === 'cancelled') && offer.kind !== 'proposal') {
-      return res.status(400).json({ error: `Cannot accept ${offer.kind} on a ${order.status} project order.` });
-    }
-    if (order.status === 'cancelled' && order.orderType !== 'gig' && !order.gigOrderId && offer.kind !== 'proposal') {
-      return res.status(400).json({ error: 'Cannot accept offers on a cancelled order (escrow has already been refunded).' });
-    }
-    if (order.status === 'completed' && offer.kind === 'invoice') {
-      return res.status(400).json({ error: 'Cannot accept an invoice on a completed order (escrow has already been released).' });
-    }
 
     if (action === 'decline') {
       if (order.orderType === 'project' && offer.kind === 'invoice') {
@@ -887,7 +1326,7 @@ router.post('/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimit
           });
         }
       } else if (offer.kind === 'invoice' && order.orderType !== 'project' && (order.status === 'delivered' || order.status === 'draft_review')) {
-        const otherOffers = await store.listOffersForOrder(order.id);
+        const otherOffers = (await store.listOffersForOrder(order.id)).filter(o => o.orderId === order.id);
         const hasOtherPending = otherOffers.some(o => o.id !== offer.id && o.kind === 'invoice' && o.status === 'pending');
         if (!hasOtherPending && (await orderHasEscrow(order.id))) {
           order.status = 'revision';
@@ -899,261 +1338,8 @@ router.post('/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimit
       return res.json({ offer: await viewOffer(offer), order: enrichOrderWithServiceInfo(order) });
     }
 
-    // accept: real money movement through the ledger
-    await ensureWallet(order.buyerId);
-    await ensureWallet(order.sellerId);
-    const today = now.split('T')[0];
-    const protectionEnd = new Date(Date.now() + siteSettings.getSettings().commission.escrowProtectionDays * 86400000).toISOString().split('T')[0];
-    const isInitialFunding = !(await orderHasEscrow(order.id));
-    const isFollowOnAfterCompletion = (await orderHasEscrow(order.id)) && (order.status === 'completed' || (await getActiveEscrowRemaining(order)) === 0);
-    const isCancelledGigFollowOn = order.status === 'cancelled' && (order.orderType === 'gig' || order.gigOrderId);
-
-    if (offer.kind === 'invoice') {
-      const validationError = validateOrderReleasePreconditions(order, false, true);
-      if (validationError) {
-        return res.status(validationError.status).json({ error: validationError.error });
-      }
-
-      const esc = await financialRepository.getEscrow(order.id);
-      const currentEscrow = esc ? esc.remaining : Number(order.amount || 0);
-      const invoiceAmount = Number(offer.amount);
-      const additionalAmount = Math.round((invoiceAmount - currentEscrow) * 100) / 100;
-
-      if (additionalAmount < 0) {
-        return res.status(400).json({ error: `Final invoice amount ($${invoiceAmount}) cannot be less than the current order escrow ($${currentEscrow}).` });
-      }
-
-      if (additionalAmount > 0) {
-        await topUpOrderEscrowWithEvent({
-          orderId: order.id,
-          orderTitle: `Invoice Top-up: ${offer.title}`,
-          amount: additionalAmount,
-          buyerId: order.buyerId,
-          sellerId: order.sellerId,
-          actor: `user:${order.buyerId}`,
-          idempotencyKey: `${idempotencyKey}-topup`
-        });
-        order.amount = invoiceAmount;
-      }
-
-      let invoiceRevisionsResolved = false;
-      if (Array.isArray(order.revisions)) {
-        for (const rev of order.revisions) {
-          if (rev.status === 'requested') {
-            rev.status = 'resolved';
-            invoiceRevisionsResolved = true;
-          }
-        }
-      }
-      if (invoiceRevisionsResolved) {
-        await emitSystemEvent(order.id, 'revision_resolved', `📝 Revision resolved via accepted invoice ${offer.number}.`);
-      }
-
-      await releaseOrderFunds(order, caller.name, `Final invoice ${offer.number} accepted by buyer and escrow released`, false);
-
-      offer.status = 'paid';
-      offer.resolvedAt = now;
-      offer.resolvedBy = caller.id;
-
-      if (order.orderType === 'project') {
-        createNotification({
-          userId: order.sellerId,
-          type: 'invoice_paid',
-          title: 'Invoice paid',
-          message: `Invoice ${offer.number} for "${order.title}" ($${invoiceAmount}) was approved and paid.`,
-          link: `/workstream/${order.id}`,
-          metadata: { orderId: order.id, offerId: offer.id, amount: invoiceAmount }
-        });
-      }
-
-      await syncUserBalances();
-      await saveOfferToDb(offer);
-      await store.saveOrder(order);
-      const completionNote = additionalAmount > 0
-        ? `${offer.number} ($${invoiceAmount.toLocaleString()}) was paid (+$${additionalAmount.toLocaleString()} funded from wallet) and full escrow ($${invoiceAmount.toLocaleString()}) was released to the seller. Order completed!`
-        : `${offer.number} was accepted and escrow funds ($${invoiceAmount.toLocaleString()}) were released to the seller. Order completed!`;
-      await postOfferMessage(order, offer, null, completionNote, 'offer_paid');
-      return res.json({ offer: await viewOffer(offer), order: enrichOrderWithServiceInfo(order) });
-
-    } else if (isInitialFunding) {
-      if (order.status === 'funded_in_escrow' || (await orderHasEscrow(order.id))) {
-        return res.status(409).json({ error: 'Order escrow is already funded.' });
-      }
-      if (order.status !== 'in_progress' && order.status !== 'payment_pending') {
-        return res.status(409).json({ error: 'Cannot fund escrow for order in current status.' });
-      }
-      const newTitle = offer.kind === 'proposal' && (/^inquiry:/i.test(order.title) || !order.amount) ? offer.title : order.title;
-      const prevStatus = order.status;
-      order.previousStatus = prevStatus;
-      order.status = 'payment_pending';
-      await store.saveOrder(order);
-
-      let escrowFunded = false;
-      try {
-        await fundOrderEscrowWithEvent({
-          orderId: order.id,
-          orderTitle: newTitle,
-          amount: offer.amount,
-          buyerId: order.buyerId,
-          sellerId: order.sellerId,
-          actor: `user:${order.buyerId}`,
-          idempotencyKey
-        });
-        escrowFunded = true;
-        order.title = newTitle;
-        order.amount = offer.amount;
-        order.status = 'funded_in_escrow';
-        order.escrowProtectionStartDate = today;
-        order.escrowProtectionEndDate = protectionEnd;
-        if (offer.kind === 'proposal' && offer.deliveryDays) {
-          order.dueDate = new Date(Date.now() + offer.deliveryDays * 86400000).toISOString();
-        }
-        offer.orderId = order.id;
-        offer.status = 'accepted';
-        if (offer.kind === 'proposal') {
-          const linkedProp = await findLinkedProposalForOffer(offer, order);
-          if (linkedProp) {
-            linkedProp.status = 'accepted';
-            linkedProp.workstreamOrderId = order.id;
-            linkedProp.offerId = offer.id;
-            order.proposalId = linkedProp.id;
-            await store.saveProposal(linkedProp);
-          }
-        }
-        await store.saveOrder(order);
-        await saveOfferToDb(offer);
-        await postOfferMessage(order, offer, null, `${offer.number} was accepted and escrow was funded ($${offer.amount}).`, 'offer_accepted');
-      } catch (fundingErr: any) {
-        if (!escrowFunded) {
-          order.status = prevStatus;
-          await store.saveOrder(order);
-          return res.status(400).json({ error: fundingErr.message || 'Failed to fund escrow for offer.' });
-        }
-        order.status = 'in_progress';
-        offer.status = 'accepted';
-        await store.saveOrder(order);
-        await saveOfferToDb(offer);
-        return res.json({ offer: await viewOffer(offer), order: enrichOrderWithServiceInfo(order) });
-      }
-    } else if (isFollowOnAfterCompletion || isCancelledGigFollowOn || (order.orderType === 'project' && (order.status === 'completed' || order.status === 'cancelled') && offer.kind === 'proposal')) {
-      const newOrderId = 'ord_' + randomUUID().slice(0, 12);
-      const isGigFollowOn = order.orderType === 'gig' || (Boolean(order.gigId) && !order.projectId);
-      const orderType: 'gig' | 'project' = isGigFollowOn ? 'gig' : 'project';
-      const gigOrderId = orderType === 'gig' ? newOrderId : undefined;
-      const projectOrderId = orderType === 'project' ? newOrderId : undefined;
-
-      const newOrder: Order = {
-        id: newOrderId,
-        workspaceId: order.workspaceId,
-        orderType,
-        ...(gigOrderId ? { gigOrderId } : {}),
-        ...(projectOrderId ? { projectOrderId } : {}),
-        title: offer.title,
-        buyerId: order.buyerId,
-        sellerId: order.sellerId,
-        amount: offer.amount,
-        status: 'payment_pending',
-        createdAt: today,
-        dueDate: offer.kind === 'proposal' && offer.deliveryDays
-          ? new Date(Date.now() + offer.deliveryDays * 86400000).toISOString()
-          : new Date(Date.now() + 7 * 86400000).toISOString(),
-        escrowProtectionStartDate: today,
-        escrowProtectionEndDate: protectionEnd,
-        feeBreakdown: calculateOrderFees(offer.amount),
-        projectId: order.projectId,
-        gigId: order.gigId
-      };
-
-      const enrichedOrder = enrichOrderWithServiceInfo(newOrder);
-      await recordOrder(enrichedOrder);
-      await store.saveOrder(enrichedOrder);
-
-      let followOnEscrowFunded = false;
-      try {
-        await fundOrderEscrowWithEvent({
-          orderId: newOrder.id,
-          orderTitle: newOrder.title,
-          amount: newOrder.amount,
-          buyerId: newOrder.buyerId,
-          sellerId: newOrder.sellerId,
-          actor: `user:${newOrder.buyerId}`,
-          idempotencyKey
-        });
-        followOnEscrowFunded = true;
-        
-        enrichedOrder.status = 'funded_in_escrow';
-        await store.saveOrder(enrichedOrder);
-        await syncUserBalances();
-      } catch (fundingErr: any) {
-        if (!followOnEscrowFunded) {
-          const pool = postgresStore.getPool();
-          const escCheck = await pool.query('SELECT 1 FROM escrows WHERE order_id = $1', [newOrder.id]);
-          if (escCheck.rows.length === 0) {
-            await pool.query('DELETE FROM orders WHERE id = $1', [newOrder.id]);
-          } else {
-            enrichedOrder.status = 'payment_pending';
-            await store.saveOrder(enrichedOrder);
-          }
-          return res.status(400).json({ error: fundingErr.message || 'Failed to fund escrow for follow-on order.' });
-        }
-        enrichedOrder.status = 'in_progress';
-        await store.saveOrder(enrichedOrder);
-        return res.json({ offer: await viewOffer(offer), order: enrichOrderWithServiceInfo(enrichedOrder) });
-      }
-
-      await emitSystemEvent(newOrder.id, 'order_created', `Order placed: ${newOrder.title}. Payment is held in escrow until the work is approved.`);
-
-      offer.orderId = newOrder.id;
-      offer.status = 'accepted';
-
-      if (orderType === 'project') {
-        createNotification({
-          userId: newOrder.sellerId,
-          type: 'proposal_accepted',
-          title: 'Follow-on proposal accepted',
-          message: `Your follow-on proposal "${offer.title}" was accepted and escrow has been funded.`,
-          link: `/workstream/${newOrderId}`,
-          metadata: { orderId: newOrderId, offerId: offer.id }
-        });
-      }
-
-      await saveOfferToDb(offer);
-      await postOfferMessage(enrichedOrder, offer, null, `Follow-on ${OFFER_LABEL[offer.kind]} ${offer.number} ("${offer.title}") was accepted and $${offer.amount.toLocaleString()} was funded into escrow in a new Order (#${newOrderId}).`, 'offer_accepted');
-      return res.json({ offer: await viewOffer(offer), order: enrichOrderWithServiceInfo(enrichedOrder) });
-    } else {
-      await topUpOrderEscrowWithEvent({
-        orderId: order.id,
-        orderTitle: offer.title,
-        amount: offer.amount,
-        buyerId: order.buyerId,
-        sellerId: order.sellerId,
-        actor: `user:${order.buyerId}`,
-        idempotencyKey
-      });
-      order.amount = Math.round((Number(order.amount || 0) + offer.amount) * 100) / 100;
-      if (offer.kind === 'proposal' && offer.deliveryDays) {
-        order.dueDate = new Date(Date.now() + offer.deliveryDays * 86400000).toISOString();
-      }
-      offer.orderId = order.id;
-      offer.status = 'accepted';
-      if (offer.kind === 'proposal') {
-        const linkedProp = await findLinkedProposalForOffer(offer, order);
-        if (linkedProp) {
-          linkedProp.status = 'accepted';
-          linkedProp.workstreamOrderId = order.id;
-          linkedProp.offerId = offer.id;
-          await store.saveProposal(linkedProp);
-        }
-      }
-      await postOfferMessage(order, offer, null, `${offer.number} was accepted and escrow was topped up with $${offer.amount}. All funds and milestones remain unified under Order #${order.id}.`, 'offer_accepted');
-    }
-
-    offer.resolvedAt = now;
-    offer.resolvedBy = caller.id;
-    await syncUserBalances();
-    await store.saveOrder(order);
-    await saveOfferToDb(offer);
-    res.json({ offer: await viewOffer(offer), order: enrichOrderWithServiceInfo(order) });
+    const acceptResult = await executeUnifiedOfferAccept(offer, order, caller, idempotencyKey);
+    return res.status(acceptResult.status).json(acceptResult.body);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   } finally {
@@ -1196,7 +1382,7 @@ router.post(
       }
       if (offer.status !== 'pending') {
         if (offer.status === 'accepted' || offer.status === 'paid') {
-          const existingOrder = offer.orderId ? await store.getOrder(offer.orderId) : null;
+          const existingOrder = (offer.resultingOrderId || offer.orderId) ? await store.getOrder(offer.resultingOrderId || offer.orderId) : null;
           return res.json({
             success: true,
             order: existingOrder ? enrichOrderWithServiceInfo(existingOrder) : null,
@@ -1208,84 +1394,93 @@ router.post(
 
       const idempotencyKey = req.body?.idempotencyKey || (req.headers['x-idempotency-key'] as string) || `offer-accept-${offer.id}`;
 
-      let order = offer.orderId ? await store.getOrder(offer.orderId) : null;
+      const targetOrderLookupId = offer.originOrderId || offer.orderId;
+      let order = targetOrderLookupId ? await store.getOrder(targetOrderLookupId) : null;
       if (!order && msg?.order_id) {
         order = await store.getOrder(msg.order_id);
       }
 
       if (!order) {
-        const clientId = caller.id;
-        const sellerId = offer.createdBy;
-        const offerAmount = Number(offer.amount);
-        const offerTitle = offer.title || 'Custom Offer';
-
-        if (!sellerId || !Number.isFinite(offerAmount) || offerAmount <= 0) {
-          return res.status(400).json({ error: 'Invalid custom offer details.' });
-        }
-
-        await ensureWallet(clientId);
-        await ensureWallet(sellerId);
-
-        const newOrderId = 'ord_' + randomUUID().slice(0, 12);
-        const today = new Date().toISOString().split('T')[0];
-        const protectionDays = siteSettings.getSettings().commission.escrowProtectionDays || 14;
-
-        const newOrder: Order = {
-          id: newOrderId,
-          workspaceId: newOrderId,
-          title: offerTitle,
-          buyerId: clientId,
-          sellerId: sellerId,
-          amount: offerAmount,
-          status: 'payment_pending',
-          createdAt: today,
-          dueDate: new Date(Date.now() + 7 * 86400000).toISOString(),
-          escrowProtectionStartDate: today,
-          escrowProtectionEndDate: new Date(Date.now() + protectionDays * 86400000).toISOString().split('T')[0],
-          feeBreakdown: calculateOrderFees(offerAmount)
-        };
-
-        await workspaceService.ensureWorkspaceForOrderAsync(newOrder);
-        await store.saveOrder(newOrder);
-
-        let customOfferEscrowFunded = false;
+        if (!tryAcquireOrderLock(offer.id, res)) return;
         try {
-          await fundOrderEscrowWithEvent({
-            orderId: newOrder.id,
-            orderTitle: newOrder.title,
-            amount: newOrder.amount,
-            buyerId: newOrder.buyerId,
-            sellerId: newOrder.sellerId,
-            actor: `user:${caller.id}`,
-            idempotencyKey
+          const clientId = caller.id;
+          const sellerId = offer.createdBy;
+          const offerAmount = Number(offer.amount);
+          const offerTitle = offer.title || 'Custom Offer';
+
+          if (!sellerId || !Number.isFinite(offerAmount) || offerAmount <= 0) {
+            return res.status(400).json({ error: 'Invalid custom offer details.' });
+          }
+
+          await ensureWallet(clientId);
+          await ensureWallet(sellerId);
+
+          const newOrderId = 'ord_' + randomUUID().slice(0, 12);
+          const today = new Date().toISOString().split('T')[0];
+          const protectionDays = siteSettings.getSettings().commission.escrowProtectionDays || 14;
+
+          const newOrder: Order = {
+            id: newOrderId,
+            workspaceId: offer.workspaceId || newOrderId,
+            title: offerTitle,
+            buyerId: clientId,
+            sellerId: sellerId,
+            amount: offerAmount,
+            status: 'payment_pending',
+            createdAt: today,
+            dueDate: new Date(Date.now() + 7 * 86400000).toISOString(),
+            escrowProtectionStartDate: today,
+            escrowProtectionEndDate: new Date(Date.now() + protectionDays * 86400000).toISOString().split('T')[0],
+            feeBreakdown: await quoteOrderWithLiveSettings(offerAmount)
+          };
+
+          await postgresStore.executeInTransaction(async (client) => {
+            const offerLockRes = await client.query('SELECT status, order_id FROM workstream_offers WHERE id = $1 FOR UPDATE', [offer.id]);
+            if (offerLockRes.rows.length > 0 && offerLockRes.rows[0].status !== 'pending') {
+              throw new Error(`This offer is already ${offerLockRes.rows[0].status}.`);
+            }
+
+            await recordOrder(newOrder, client);
+            await store.saveOrder(newOrder, client);
+
+            await fundOrderEscrowWithEvent({
+              orderId: newOrder.id,
+              orderTitle: newOrder.title,
+              amount: newOrder.amount,
+              buyerId: newOrder.buyerId,
+              sellerId: newOrder.sellerId,
+              actor: `user:${caller.id}`,
+              idempotencyKey
+            }, client);
+
+            const fundedRow = await store.getOrder(newOrder.id, client);
+            if (fundedRow?.feeBreakdown) {
+              newOrder.feeBreakdown = fundedRow.feeBreakdown;
+              (newOrder as any).serviceFee = (fundedRow as any).serviceFee;
+              (newOrder as any).smallOrderFee = (fundedRow as any).smallOrderFee;
+            }
+
+            newOrder.status = 'funded_in_escrow';
+            await store.saveOrder(newOrder, client);
+            await syncUserBalances([newOrder.buyerId, newOrder.sellerId].filter(Boolean), client);
+            await emitSystemEvent(newOrder.id, 'order_created', `Order placed: ${newOrder.title}. Payment is held in escrow until the work is approved.`, {}, client);
+
+            offer.status = 'accepted';
+            offer.originOrderId = offer.originOrderId || newOrder.id;
+            offer.resultingOrderId = newOrder.id;
+            offer.workspaceId = newOrder.workspaceId;
+            offer.orderId = newOrder.id;
+            offer.resolvedAt = new Date().toISOString();
+            offer.resolvedBy = caller.id;
+            await saveOfferToDb(offer, client);
+            await postOfferMessage(newOrder, offer, null, `${offer.number || 'Offer'} was accepted and escrow was funded ($${offer.amount}).`, 'offer_accepted', client);
           });
-          customOfferEscrowFunded = true;
-
-          newOrder.status = 'in_progress';
-          await store.saveOrder(newOrder);
-          await syncUserBalances();
-
-          offer.status = 'accepted';
-          offer.orderId = newOrder.id;
-          offer.resolvedAt = new Date().toISOString();
-          offer.resolvedBy = caller.id;
-          await saveOfferToDb(offer);
 
           return res.json({ success: true, order: enrichOrderWithServiceInfo(newOrder), offer: await viewOffer(offer) });
         } catch (err: any) {
-          if (!customOfferEscrowFunded) {
-            const escCheck = await pool.query("SELECT 1 FROM escrows WHERE order_id = $1", [newOrder.id]);
-            if (escCheck.rows.length === 0) {
-              await pool.query("DELETE FROM orders WHERE id = $1", [newOrder.id]);
-            } else {
-              newOrder.status = 'payment_pending';
-              await store.saveOrder(newOrder);
-            }
-            return res.status(400).json({ error: err.message || 'Failed to fund escrow for custom offer' });
-          }
-          newOrder.status = 'in_progress';
-          await store.saveOrder(newOrder);
-          return res.json({ success: true, order: enrichOrderWithServiceInfo(newOrder), offer: await viewOffer(offer) });
+          return res.status(400).json({ error: err.message || 'Failed to fund escrow for custom offer' });
+        } finally {
+          releaseOrderLock(offer.id);
         }
       }
 
@@ -1303,111 +1498,28 @@ router.post(
 
         if (targetOffer.status !== 'pending') {
           if (targetOffer.status === 'accepted' || targetOffer.status === 'paid') {
+            const resultingOrd = (targetOffer.resultingOrderId || targetOffer.orderId)
+              ? await store.getOrder(targetOffer.resultingOrderId || targetOffer.orderId)
+              : freshOrder;
             return res.json({
               success: true,
-              order: enrichOrderWithServiceInfo(freshOrder),
+              order: enrichOrderWithServiceInfo(resultingOrd || freshOrder),
               offer: await viewOffer(targetOffer)
             });
           }
           return res.status(409).json({ error: `This offer is already ${targetOffer.status}.` });
         }
 
-        if (targetOffer.kind === 'invoice') {
-          const validationError = validateOrderReleasePreconditions(freshOrder, false, true);
-          if (validationError) {
-            return res.status(validationError.status).json({ error: validationError.error });
-          }
-
-          const esc = await financialRepository.getEscrow(freshOrder.id);
-          const currentEscrow = esc ? esc.remaining : (freshOrder.escrowBalance ?? Number(freshOrder.amount || 0));
-          const invoiceAmount = Number(targetOffer.amount);
-          const additionalAmount = Math.round((invoiceAmount - currentEscrow) * 100) / 100;
-
-          if (additionalAmount < 0) {
-            return res.status(400).json({ error: `Final invoice amount ($${invoiceAmount}) cannot be less than the current order escrow ($${currentEscrow}).` });
-          }
-
-          await ensureWallet(freshOrder.buyerId);
-          await ensureWallet(freshOrder.sellerId);
-
-          if (additionalAmount > 0) {
-            await topUpOrderEscrowWithEvent({
-              orderId: freshOrder.id,
-              orderTitle: `Invoice Top-up: ${targetOffer.title}`,
-              amount: additionalAmount,
-              buyerId: freshOrder.buyerId,
-              sellerId: freshOrder.sellerId,
-              actor: `user:${caller.id}`,
-              idempotencyKey: `${idempotencyKey}-topup`
-            });
-            freshOrder.amount = invoiceAmount;
-          }
-
-          let invoiceRevisionsResolved = false;
-          if (Array.isArray(freshOrder.revisions)) {
-            for (const rev of freshOrder.revisions) {
-              if (rev.status === 'requested') {
-                rev.status = 'resolved';
-                invoiceRevisionsResolved = true;
-              }
-            }
-          }
-          if (invoiceRevisionsResolved) {
-            await emitSystemEvent(freshOrder.id, 'revision_resolved', `📝 Revision resolved via accepted invoice ${targetOffer.number || targetOffer.id}.`);
-          }
-
-          await releaseOrderFunds(freshOrder, caller.name, `Final invoice ${targetOffer.number || targetOffer.id} accepted by buyer and escrow released`, false);
-
-          targetOffer.status = 'paid';
-          targetOffer.resolvedAt = new Date().toISOString();
-          targetOffer.resolvedBy = caller.id;
-          await saveOfferToDb(targetOffer);
-
-          freshOrder.status = 'completed';
-          freshOrder.completedAt = new Date().toISOString();
-          freshOrder.escrowReleased = true;
-          await store.saveOrder(freshOrder);
-          await syncUserBalances();
-
-          return res.json({ success: true, order: enrichOrderWithServiceInfo(freshOrder), offer: await viewOffer(targetOffer) });
-        } else {
-          const amountToFund = Number(targetOffer.amount);
-          if (!Number.isFinite(amountToFund) || amountToFund <= 0) {
-            return res.status(400).json({ error: 'Invalid offer amount.' });
-          }
-
-          await ensureWallet(freshOrder.buyerId);
-          await ensureWallet(freshOrder.sellerId);
-
-          await topUpOrderEscrowWithEvent({
-            orderId: freshOrder.id,
-            orderTitle: targetOffer.title || freshOrder.title,
-            amount: amountToFund,
-            buyerId: freshOrder.buyerId,
-            sellerId: freshOrder.sellerId,
-            actor: `user:${caller.id}`,
-            idempotencyKey
-          });
-
-          targetOffer.status = 'accepted';
-          targetOffer.resolvedAt = new Date().toISOString();
-          targetOffer.resolvedBy = caller.id;
-          await saveOfferToDb(targetOffer);
-
-          freshOrder.amount = Math.round((Number(freshOrder.amount || 0) + amountToFund) * 100) / 100;
-          freshOrder.status = 'in_progress';
-          await store.saveOrder(freshOrder);
-          await syncUserBalances();
-
-          return res.json({ success: true, order: enrichOrderWithServiceInfo(freshOrder), offer: await viewOffer(targetOffer) });
-        }
+        const acceptResult = await executeUnifiedOfferAccept(targetOffer, freshOrder, caller, idempotencyKey);
+        return res.status(acceptResult.status).json(acceptResult.body);
       } finally {
         releaseOrderLock(lockedExistingOrderId);
       }
     } catch (err: any) {
-      return res.status(500).json(formatApiError(err, 'Failed to accept offer'));
+      return res.status(400).json({ error: err.message || 'Failed to accept offer' });
     }
   }
 );
 
 export default router;
+
