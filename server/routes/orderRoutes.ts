@@ -80,7 +80,35 @@ router.get('/orders', requireAuth, requireActiveStatus, async (req: Request, res
     const caller = await store.getUser(authUserId);
     const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin' || caller?.role === 'support';
 
-    const ordersList = isAdmin ? await store.listOrders() : await store.listOrdersForUser(authUserId);
+    const pool = postgresStore.getPool();
+    const inqRes = await pool.query(
+      isAdmin
+        ? `SELECT * FROM workspaces WHERE (metadata->>'isInquiry') = 'true'`
+        : `SELECT * FROM workspaces WHERE (buyer_id = $1 OR seller_id = $1) AND (metadata->>'isInquiry') = 'true'`,
+      isAdmin ? [] : [authUserId]
+    );
+
+    const inqOrders: Order[] = inqRes.rows.map(ws => {
+      const meta = typeof ws.metadata === 'string' ? JSON.parse(ws.metadata) : (ws.metadata || {});
+      return {
+        id: ws.workspace_id,
+        workspaceId: ws.workspace_id,
+        title: ws.title || 'Inquiry',
+        buyerId: ws.buyer_id,
+        sellerId: ws.seller_id,
+        amount: 0,
+        status: 'in_progress' as const,
+        createdAt: ws.created_at,
+        dueDate: new Date(Date.now() + 7 * 86400000).toISOString(),
+        isInquiry: true,
+        gigId: meta.originType === 'gig' ? meta.originId : undefined,
+        projectId: meta.originType === 'project' ? meta.originId : undefined,
+        originType: meta.originType
+      } as any;
+    });
+
+    const dbOrders = isAdmin ? await store.listOrders() : await store.listOrdersForUser(authUserId);
+    const ordersList = [...dbOrders, ...inqOrders];
     const orderIds = ordersList.map(o => o.id);
     const userIds = Array.from(new Set(ordersList.flatMap(o => [o.buyerId, o.sellerId]).filter(Boolean)));
 
@@ -88,17 +116,19 @@ router.get('/orders', requireAuth, requireActiveStatus, async (req: Request, res
       return res.json([]);
     }
 
-    const pool = postgresStore.getPool();
     const [usersList, latestMsgsRes] = await Promise.all([
       userIds.length > 0
         ? Promise.all(userIds.map(id => store.getUser(id)))
         : Promise.resolve([]),
       orderIds.length > 0
         ? pool.query(`
-            SELECT DISTINCT ON (order_id) order_id, text, timestamp
-            FROM messages
-            WHERE order_id = ANY($1)
-            ORDER BY order_id, timestamp DESC
+            SELECT DISTINCT ON (target_id) target_id AS order_id, text, timestamp
+            FROM (
+              SELECT COALESCE(order_id, workspace_id) AS target_id, text, timestamp
+              FROM messages
+              WHERE order_id = ANY($1) OR workspace_id = ANY($1)
+            ) sub
+            ORDER BY target_id, timestamp DESC
           `, [orderIds])
         : Promise.resolve({ rows: [] as any[] })
     ]);
@@ -134,7 +164,30 @@ router.get('/orders', requireAuth, requireActiveStatus, async (req: Request, res
 // Single Order Workspace Detail - Directly querying PostgreSQL
 router.get('/orders/:id', requireAuth, async (req: Request, res: Response) => {
   try {
-    const order = await store.getOrder(req.params.id);
+    let order = await store.getOrder(req.params.id);
+    if (!order) {
+      const ws = await workspaceService.getWorkspaceAsync(req.params.id);
+      if (ws && ((ws as any).metadata?.isInquiry || (ws as any).metadata?.isInquiry === 'true')) {
+        const meta = typeof (ws as any).metadata === 'string' ? JSON.parse((ws as any).metadata) : ((ws as any).metadata || {});
+        order = {
+          id: ws.workspaceId,
+          workspaceId: ws.workspaceId,
+          title: (ws as any).title || 'Inquiry',
+          buyerId: ws.buyerId,
+          sellerId: ws.sellerId,
+          amount: 0,
+          status: 'in_progress',
+          createdAt: ws.createdAt,
+          dueDate: new Date(Date.now() + 7 * 86400000).toISOString(),
+          isInquiry: true,
+          gigId: meta.originType === 'gig' ? meta.originId : undefined,
+          projectId: meta.originType === 'project' ? meta.originId : undefined,
+          originType: meta.originType
+        } as any;
+      } else {
+        return res.status(404).json({ error: 'Order not found' });
+      }
+    }
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
     const authUserId = resolveAuthenticatedUserId(req)!;
@@ -293,26 +346,42 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
     const isInquiry = (Boolean(req.body?.isInquiry) && (!Number.isFinite(rawAmount) || rawAmount === 0)) || (rawAmount === 0 && /^inquiry:/i.test(title));
     if (isInquiry) rawAmount = 0;
 
+    const resolvedOriginType: 'gig' | 'project' | 'profile' = req.body?.projectId
+      ? 'project'
+      : (req.body?.gigId ? 'gig' : 'profile');
+    const resolvedOriginId = req.body?.projectId || req.body?.gigId || sellerId;
+
     if (isInquiry && !req.body?.workspaceId && !req.body?.forceNew) {
       const existingInqRes = await postgresStore.getPool().query(
-        `SELECT o.* FROM orders o
-         LEFT JOIN escrows e ON e.order_id = o.id
-         WHERE o.buyer_id = $1
-           AND o.seller_id = $2
-           AND COALESCE(o.gig_id, '') = $3
-           AND COALESCE(o.project_id, '') = $4
-           AND COALESCE(o.amount, 0) = 0
-           AND o.status IN ('in_progress', 'payment_pending')
-           AND (e.order_id IS NULL OR COALESCE(e.remaining, 0) = 0)
-         ORDER BY o.updated_at DESC NULLS LAST, o.created_at DESC, o.id DESC
+        `SELECT * FROM workspaces
+         WHERE buyer_id = $1
+           AND seller_id = $2
+           AND (metadata->>'originType') = $3
+           AND (metadata->>'originId') = $4
+           AND (metadata->>'isInquiry') = 'true'
+         ORDER BY updated_at DESC, created_at DESC
          LIMIT 1`,
-        [buyerId, sellerId, String(req.body?.gigId || ''), String(req.body?.projectId || '')]
+        [buyerId, sellerId, resolvedOriginType, resolvedOriginId]
       );
       if (existingInqRes.rows.length > 0) {
-        const existingOrd = await store.getOrderById(existingInqRes.rows[0].id);
-        if (existingOrd) {
-          return res.status(200).json(enrichOrderWithServiceInfo(existingOrd));
-        }
+        const matchedWs = existingInqRes.rows[0];
+        const inqItem: any = {
+          id: matchedWs.workspace_id,
+          workspaceId: matchedWs.workspace_id,
+          title: matchedWs.title,
+          buyerId: matchedWs.buyer_id,
+          sellerId: matchedWs.seller_id,
+          amount: 0,
+          status: 'in_progress',
+          createdAt: matchedWs.created_at,
+          dueDate: new Date(Date.now() + 7 * 86400000).toISOString(),
+          isInquiry: true,
+          originType: resolvedOriginType,
+          originId: resolvedOriginId,
+          gigId: req.body?.gigId,
+          projectId: req.body?.projectId
+        };
+        return res.status(200).json(enrichOrderWithServiceInfo(inqItem));
       }
     }
 
@@ -443,29 +512,93 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
         }
       }
 
-      if (isInquiry && !req.body?.workspaceId && !req.body?.forceNew) {
-        const inqLockRes = await client.query(
-          `SELECT o.* FROM orders o
-           LEFT JOIN escrows e ON e.order_id = o.id
-           WHERE o.buyer_id = $1
-             AND o.seller_id = $2
-             AND COALESCE(o.gig_id, '') = $3
-             AND COALESCE(o.project_id, '') = $4
-             AND COALESCE(o.amount, 0) = 0
-             AND o.status IN ('in_progress', 'payment_pending')
-             AND (e.order_id IS NULL OR COALESCE(e.remaining, 0) = 0)
-           ORDER BY o.updated_at DESC NULLS LAST, o.created_at DESC, o.id DESC
-           LIMIT 1
-           FOR UPDATE OF o`,
-          [buyerId, sellerId, String(req.body?.gigId || ''), String(req.body?.projectId || '')]
-        );
-        if (inqLockRes.rows.length > 0) {
-          const matched = inqLockRes.rows[0];
-          const existing = await store.getOrderById(matched.id, client);
-          if (existing) {
-            return { replayed: true, result: enrichOrderWithServiceInfo(existing) };
+      if (isInquiry) {
+        const lockKey = `inquiry:${buyerId}:${sellerId}:${resolvedOriginType}:${resolvedOriginId}`;
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [lockKey]);
+
+        if (!req.body?.workspaceId && !req.body?.forceNew) {
+          const inqLockRes = await client.query(
+            `SELECT * FROM workspaces
+             WHERE buyer_id = $1
+               AND seller_id = $2
+               AND (metadata->>'originType') = $3
+               AND (metadata->>'originId') = $4
+               AND (metadata->>'isInquiry') = 'true'
+             ORDER BY updated_at DESC, created_at DESC
+             LIMIT 1
+             FOR UPDATE`,
+            [buyerId, sellerId, resolvedOriginType, resolvedOriginId]
+          );
+          if (inqLockRes.rows.length > 0) {
+            const matchedWs = inqLockRes.rows[0];
+            const inqItem: any = {
+              id: matchedWs.workspace_id,
+              workspaceId: matchedWs.workspace_id,
+              title: matchedWs.title,
+              buyerId: matchedWs.buyer_id,
+              sellerId: matchedWs.seller_id,
+              amount: 0,
+              status: 'in_progress',
+              createdAt: matchedWs.created_at,
+              dueDate: new Date(Date.now() + 7 * 86400000).toISOString(),
+              isInquiry: true,
+              originType: resolvedOriginType,
+              originId: resolvedOriginId,
+              gigId: req.body?.gigId,
+              projectId: req.body?.projectId
+            };
+            return { replayed: true, result: enrichOrderWithServiceInfo(inqItem) };
           }
         }
+
+        const workspaceId = req.body?.workspaceId || ('ws_' + randomUUID().slice(0, 12));
+        const metadata = {
+          originType: resolvedOriginType,
+          originId: resolvedOriginId,
+          isInquiry: true,
+          status: 'active'
+        };
+
+        const insertWsRes = await client.query(
+          `INSERT INTO workspaces (workspace_id, buyer_id, seller_id, order_ids, title, created_at, updated_at, metadata)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           ON CONFLICT (buyer_id, seller_id, (metadata->>'originType'), (metadata->>'originId')) WHERE (metadata->>'isInquiry') = 'true'
+           DO UPDATE SET updated_at = EXCLUDED.updated_at
+           RETURNING *`,
+          [
+            workspaceId,
+            buyerId,
+            sellerId,
+            JSON.stringify([]),
+            title,
+            today,
+            new Date().toISOString(),
+            JSON.stringify(metadata)
+          ]
+        );
+        const createdWs = insertWsRes.rows[0];
+        const inqItem: any = {
+          id: createdWs.workspace_id,
+          workspaceId: createdWs.workspace_id,
+          title: createdWs.title,
+          buyerId: createdWs.buyer_id,
+          sellerId: createdWs.seller_id,
+          amount: 0,
+          status: 'in_progress',
+          createdAt: createdWs.created_at,
+          dueDate: new Date(Date.now() + 7 * 86400000).toISOString(),
+          isInquiry: true,
+          originType: resolvedOriginType,
+          originId: resolvedOriginId,
+          gigId: req.body?.gigId,
+          projectId: req.body?.projectId
+        };
+
+        if (scopedIdempKey) {
+          await recordIdempotencyResult(client, scopedIdempKey, 'createOrder', inqItem, orderPayloadFingerprint);
+        }
+
+        return { replayed: false, result: enrichOrderWithServiceInfo(inqItem) };
       }
 
       let workspaceId: string;
@@ -694,7 +827,18 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
     }
 
     if (isInquiry) {
-      await emitSystemEvent(enriched.id, 'order_created', `Inquiry thread opened: ${title}.`);
+      try {
+        await emitSystemEvent(enriched.id, 'order_created', `Inquiry thread opened: ${title}.`);
+      } catch {}
+      createNotification({
+        userId: sellerId,
+        type: 'message',
+        title: 'New Inquiry',
+        message: `${buyer.name} opened an inquiry: "${title}".`,
+        link: `/workstream/${enriched.id}`,
+        dedupKey: `inq_${enriched.id}_${sellerId}`,
+        actorId: buyerId
+      });
     } else {
       await emitSystemEvent(enriched.id, 'order_created', `Order placed: ${title}. Payment is held in escrow until the work is approved.`);
       if (requirements) {

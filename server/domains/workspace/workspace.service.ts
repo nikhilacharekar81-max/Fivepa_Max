@@ -129,10 +129,13 @@ class WorkspaceService {
   public async getWorkspaceAsync(workspaceId: string, client?: any): Promise<Workspace | undefined> {
     const ws = await postgresStore.getWorkspace(workspaceId, client);
     if (ws) {
-      this.workspaces.set(workspaceId, ws);
+      this.syncWorkspaceToMemory(ws as any, client);
       return ws;
     }
-    this.workspaces.delete(workspaceId);
+    const isTx = Boolean(client) || postgresStore.isActiveTransaction();
+    if (!isTx) {
+      this.workspaces.delete(workspaceId);
+    }
     return undefined;
   }
 

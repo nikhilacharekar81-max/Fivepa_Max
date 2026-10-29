@@ -955,3 +955,4 @@ CREATE INDEX IF NOT EXISTS idx_orders_buyer_seller ON orders (buyer_id, seller_i
 CREATE INDEX IF NOT EXISTS idx_workstream_offers_workspace ON workstream_offers (workspace_id);
 CREATE INDEX IF NOT EXISTS idx_uploads_workspace_id ON uploads (workspace_id);
 CREATE INDEX IF NOT EXISTS idx_uploads_order_id ON uploads (order_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_inquiry_unique ON workspaces (buyer_id, seller_id, (metadata->>'originType'), (metadata->>'originId')) WHERE (metadata->>'isInquiry') = 'true';

@@ -323,6 +323,7 @@ export async function processProposalAccept(req: any, res: any) {
       const order: Order = (txResult as any).order;
       const offer: WorkstreamOffer | null = (txResult as any).offer || null;
       const workspace: any = (txResult as any).workspace;
+      const isReplay = Boolean((txResult as any).replayed);
 
       try {
         await recordOrder(order);
@@ -337,27 +338,30 @@ export async function processProposalAccept(req: any, res: any) {
       try { await store.saveOrder(order); } catch (e) { console.warn('[processProposalAccept] Post-commit saveOrder warning:', e); }
       try { await store.saveProject(proj); } catch (e) { console.warn('[processProposalAccept] Post-commit saveProject warning:', e); }
       try { await syncUserBalances(); } catch (e) { console.warn('[processProposalAccept] Post-commit syncUserBalances warning:', e); }
-      try {
-        await emitSystemEvent(order.id, 'order_created', `Order placed: ${order.title}. Payment is held in escrow until the work is approved.`);
-        if (offer) {
-          await postOfferMessage(order, offer, null, `Proposal ${offer.number} was created.`, 'offer_created');
-          await postOfferMessage(order, offer, null, `Proposal ${offer.number} was accepted and escrow funded ($${order.amount}).`, 'offer_accepted');
-        }
-      } catch (e) {
-        console.warn('[processProposalAccept] Post-commit events warning:', e);
-      }
 
-      try {
-        await createNotification({
-          userId: proposal.freelancerId,
-          type: 'proposal_accepted',
-          title: 'Proposal accepted',
-          message: `Your proposal for "${proj.title}" was accepted and escrow has been funded.`,
-          link: `/workstream/${order.id}`,
-          metadata: { orderId: order.id, projectId: proj.id, proposalId: proposal.id }
-        });
-      } catch (e) {
-        console.warn('[processProposalAccept] Post-commit notification warning:', e);
+      if (!isReplay) {
+        try {
+          await emitSystemEvent(order.id, 'order_created', `Order placed: ${order.title}. Payment is held in escrow until the work is approved.`);
+          if (offer) {
+            await postOfferMessage(order, offer, null, `Proposal ${offer.number} was created.`, 'offer_created');
+            await postOfferMessage(order, offer, null, `Proposal ${offer.number} was accepted and escrow funded ($${order.amount}).`, 'offer_accepted');
+          }
+        } catch (e) {
+          console.warn('[processProposalAccept] Post-commit events warning:', e);
+        }
+
+        try {
+          await createNotification({
+            userId: proposal.freelancerId,
+            type: 'proposal_accepted',
+            title: 'Proposal accepted',
+            message: `Your proposal for "${proj.title}" was accepted and escrow has been funded.`,
+            link: `/workstream/${order.id}`,
+            metadata: { orderId: order.id, projectId: proj.id, proposalId: proposal.id }
+          });
+        } catch (e) {
+          console.warn('[processProposalAccept] Post-commit notification warning:', e);
+        }
       }
 
       const enrichedProposal = await enrichProposalWithWorkstream(proposal);

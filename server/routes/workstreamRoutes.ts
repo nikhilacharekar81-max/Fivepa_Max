@@ -538,7 +538,18 @@ router.post('/messages', requireAuth, rateLimit(120, 60_000), async (req: Reques
 
     let order = orderId ? await store.getOrder(orderId) : null;
     let workspace = workspaceId ? await workspaceService.getWorkspaceAsync(workspaceId) : (order?.workspaceId ? await workspaceService.getWorkspaceAsync(order.workspaceId) : null);
+    if (orderId && !order) return res.status(404).json({ error: 'Order not found' });
+    if (workspaceId && !workspace) return res.status(404).json({ error: 'Workspace not found' });
     if (!order && !workspace) return res.status(404).json({ error: 'Order or Workspace not found' });
+
+    if (order && workspace) {
+      const orderBelongsToWs = (order.workspaceId && order.workspaceId === workspace.workspaceId) ||
+        (Array.isArray(workspace.orderIds) && workspace.orderIds.includes(order.id));
+      const partiesMatch = order.buyerId === workspace.buyerId && order.sellerId === workspace.sellerId;
+      if (!orderBelongsToWs || !partiesMatch) {
+        return res.status(400).json({ error: 'Order does not belong to the specified Workspace' });
+      }
+    }
 
     const buyerId = order?.buyerId || workspace?.buyerId;
     const sellerId = order?.sellerId || workspace?.sellerId;
@@ -560,10 +571,10 @@ router.post('/messages', requireAuth, rateLimit(120, 60_000), async (req: Reques
 
     const clientMessageId = typeof req.body.clientMessageId === 'string' ? req.body.clientMessageId : undefined;
     const queryTargetId = order?.id || workspace?.workspaceId;
-    if (clientMessageId && queryTargetId) {
+    if (clientMessageId && (order?.id || workspace?.workspaceId)) {
       const existingRes = await postgresStore.getPool().query(
-        "SELECT * FROM messages WHERE (order_id = $1 OR workspace_id = $1) AND sender_id = $2 AND metadata->>'clientMessageId' = $3 LIMIT 1",
-        [queryTargetId, caller.id, clientMessageId]
+        "SELECT * FROM messages WHERE (order_id = $1 OR workspace_id = $2) AND sender_id = $3 AND metadata->>'clientMessageId' = $4 LIMIT 1",
+        [order?.id || null, workspace?.workspaceId || null, caller.id, clientMessageId]
       );
       if (existingRes.rows.length > 0) {
         const r = existingRes.rows[0];
@@ -670,6 +681,16 @@ router.post('/orders/:id/message', requireAuth, rateLimit(120, 60_000), async (r
     if (order.isMuted && !isStaffUser(user)) {
       return res.status(403).json({ error: 'Chat is currently paused.' });
     }
+    if (req.body.workspaceId) {
+      if (order.workspaceId && req.body.workspaceId !== order.workspaceId) {
+        return res.status(400).json({ error: 'Order does not belong to the specified Workspace' });
+      }
+      const ws = await workspaceService.getWorkspaceAsync(req.body.workspaceId);
+      if (!ws || (order.workspaceId && ws.workspaceId !== order.workspaceId) || (!ws.orderIds?.includes(order.id) && order.workspaceId !== ws.workspaceId) || ws.buyerId !== order.buyerId || ws.sellerId !== order.sellerId) {
+        return res.status(400).json({ error: 'Order does not belong to the specified Workspace' });
+      }
+    }
+
     const fileCheck = await validateMessageFileInfo(req.body.fileInfo, user, order);
     if (!fileCheck.ok) return res.status(400).json({ error: (fileCheck as any).error });
 
@@ -701,6 +722,9 @@ router.post('/orders/:id/message', requireAuth, rateLimit(120, 60_000), async (r
     }
 
     const newMsg = sanitizeAndCreateMessage(user, order, req.body, fileCheck);
+    if (order.workspaceId) {
+      newMsg.workspaceId = order.workspaceId;
+    }
     if (newMsg.fileInfo?.url) {
       const fn = workstreamFilenameFromUrl(newMsg.fileInfo.url);
       if (fn) {
