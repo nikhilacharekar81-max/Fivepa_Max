@@ -984,32 +984,146 @@ BEGIN
       DECLARE
         _primary_ws_id TEXT := _dup.ws_ids[1];
         _other_ws_id TEXT;
-        _msg_count INT;
-        _ord_count INT;
-        _offer_count INT;
-        _upload_count INT;
+        _associated_order_ids TEXT[];
+        _recorded_order_count INT := 0;
+        _msg_count INT := 0;
+        _ord_count INT := 0;
+        _offer_count INT := 0;
+        _upload_count INT := 0;
+        _escrow_count INT := 0;
+        _invoice_count INT := 0;
+        _dispute_count INT := 0;
+        _refund_count INT := 0;
+        _review_count INT := 0;
         _has_unresolvable BOOLEAN := FALSE;
+        _conflict_reasons TEXT := '';
       BEGIN
         FOR i IN 2..array_length(_dup.ws_ids, 1) LOOP
           _other_ws_id := _dup.ws_ids[i];
-          SELECT COUNT(*) INTO _msg_count FROM messages WHERE workspace_id = _other_ws_id OR metadata->>'workspaceId' = _other_ws_id;
-          SELECT COUNT(*) INTO _ord_count FROM orders WHERE workspace_id = _other_ws_id;
-          SELECT COUNT(*) INTO _offer_count FROM workstream_offers WHERE workspace_id = _other_ws_id;
-          SELECT COUNT(*) INTO _upload_count FROM uploads WHERE workspace_id = _other_ws_id;
+          _conflict_reasons := '';
 
-          -- Non-destructive reconciliation only when duplicate is completely empty
-          IF _msg_count = 0 AND _ord_count = 0 AND _offer_count = 0 AND _upload_count = 0 THEN
+          -- 1. Identify all direct and indirect Order associations for this workspace
+          -- Accounts for:
+          -- a) orders.workspace_id = _other_ws_id
+          -- b) Order IDs recorded in workspaces.order_ids (even if orders.workspace_id is NULL or mismatched)
+          -- c) Order ID stored in workspaces.metadata->>'activeOrderId'
+          SELECT ARRAY(
+            SELECT DISTINCT ord_id
+            FROM (
+              SELECT id AS ord_id FROM orders WHERE workspace_id = _other_ws_id
+              UNION
+              SELECT elem AS ord_id
+              FROM workspaces w,
+                   jsonb_array_elements_text(
+                     CASE 
+                       WHEN jsonb_typeof(w.order_ids) = 'array' THEN w.order_ids 
+                       ELSE '[]'::jsonb 
+                     END
+                   ) AS elem
+              WHERE w.workspace_id = _other_ws_id AND elem IS NOT NULL AND elem <> ''
+              UNION
+              SELECT (metadata->>'activeOrderId') AS ord_id
+              FROM workspaces
+              WHERE workspace_id = _other_ws_id 
+                AND (metadata->>'activeOrderId') IS NOT NULL 
+                AND (metadata->>'activeOrderId') <> ''
+            ) sub
+          ) INTO _associated_order_ids;
+
+          -- Check recorded order IDs in workspaces.order_ids JSON array
+          SELECT COALESCE(
+            CASE 
+              WHEN jsonb_typeof(order_ids) = 'array' THEN jsonb_array_length(order_ids)
+              ELSE 0
+            END, 0
+          ) INTO _recorded_order_count
+          FROM workspaces
+          WHERE workspace_id = _other_ws_id;
+
+          -- 2. Count associated orders
+          SELECT COUNT(*) INTO _ord_count
+          FROM orders
+          WHERE workspace_id = _other_ws_id
+             OR (array_length(_associated_order_ids, 1) > 0 AND id = ANY(_associated_order_ids));
+
+          -- 3. Count messages associated directly or indirectly through associated orders
+          SELECT COUNT(*) INTO _msg_count
+          FROM messages
+          WHERE workspace_id = _other_ws_id
+             OR metadata->>'workspaceId' = _other_ws_id
+             OR order_id = _other_ws_id
+             OR (array_length(_associated_order_ids, 1) > 0 AND (
+                  order_id = ANY(_associated_order_ids)
+                  OR metadata->>'orderId' = ANY(_associated_order_ids)
+                  OR metadata->>'order_id' = ANY(_associated_order_ids)
+                ));
+
+          -- 4. Count workstream offers associated directly or indirectly through associated orders
+          SELECT COUNT(*) INTO _offer_count
+          FROM workstream_offers
+          WHERE workspace_id = _other_ws_id
+             OR metadata->>'workspaceId' = _other_ws_id
+             OR order_id = _other_ws_id
+             OR (array_length(_associated_order_ids, 1) > 0 AND (
+                  order_id = ANY(_associated_order_ids)
+                  OR metadata->>'originOrderId' = ANY(_associated_order_ids)
+                  OR metadata->>'resultingOrderId' = ANY(_associated_order_ids)
+                  OR metadata->>'orderId' = ANY(_associated_order_ids)
+                ));
+
+          -- 5. Count uploads associated directly or indirectly through associated orders
+          SELECT COUNT(*) INTO _upload_count
+          FROM uploads
+          WHERE workspace_id = _other_ws_id
+             OR order_id = _other_ws_id
+             OR (array_length(_associated_order_ids, 1) > 0 AND order_id = ANY(_associated_order_ids));
+
+          -- 6. Count escrows, custom invoices, disputes, refunds, and reviews associated through associated orders
+          IF array_length(_associated_order_ids, 1) > 0 THEN
+            SELECT COUNT(*) INTO _escrow_count FROM escrows WHERE order_id = ANY(_associated_order_ids);
+            SELECT COUNT(*) INTO _invoice_count FROM custom_invoices WHERE related_order_id = ANY(_associated_order_ids);
+            SELECT COUNT(*) INTO _dispute_count FROM disputes WHERE order_id = ANY(_associated_order_ids);
+            SELECT COUNT(*) INTO _refund_count FROM refunds WHERE order_id = ANY(_associated_order_ids);
+            SELECT COUNT(*) INTO _review_count FROM reviews WHERE order_id = ANY(_associated_order_ids);
+          ELSE
+            _escrow_count := 0;
+            _invoice_count := 0;
+            _dispute_count := 0;
+            _refund_count := 0;
+            _review_count := 0;
+          END IF;
+
+          -- Non-destructive reconciliation ONLY when the duplicate workspace is proven to have NO direct or indirect historical associations
+          IF _recorded_order_count = 0 
+             AND _ord_count = 0 
+             AND _msg_count = 0 
+             AND _offer_count = 0 
+             AND _upload_count = 0 
+             AND _escrow_count = 0 
+             AND _invoice_count = 0 
+             AND _dispute_count = 0 
+             AND _refund_count = 0 
+             AND _review_count = 0 
+             AND COALESCE(array_length(_associated_order_ids, 1), 0) = 0 THEN
             UPDATE workspaces
             SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{isInquiry}', '"false"'::jsonb, true)
             WHERE workspace_id = _other_ws_id;
           ELSE
             _has_unresolvable := TRUE;
+            _conflict_reasons := format(
+              'orders=%s, recorded_order_ids=%s, msgs=%s, offers=%s, uploads=%s, escrows=%s, invoices=%s, disputes=%s',
+              _ord_count, _recorded_order_count, _msg_count, _offer_count, _upload_count, _escrow_count, _invoice_count, _dispute_count
+            );
+            _unresolvable_diag := _unresolvable_diag || format(
+              ' [Workspace %s: %s (buyer: %s, seller: %s, originType: %s, originId: %s)]',
+              _other_ws_id, _conflict_reasons, _dup.buyer_id, _dup.seller_id, _dup.o_type, _dup.o_id
+            );
           END IF;
         END LOOP;
 
         IF _has_unresolvable THEN
           _unresolvable_diag := _unresolvable_diag || format(
-            ' [Buyer: %s, Seller: %s, OriginType: %s, OriginId: %s, Workspaces: %s]',
+            ' [Duplicate group for Buyer: %s, Seller: %s, OriginType: %s, OriginId: %s, Workspaces: %s]',
             _dup.buyer_id, _dup.seller_id, _dup.o_type, _dup.o_id, array_to_string(_dup.ws_ids, ', ')
           );
         END IF;
@@ -1017,7 +1131,7 @@ BEGIN
     END LOOP;
 
     IF _unresolvable_diag <> '' THEN
-      RAISE EXCEPTION 'Cannot safely enforce idx_workspaces_inquiry_unique: Duplicate active inquiry workspaces with distinct message/order history exist:%', _unresolvable_diag;
+      RAISE EXCEPTION 'Cannot safely enforce idx_workspaces_inquiry_unique: Duplicate active inquiry workspaces with existing direct or indirect historical associations exist:%', _unresolvable_diag;
     END IF;
   END IF;
 
