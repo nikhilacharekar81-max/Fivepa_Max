@@ -986,6 +986,7 @@ BEGIN
         _other_ws_id TEXT;
         _associated_order_ids TEXT[];
         _recorded_order_count INT := 0;
+        _is_order_ids_malformed BOOLEAN := FALSE;
         _msg_count INT := 0;
         _ord_count INT := 0;
         _offer_count INT := 0;
@@ -995,6 +996,10 @@ BEGIN
         _dispute_count INT := 0;
         _refund_count INT := 0;
         _review_count INT := 0;
+        _ledger_entry_count INT := 0;
+        _earnings_clearing_count INT := 0;
+        _clearing_earnings_count INT := 0;
+        _checkout_session_count INT := 0;
         _has_unresolvable BOOLEAN := FALSE;
         _conflict_reasons TEXT := '';
       BEGIN
@@ -1002,10 +1007,20 @@ BEGIN
           _other_ws_id := _dup.ws_ids[i];
           _conflict_reasons := '';
 
+          -- Check if order_ids is non-null and not a JSON array
+          SELECT 
+            CASE 
+              WHEN order_ids IS NULL THEN FALSE
+              WHEN jsonb_typeof(order_ids) = 'array' THEN FALSE
+              ELSE TRUE
+            END INTO _is_order_ids_malformed
+          FROM workspaces
+          WHERE workspace_id = _other_ws_id;
+
           -- 1. Identify all direct and indirect Order associations for this workspace
           -- Accounts for:
           -- a) orders.workspace_id = _other_ws_id
-          -- b) Order IDs recorded in workspaces.order_ids (even if orders.workspace_id is NULL or mismatched)
+          -- b) Order IDs recorded in workspaces.order_ids (only when order_ids is a valid JSON array)
           -- c) Order ID stored in workspaces.metadata->>'activeOrderId'
           SELECT ARRAY(
             SELECT DISTINCT ord_id
@@ -1014,13 +1029,11 @@ BEGIN
               UNION
               SELECT elem AS ord_id
               FROM workspaces w,
-                   jsonb_array_elements_text(
-                     CASE 
-                       WHEN jsonb_typeof(w.order_ids) = 'array' THEN w.order_ids 
-                       ELSE '[]'::jsonb 
-                     END
-                   ) AS elem
-              WHERE w.workspace_id = _other_ws_id AND elem IS NOT NULL AND elem <> ''
+                   jsonb_array_elements_text(w.order_ids) AS elem
+              WHERE w.workspace_id = _other_ws_id 
+                AND w.order_ids IS NOT NULL 
+                AND jsonb_typeof(w.order_ids) = 'array'
+                AND elem IS NOT NULL AND elem <> ''
               UNION
               SELECT (metadata->>'activeOrderId') AS ord_id
               FROM workspaces
@@ -1030,10 +1043,10 @@ BEGIN
             ) sub
           ) INTO _associated_order_ids;
 
-          -- Check recorded order IDs in workspaces.order_ids JSON array
+          -- Check recorded order IDs count in workspaces.order_ids JSON array
           SELECT COALESCE(
             CASE 
-              WHEN jsonb_typeof(order_ids) = 'array' THEN jsonb_array_length(order_ids)
+              WHEN order_ids IS NOT NULL AND jsonb_typeof(order_ids) = 'array' THEN jsonb_array_length(order_ids)
               ELSE 0
             END, 0
           ) INTO _recorded_order_count
@@ -1078,23 +1091,32 @@ BEGIN
              OR order_id = _other_ws_id
              OR (array_length(_associated_order_ids, 1) > 0 AND order_id = ANY(_associated_order_ids));
 
-          -- 6. Count escrows, custom invoices, disputes, refunds, and reviews associated through associated orders
+          -- 6. Count escrows, custom invoices, disputes, refunds, reviews, ledger_entries, earnings_clearing, clearing_earnings, and payment_checkout_sessions
           IF array_length(_associated_order_ids, 1) > 0 THEN
             SELECT COUNT(*) INTO _escrow_count FROM escrows WHERE order_id = ANY(_associated_order_ids);
             SELECT COUNT(*) INTO _invoice_count FROM custom_invoices WHERE related_order_id = ANY(_associated_order_ids);
             SELECT COUNT(*) INTO _dispute_count FROM disputes WHERE order_id = ANY(_associated_order_ids);
             SELECT COUNT(*) INTO _refund_count FROM refunds WHERE order_id = ANY(_associated_order_ids);
             SELECT COUNT(*) INTO _review_count FROM reviews WHERE order_id = ANY(_associated_order_ids);
+            SELECT COUNT(*) INTO _ledger_entry_count FROM ledger_entries WHERE order_id = ANY(_associated_order_ids);
+            SELECT COUNT(*) INTO _earnings_clearing_count FROM earnings_clearing WHERE order_id = ANY(_associated_order_ids);
+            SELECT COUNT(*) INTO _clearing_earnings_count FROM clearing_earnings WHERE order_id = ANY(_associated_order_ids);
+            SELECT COUNT(*) INTO _checkout_session_count FROM payment_checkout_sessions WHERE order_id = ANY(_associated_order_ids);
           ELSE
             _escrow_count := 0;
             _invoice_count := 0;
             _dispute_count := 0;
             _refund_count := 0;
             _review_count := 0;
+            _ledger_entry_count := 0;
+            _earnings_clearing_count := 0;
+            _clearing_earnings_count := 0;
+            _checkout_session_count := 0;
           END IF;
 
-          -- Non-destructive reconciliation ONLY when the duplicate workspace is proven to have NO direct or indirect historical associations
-          IF _recorded_order_count = 0 
+          -- Non-destructive reconciliation ONLY when the duplicate workspace is proven to have NO direct or indirect historical associations AND order_ids is not malformed
+          IF NOT _is_order_ids_malformed 
+             AND _recorded_order_count = 0 
              AND _ord_count = 0 
              AND _msg_count = 0 
              AND _offer_count = 0 
@@ -1104,6 +1126,10 @@ BEGIN
              AND _dispute_count = 0 
              AND _refund_count = 0 
              AND _review_count = 0 
+             AND _ledger_entry_count = 0
+             AND _earnings_clearing_count = 0
+             AND _clearing_earnings_count = 0
+             AND _checkout_session_count = 0
              AND COALESCE(array_length(_associated_order_ids, 1), 0) = 0 THEN
             UPDATE workspaces
             SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{isInquiry}', '"false"'::jsonb, true)
@@ -1111,8 +1137,9 @@ BEGIN
           ELSE
             _has_unresolvable := TRUE;
             _conflict_reasons := format(
-              'orders=%s, recorded_order_ids=%s, msgs=%s, offers=%s, uploads=%s, escrows=%s, invoices=%s, disputes=%s',
-              _ord_count, _recorded_order_count, _msg_count, _offer_count, _upload_count, _escrow_count, _invoice_count, _dispute_count
+              'orders=%s, recorded_order_ids=%s, malformed_order_ids=%s, msgs=%s, offers=%s, uploads=%s, escrows=%s, invoices=%s, disputes=%s, ledger_entries=%s, earnings_clearing=%s, clearing_earnings=%s, checkout_sessions=%s',
+              _ord_count, _recorded_order_count, _is_order_ids_malformed, _msg_count, _offer_count, _upload_count, _escrow_count, _invoice_count, _dispute_count,
+              _ledger_entry_count, _earnings_clearing_count, _clearing_earnings_count, _checkout_session_count
             );
             _unresolvable_diag := _unresolvable_diag || format(
               ' [Workspace %s: %s (buyer: %s, seller: %s, originType: %s, originId: %s)]',
