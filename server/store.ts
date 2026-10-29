@@ -1237,18 +1237,21 @@ export class PostgresAsyncStore implements StoreInterface {
     return postgresStore.listMessagesForWorkspace(workspaceId, client);
   }
 
-  async getMessageByClientMsgId(orderId: string, senderId: string, clientMsgId: string): Promise<Message | undefined> {
+  async getMessageByClientMsgId(orderIdOrWorkspaceId: string, senderId: string, clientMsgId: string): Promise<Message | undefined> {
     const res = await postgresStore.getPool().query(
       `SELECT * FROM messages 
-       WHERE order_id = $1 AND sender_id = $2 AND metadata->>'clientMessageId' = $3 
+       WHERE (order_id = $1 OR workspace_id = $1 OR metadata->>'workspaceId' = $1)
+         AND sender_id = $2 
+         AND metadata->>'clientMessageId' = $3 
        LIMIT 1`,
-      [orderId, senderId, clientMsgId]
+      [orderIdOrWorkspaceId, senderId, clientMsgId]
     );
     if (res.rows.length > 0) {
       const r = res.rows[0];
       return {
         id: r.id,
-        orderId: r.order_id,
+        orderId: r.order_id || undefined,
+        workspaceId: r.workspace_id || r.metadata?.workspaceId || undefined,
         senderId: r.sender_id,
         senderName: r.sender_name,
         text: r.text,
@@ -1271,9 +1274,10 @@ export class PostgresAsyncStore implements StoreInterface {
         [message.timestamp || new Date().toISOString()]
       );
     }
+    const wsId = (message as any).workspaceId || message.metadata?.workspaceId || null;
     await dbRunner.query(
-      `INSERT INTO messages (id, order_id, sender_id, sender_name, text, timestamp, type, file_info, metadata)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `INSERT INTO messages (id, order_id, sender_id, sender_name, text, timestamp, type, file_info, metadata, workspace_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        ON CONFLICT (id) DO UPDATE SET
          order_id = EXCLUDED.order_id,
          sender_id = EXCLUDED.sender_id,
@@ -1282,10 +1286,12 @@ export class PostgresAsyncStore implements StoreInterface {
          timestamp = EXCLUDED.timestamp,
          type = EXCLUDED.type,
          file_info = EXCLUDED.file_info,
-         metadata = EXCLUDED.metadata`,
+         metadata = EXCLUDED.metadata,
+         workspace_id = COALESCE(EXCLUDED.workspace_id, messages.workspace_id)`,
       [
-        message.id, message.orderId, message.senderId, message.senderName, message.text, message.timestamp,
-        message.type || 'message', JSON.stringify(message.fileInfo || null), JSON.stringify(message.metadata || null)
+        message.id, message.orderId || null, message.senderId, message.senderName, message.text, message.timestamp,
+        message.type || 'message', JSON.stringify(message.fileInfo || null), JSON.stringify(message.metadata || null),
+        wsId
       ]
     );
   }

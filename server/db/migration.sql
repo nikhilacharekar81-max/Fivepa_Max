@@ -173,7 +173,8 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
 
 CREATE TABLE IF NOT EXISTS messages (
   id VARCHAR(64) PRIMARY KEY,
-  order_id VARCHAR(64) NOT NULL,
+  order_id VARCHAR(64),
+  workspace_id VARCHAR(64),
   sender_id VARCHAR(64) NOT NULL,
   sender_name VARCHAR(255) NOT NULL,
   text TEXT NOT NULL,
@@ -182,6 +183,9 @@ CREATE TABLE IF NOT EXISTS messages (
   file_info JSONB,
   metadata JSONB
 );
+
+ALTER TABLE messages ALTER COLUMN order_id DROP NOT NULL;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS workspace_id VARCHAR(64);
 
 CREATE TABLE IF NOT EXISTS reviews (
   id VARCHAR(64) PRIMARY KEY,

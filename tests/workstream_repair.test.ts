@@ -271,9 +271,61 @@ test('FivePA WorkStream & Workspace Architecture Repair Suite (Parts 15.A - 15.G
       });
       assert.strictEqual(uploadRes1.status, 200);
       const uploadData1 = await uploadRes1.json();
+      assert.strictEqual(uploadData1.type, 'text/plain', 'JSON/base64 .txt upload must return text/plain MIME type, not application/json');
+      assert.strictEqual(uploadData1.file.type, 'text/plain');
       uploadedFileUrlOrder1 = uploadData1.file.url;
       uploadedFilenameOrder1 = uploadedFileUrlOrder1.split('/').pop()!;
       assert.ok(uploadedFilenameOrder1);
+      const storedRec1 = await store.getUploadRecord(uploadedFilenameOrder1);
+      assert.ok(storedRec1, 'Upload record must be persisted in PostgreSQL');
+      assert.strictEqual(storedRec1?.mime, 'text/plain', 'Stored upload record must persist text/plain MIME type, not application/json');
+
+      // Verify PDF upload via JSON/base64 stores application/pdf and rejects mismatched MIME/content
+      const pdfBytes = Buffer.from('%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF', 'utf8');
+      const pdfUploadRes = await fetch(`${baseUrl}/api/workstream/upload`, {
+        method: 'POST',
+        headers: buyerHeaders,
+        body: JSON.stringify({
+          name: 'contract.pdf',
+          orderId: order1Id,
+          workspaceId: workspace1Id,
+          dataUrl: 'data:application/pdf;base64,' + pdfBytes.toString('base64'),
+        }),
+      });
+      assert.strictEqual(pdfUploadRes.status, 200);
+      const pdfUploadData = await pdfUploadRes.json();
+      assert.strictEqual(pdfUploadData.file.type, 'application/pdf');
+      const pdfFilename = pdfUploadData.file.url.split('/').pop()!;
+      const pdfStoredRec = await store.getUploadRecord(pdfFilename);
+      assert.strictEqual(pdfStoredRec?.mime, 'application/pdf');
+
+      // Verify spoofed MIME metadata (claiming image/png for a .pdf file) is rejected
+      const spoofedMimeRes = await fetch(`${baseUrl}/api/workstream/upload`, {
+        method: 'POST',
+        headers: buyerHeaders,
+        body: JSON.stringify({
+          name: 'spoofed.pdf',
+          type: 'image/png',
+          orderId: order1Id,
+          workspaceId: workspace1Id,
+          dataUrl: 'data:image/png;base64,' + pdfBytes.toString('base64'),
+        }),
+      });
+      assert.strictEqual(spoofedMimeRes.status, 400, 'Upload with declared MIME type contradicting extension must be rejected');
+
+      // Verify disguised binary content (PDF bytes uploaded with .txt extension) is rejected
+      const disguisedBinaryRes = await fetch(`${baseUrl}/api/workstream/upload`, {
+        method: 'POST',
+        headers: buyerHeaders,
+        body: JSON.stringify({
+          name: 'disguised.txt',
+          type: 'text/plain',
+          orderId: order1Id,
+          workspaceId: workspace1Id,
+          dataUrl: 'data:text/plain;base64,' + pdfBytes.toString('base64'),
+        }),
+      });
+      assert.strictEqual(disguisedBinaryRes.status, 400, 'Disguised PDF binary content with .txt extension must be rejected');
 
       const msgRes1 = await fetch(`${baseUrl}/api/messages`, {
         method: 'POST',

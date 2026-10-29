@@ -42,6 +42,340 @@ export const WORKSTREAM_ALLOWED_EXTENSIONS = new Set([
 
 export const WORKSTREAM_INLINE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.pdf', '.txt']);
 
+export const WORKSTREAM_EXTENSION_MIME_MAP: Record<string, { canonical: string; allowed: string[] }> = {
+  '.pdf': { canonical: 'application/pdf', allowed: ['application/pdf'] },
+  '.png': { canonical: 'image/png', allowed: ['image/png', 'image/x-png'] },
+  '.jpg': { canonical: 'image/jpeg', allowed: ['image/jpeg', 'image/jpg', 'image/pjpeg'] },
+  '.jpeg': { canonical: 'image/jpeg', allowed: ['image/jpeg', 'image/jpg', 'image/pjpeg'] },
+  '.gif': { canonical: 'image/gif', allowed: ['image/gif'] },
+  '.webp': { canonical: 'image/webp', allowed: ['image/webp'] },
+  '.svg': { canonical: 'image/svg+xml', allowed: ['image/svg+xml', 'text/xml', 'application/xml', 'text/plain'] },
+  '.txt': { canonical: 'text/plain', allowed: ['text/plain'] },
+  '.md': { canonical: 'text/markdown', allowed: ['text/markdown', 'text/x-markdown', 'text/plain'] },
+  '.csv': { canonical: 'text/csv', allowed: ['text/csv', 'application/csv', 'text/plain', 'application/vnd.ms-excel'] },
+  '.json': { canonical: 'application/json', allowed: ['application/json', 'text/json', 'text/plain'] },
+  '.doc': { canonical: 'application/msword', allowed: ['application/msword', 'application/vnd.ms-word', 'application/x-ole-storage'] },
+  '.docx': {
+    canonical: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    allowed: ['application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/zip', 'application/x-zip-compressed']
+  },
+  '.xls': { canonical: 'application/vnd.ms-excel', allowed: ['application/vnd.ms-excel', 'application/x-ole-storage'] },
+  '.xlsx': {
+    canonical: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    allowed: ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'application/zip', 'application/x-zip-compressed']
+  },
+  '.ppt': { canonical: 'application/vnd.ms-powerpoint', allowed: ['application/vnd.ms-powerpoint', 'application/x-ole-storage'] },
+  '.pptx': {
+    canonical: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    allowed: ['application/vnd.openxmlformats-officedocument.presentationml.presentation', 'application/zip', 'application/x-zip-compressed']
+  },
+  '.zip': { canonical: 'application/zip', allowed: ['application/zip', 'application/x-zip-compressed', 'multipart/x-zip'] },
+  '.rar': { canonical: 'application/vnd.rar', allowed: ['application/vnd.rar', 'application/x-rar-compressed', 'application/x-rar'] },
+  '.7z': { canonical: 'application/x-7z-compressed', allowed: ['application/x-7z-compressed'] },
+  '.mp4': { canonical: 'video/mp4', allowed: ['video/mp4', 'application/mp4'] },
+  '.mov': { canonical: 'video/quicktime', allowed: ['video/quicktime', 'video/mov', 'video/mp4'] },
+  '.webm': { canonical: 'video/webm', allowed: ['video/webm', 'audio/webm'] },
+  '.mp3': { canonical: 'audio/mpeg', allowed: ['audio/mpeg', 'audio/mp3'] },
+  '.wav': { canonical: 'audio/wav', allowed: ['audio/wav', 'audio/x-wav', 'audio/wave'] },
+  '.fig': { canonical: 'application/octet-stream', allowed: ['application/octet-stream', 'application/x-figma', 'application/zip'] },
+  '.psd': { canonical: 'image/vnd.adobe.photoshop', allowed: ['image/vnd.adobe.photoshop', 'application/x-photoshop', 'application/photoshop', 'image/psd'] },
+  '.ai': { canonical: 'application/postscript', allowed: ['application/postscript', 'application/illustrator', 'application/pdf'] },
+  '.sketch': { canonical: 'application/zip', allowed: ['application/zip', 'application/x-zip-compressed'] },
+  '.html': { canonical: 'text/html', allowed: ['text/html', 'text/plain'] },
+  '.htm': { canonical: 'text/html', allowed: ['text/html', 'text/plain'] },
+  '.js': { canonical: 'text/javascript', allowed: ['text/javascript', 'application/javascript', 'application/x-javascript', 'text/plain'] },
+  '.jsx': { canonical: 'text/jsx', allowed: ['text/jsx', 'text/javascript', 'application/javascript', 'text/plain'] },
+  '.ts': { canonical: 'text/typescript', allowed: ['text/typescript', 'application/typescript', 'video/mp2t', 'text/plain'] },
+  '.tsx': { canonical: 'text/tsx', allowed: ['text/tsx', 'text/typescript', 'application/typescript', 'text/plain'] },
+  '.css': { canonical: 'text/css', allowed: ['text/css', 'text/plain'] },
+  '.scss': { canonical: 'text/x-scss', allowed: ['text/x-scss', 'text/css', 'text/plain'] },
+  '.py': { canonical: 'text/x-python', allowed: ['text/x-python', 'application/x-python-code', 'text/x-script.python', 'text/plain'] },
+  '.java': { canonical: 'text/x-java-source', allowed: ['text/x-java-source', 'text/x-java', 'text/plain'] },
+  '.cpp': { canonical: 'text/x-c++src', allowed: ['text/x-c++src', 'text/x-c', 'text/plain'] },
+  '.c': { canonical: 'text/x-csrc', allowed: ['text/x-csrc', 'text/x-c', 'text/plain'] },
+  '.cs': { canonical: 'text/x-csharp', allowed: ['text/x-csharp', 'text/plain'] },
+  '.php': { canonical: 'application/x-httpd-php', allowed: ['application/x-httpd-php', 'text/x-php', 'text/php', 'application/php', 'text/plain'] },
+  '.rb': { canonical: 'text/x-ruby', allowed: ['text/x-ruby', 'application/x-ruby', 'text/plain'] },
+  '.go': { canonical: 'text/x-go', allowed: ['text/x-go', 'text/plain'] },
+  '.rs': { canonical: 'text/x-rust', allowed: ['text/x-rust', 'text/plain'] },
+  '.sql': { canonical: 'application/sql', allowed: ['application/sql', 'text/x-sql', 'text/sql', 'text/plain'] },
+  '.sh': { canonical: 'application/x-sh', allowed: ['application/x-sh', 'text/x-sh', 'text/x-shellscript', 'text/plain'] },
+  '.xml': { canonical: 'application/xml', allowed: ['application/xml', 'text/xml', 'text/plain'] },
+  '.vue': { canonical: 'text/x-vue', allowed: ['text/x-vue', 'text/plain'] },
+  '.svelte': { canonical: 'text/x-svelte', allowed: ['text/x-svelte', 'text/plain'] },
+  '.yaml': { canonical: 'application/yaml', allowed: ['application/yaml', 'text/yaml', 'text/x-yaml', 'application/x-yaml', 'text/plain'] },
+  '.yml': { canonical: 'application/yaml', allowed: ['application/yaml', 'text/yaml', 'text/x-yaml', 'application/x-yaml', 'text/plain'] }
+};
+
+const TEXT_BASED_EXTENSIONS = new Set([
+  '.svg', '.txt', '.md', '.csv', '.json',
+  '.html', '.htm', '.js', '.jsx', '.ts', '.tsx', '.css', '.scss',
+  '.py', '.java', '.cpp', '.c', '.cs', '.php', '.rb', '.go', '.rs', '.sql', '.sh', '.xml', '.vue', '.svelte', '.yaml', '.yml'
+]);
+
+const GENERIC_BINARY_MIMES = new Set([
+  '',
+  '*/*',
+  'application/octet-stream',
+  'binary/octet-stream',
+  'multipart/form-data',
+  'application/x-www-form-urlencoded'
+]);
+
+export function normalizeMimeType(raw?: unknown): string {
+  if (typeof raw !== 'string') return '';
+  return raw.split(';')[0].trim().toLowerCase();
+}
+
+export function getCanonicalMimeForExtension(ext: string): string {
+  const normalizedExt = ext.toLowerCase();
+  return WORKSTREAM_EXTENSION_MIME_MAP[normalizedExt]?.canonical || 'application/octet-stream';
+}
+
+export function sniffBufferMagicMime(buffer: Buffer): { mime: string; allowedExtensions: string[] } | null {
+  if (!buffer || buffer.length === 0) return null;
+
+  if (buffer.length >= 4 && buffer.toString('utf8', 0, 4) === '%PDF') {
+    return { mime: 'application/pdf', allowedExtensions: ['.pdf', '.ai'] };
+  }
+  if (buffer.length >= 4 && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) {
+    return { mime: 'image/png', allowedExtensions: ['.png'] };
+  }
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return { mime: 'image/jpeg', allowedExtensions: ['.jpg', '.jpeg'] };
+  }
+  if (buffer.length >= 4 && buffer.toString('utf8', 0, 4) === 'GIF8') {
+    return { mime: 'image/gif', allowedExtensions: ['.gif'] };
+  }
+  if (buffer.length >= 12 && buffer.toString('utf8', 0, 4) === 'RIFF' && buffer.toString('utf8', 8, 12) === 'WEBP') {
+    return { mime: 'image/webp', allowedExtensions: ['.webp'] };
+  }
+  if (buffer.length >= 12 && buffer.toString('utf8', 0, 4) === 'RIFF' && buffer.toString('utf8', 8, 12) === 'WAVE') {
+    return { mime: 'audio/wav', allowedExtensions: ['.wav'] };
+  }
+  if (
+    buffer.length >= 4 &&
+    buffer[0] === 0x50 &&
+    buffer[1] === 0x4b &&
+    ((buffer[2] === 0x03 && buffer[3] === 0x04) ||
+      (buffer[2] === 0x05 && buffer[3] === 0x06) ||
+      (buffer[2] === 0x07 && buffer[3] === 0x08))
+  ) {
+    return {
+      mime: 'application/zip',
+      allowedExtensions: ['.zip', '.docx', '.xlsx', '.pptx', '.sketch', '.fig']
+    };
+  }
+  if (
+    buffer.length >= 6 &&
+    buffer[0] === 0x52 &&
+    buffer[1] === 0x61 &&
+    buffer[2] === 0x72 &&
+    buffer[3] === 0x21 &&
+    buffer[4] === 0x1a &&
+    buffer[5] === 0x07
+  ) {
+    return { mime: 'application/vnd.rar', allowedExtensions: ['.rar'] };
+  }
+  if (
+    buffer.length >= 6 &&
+    buffer[0] === 0x37 &&
+    buffer[1] === 0x7a &&
+    buffer[2] === 0xbc &&
+    buffer[3] === 0xaf &&
+    buffer[4] === 0x27 &&
+    buffer[5] === 0x1c
+  ) {
+    return { mime: 'application/x-7z-compressed', allowedExtensions: ['.7z'] };
+  }
+  if (
+    buffer.length >= 8 &&
+    buffer[0] === 0xd0 &&
+    buffer[1] === 0xcf &&
+    buffer[2] === 0x11 &&
+    buffer[3] === 0xe0 &&
+    buffer[4] === 0xa1 &&
+    buffer[5] === 0xb1 &&
+    buffer[6] === 0x1a &&
+    buffer[7] === 0xe1
+  ) {
+    return { mime: 'application/x-ole-storage', allowedExtensions: ['.doc', '.xls', '.ppt'] };
+  }
+  if (buffer.length >= 4 && buffer.toString('utf8', 0, 4) === '8BPS') {
+    return { mime: 'image/vnd.adobe.photoshop', allowedExtensions: ['.psd'] };
+  }
+  if (buffer.length >= 4 && buffer[0] === 0x1a && buffer[1] === 0x45 && buffer[2] === 0xdf && buffer[3] === 0xa3) {
+    return { mime: 'video/webm', allowedExtensions: ['.webm'] };
+  }
+  if (buffer.length >= 8 && buffer.toString('ascii', 4, 8) === 'ftyp') {
+    const brand = buffer.length >= 12 ? buffer.toString('ascii', 8, 12) : '';
+    return {
+      mime: brand === 'qt  ' ? 'video/quicktime' : 'video/mp4',
+      allowedExtensions: ['.mp4', '.mov']
+    };
+  }
+  if (
+    (buffer.length >= 3 && buffer.toString('ascii', 0, 3) === 'ID3') ||
+    (buffer.length >= 2 && buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0)
+  ) {
+    return { mime: 'audio/mpeg', allowedExtensions: ['.mp3'] };
+  }
+  if (
+    (buffer.length >= 2 && buffer[0] === 0x4d && buffer[1] === 0x5a) ||
+    (buffer.length >= 4 && buffer[0] === 0x7f && buffer[1] === 0x45 && buffer[2] === 0x4c && buffer[3] === 0x46)
+  ) {
+    return { mime: 'application/x-executable', allowedExtensions: [] };
+  }
+
+  return null;
+}
+
+export function resolveAndValidateWorkstreamUploadMime(params: {
+  ext: string;
+  buffer: Buffer;
+  isJsonEnvelope: boolean;
+  dataUrlMime?: string;
+  declaredMime?: string;
+  headerContentType?: string;
+}): { ok: true; mimeType: string } | { ok: false; error: string } {
+  const ext = params.ext.toLowerCase();
+  const extSpec = WORKSTREAM_EXTENSION_MIME_MAP[ext];
+  if (!extSpec || !WORKSTREAM_ALLOWED_EXTENSIONS.has(ext)) {
+    return { ok: false, error: `File extension "${ext}" is not permitted.` };
+  }
+
+  const { buffer } = params;
+
+  // 1. Strict magic byte requirements for formats with fixed headers
+  if (ext === '.pdf') {
+    if (buffer.length < 4 || buffer.toString('utf8', 0, 4) !== '%PDF') {
+      return { ok: false, error: 'Invalid file signature: PDF files must start with %PDF.' };
+    }
+  } else if (ext === '.png') {
+    if (buffer.length < 4 || buffer[0] !== 0x89 || buffer[1] !== 0x50 || buffer[2] !== 0x4e || buffer[3] !== 0x47) {
+      return { ok: false, error: 'Invalid file signature: PNG files must start with \\x89PNG.' };
+    }
+  } else if (ext === '.jpg' || ext === '.jpeg') {
+    if (buffer.length < 3 || buffer[0] !== 0xff || buffer[1] !== 0xd8 || buffer[2] !== 0xff) {
+      return { ok: false, error: 'Invalid file signature: JPEG files must start with \\xFF\\xD8\\xFF.' };
+    }
+  } else if (ext === '.gif') {
+    if (buffer.length < 4 || buffer.toString('utf8', 0, 4) !== 'GIF8') {
+      return { ok: false, error: 'Invalid file signature: GIF files must start with GIF8.' };
+    }
+  } else if (ext === '.webp') {
+    if (buffer.length < 12 || buffer.toString('utf8', 0, 4) !== 'RIFF' || buffer.toString('utf8', 8, 12) !== 'WEBP') {
+      return { ok: false, error: 'Invalid file signature: WebP files must start with RIFF...WEBP.' };
+    }
+  } else if (ext === '.zip') {
+    if (
+      buffer.length < 4 ||
+      buffer[0] !== 0x50 ||
+      buffer[1] !== 0x4b ||
+      !((buffer[2] === 0x03 && buffer[3] === 0x04) || (buffer[2] === 0x05 && buffer[3] === 0x06) || (buffer[2] === 0x07 && buffer[3] === 0x08))
+    ) {
+      return { ok: false, error: 'Invalid file signature: ZIP files must start with PK\\x03\\x04.' };
+    }
+  } else if (ext === '.rar') {
+    if (
+      buffer.length < 6 ||
+      buffer[0] !== 0x52 ||
+      buffer[1] !== 0x61 ||
+      buffer[2] !== 0x72 ||
+      buffer[3] !== 0x21 ||
+      buffer[4] !== 0x1a ||
+      buffer[5] !== 0x07
+    ) {
+      return { ok: false, error: 'Invalid file signature: RAR files must start with Rar!\\x1a\\x07.' };
+    }
+  } else if (ext === '.7z') {
+    if (
+      buffer.length < 6 ||
+      buffer[0] !== 0x37 ||
+      buffer[1] !== 0x7a ||
+      buffer[2] !== 0xbc ||
+      buffer[3] !== 0xaf ||
+      buffer[4] !== 0x27 ||
+      buffer[5] !== 0x1c
+    ) {
+      return { ok: false, error: 'Invalid file signature: 7z files must start with 7z signature.' };
+    }
+  } else if (ext === '.psd') {
+    if (buffer.length < 4 || buffer.toString('utf8', 0, 4) !== '8BPS') {
+      return { ok: false, error: 'Invalid file signature: PSD files must start with 8BPS.' };
+    }
+  } else if (ext === '.wav') {
+    if (buffer.length < 12 || buffer.toString('utf8', 0, 4) !== 'RIFF' || buffer.toString('utf8', 8, 12) !== 'WAVE') {
+      return { ok: false, error: 'Invalid file signature: WAV files must start with RIFF...WAVE.' };
+    }
+  }
+
+  // 2. Check sniffed magic signature against extension to prevent disguised files
+  const sniffed = sniffBufferMagicMime(buffer);
+  if (sniffed && !sniffed.allowedExtensions.includes(ext)) {
+    return {
+      ok: false,
+      error: `File content signature (${sniffed.mime}) does not match extension "${ext}".`
+    };
+  }
+
+  // 3. Validate text/structured content integrity for text-based extensions
+  if (TEXT_BASED_EXTENSIONS.has(ext)) {
+    const checkLen = Math.min(buffer.length, 8192);
+    for (let i = 0; i < checkLen; i++) {
+      if (buffer[i] === 0x00) {
+        return {
+          ok: false,
+          error: `Binary file content is not valid for text extension "${ext}".`
+        };
+      }
+    }
+    if (ext === '.json') {
+      try {
+        JSON.parse(buffer.toString('utf8'));
+      } catch {
+        return { ok: false, error: 'Invalid JSON file content.' };
+      }
+    }
+  }
+
+  // 4. Validate client-provided MIME metadata (if explicitly provided) against permitted types for the extension
+  const allowedMimes = new Set(extSpec.allowed);
+  const dataMime = normalizeMimeType(params.dataUrlMime);
+  const declaredMime = normalizeMimeType(params.declaredMime);
+  const headerMime = normalizeMimeType(params.headerContentType);
+
+  if (dataMime && !GENERIC_BINARY_MIMES.has(dataMime)) {
+    if (!allowedMimes.has(dataMime)) {
+      return {
+        ok: false,
+        error: `Data URL MIME type "${dataMime}" does not match file extension "${ext}".`
+      };
+    }
+  }
+
+  if (declaredMime && !GENERIC_BINARY_MIMES.has(declaredMime)) {
+    if (!allowedMimes.has(declaredMime)) {
+      return {
+        ok: false,
+        error: `Declared MIME type "${declaredMime}" does not match file extension "${ext}".`
+      };
+    }
+  }
+
+  // Only validate HTTP Content-Type header when the request is a raw binary upload (not a JSON upload envelope)
+  if (!params.isJsonEnvelope && headerMime && !GENERIC_BINARY_MIMES.has(headerMime)) {
+    if (!allowedMimes.has(headerMime)) {
+      return {
+        ok: false,
+        error: `Upload Content-Type "${headerMime}" does not match file extension "${ext}".`
+      };
+    }
+  }
+
+  return { ok: true, mimeType: extSpec.canonical };
+}
+
 export const OFFER_LABEL: Record<WorkstreamOfferKind, string> = { proposal: 'proposal', invoice: 'invoice', deposit: 'deposit request' };
 export const OFFER_PREFIX: Record<WorkstreamOfferKind, string> = { proposal: 'PRP', invoice: 'INV', deposit: 'DEP' };
 export const FUNDED_STATUSES = ['funded_in_escrow', 'delivered', 'revision', 'completed', 'disputed'];
@@ -366,13 +700,18 @@ export async function validateMessageFileInfo(fileInfo: any, sender: any, target
   }
   const bytes = workstreamFileBytes(filename) || Number(dbRec?.size || 0);
   const size = bytes > 1024 * 1024 ? `${(bytes / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  const fileExt = path.extname(filename).toLowerCase();
+  const canonicalMime = getCanonicalMimeForExtension(fileExt);
+  const storedMime = normalizeMimeType(dbRec?.mime);
+  const extSpec = WORKSTREAM_EXTENSION_MIME_MAP[fileExt];
+  const resolvedMime = storedMime && extSpec?.allowed.includes(storedMime) ? extSpec.canonical : canonicalMime;
   return {
     ok: true,
     fileInfo: {
       name: typeof fileInfo.name === 'string' && fileInfo.name.trim() ? fileInfo.name.trim().slice(0, 200) : (dbRec?.originalName || filename),
       size,
       url: `${WORKSTREAM_FILE_URL_PREFIX}${filename}`,
-      ...(typeof fileInfo.type === 'string' ? { type: fileInfo.type.slice(0, 100) } : {})
+      type: resolvedMime
     }
   };
 }

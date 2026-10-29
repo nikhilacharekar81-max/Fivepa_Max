@@ -35,7 +35,8 @@ export function useWorkstream(props?: any) {
     messages: props?.messages,
     setMessages: props?.setMessages,
     currentUserId: (props?.impersonatedUser || props?.currentUser)?.id,
-    activeOrderId: currentSelectedOrder?.id
+    activeOrderId: currentSelectedOrder?.id,
+    activeWorkspaceId: currentSelectedOrder?.workspaceId || props?.selectedWorkspaceId
   });
   
   const currentSelectedOrderRef = useRef(currentSelectedOrder);

@@ -152,9 +152,10 @@ export class WorkspaceRepo {
               [m.timestamp || new Date().toISOString()]
             );
           }
+          const workspaceIdVal = (m as any).workspaceId || m.metadata?.workspaceId || null;
           await client.query(
-            `INSERT INTO messages (id, order_id, sender_id, sender_name, text, timestamp, type, file_info, metadata)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            `INSERT INTO messages (id, order_id, sender_id, sender_name, text, timestamp, type, file_info, metadata, workspace_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT (id) DO UPDATE SET
                order_id = EXCLUDED.order_id,
                sender_id = EXCLUDED.sender_id,
@@ -163,10 +164,12 @@ export class WorkspaceRepo {
                timestamp = EXCLUDED.timestamp,
                type = EXCLUDED.type,
                file_info = EXCLUDED.file_info,
-               metadata = EXCLUDED.metadata`,
+               metadata = EXCLUDED.metadata,
+               workspace_id = COALESCE(EXCLUDED.workspace_id, messages.workspace_id)`,
             [
-              m.id, m.orderId, m.senderId, m.senderName, m.text, m.timestamp,
-              m.type || 'message', JSON.stringify(m.fileInfo || null), JSON.stringify(m.metadata || null)
+              m.id, m.orderId || null, m.senderId, m.senderName, m.text, m.timestamp,
+              m.type || 'message', JSON.stringify(m.fileInfo || null), JSON.stringify(m.metadata || null),
+              workspaceIdVal
             ]
           );
         }
@@ -232,16 +235,19 @@ export class WorkspaceRepo {
     if (!workspaceId) return [];
     const dbRunner = client || this.ctx.getPool();
     const verifiedOrderIds = await this.getVerifiedWorkspaceOrderIds(workspaceId, dbRunner);
-    if (verifiedOrderIds.length === 0) return [];
     const res = await dbRunner.query(
       `SELECT * FROM messages
-       WHERE order_id = ANY($1::text[])
+       WHERE (order_id = ANY($1::text[]))
+          OR (order_id = $2)
+          OR (workspace_id = $2)
+          OR (metadata->>'workspaceId' = $2)
        ORDER BY timestamp ASC, id ASC`,
-      [verifiedOrderIds]
+      [verifiedOrderIds.length > 0 ? verifiedOrderIds : ['__nonexistent__'], workspaceId]
     );
     return res.rows.map((r: any) => ({
       id: r.id,
-      orderId: r.order_id,
+      orderId: r.order_id || undefined,
+      workspaceId: r.workspace_id || r.metadata?.workspaceId || undefined,
       senderId: r.sender_id,
       senderName: r.sender_name,
       text: r.text,

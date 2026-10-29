@@ -107,7 +107,7 @@ export function useWorkstreamFiles({
 
     // 2. Files attached in Messages or Deliverable Submitted System Events across the Workspace
     messages
-      .filter(m => workspaceOrderIds.has(m.orderId) || (Boolean(wsId) && m.metadata?.workspaceId === wsId))
+      .filter(m => (Boolean(m.orderId) && workspaceOrderIds.has(m.orderId!)) || (Boolean(wsId) && m.metadata?.workspaceId === wsId))
       .forEach(m => {
         const msgOrderId = m.orderId || selectedOrder.id;
         const msgOrderTitle = orderTitleById.get(msgOrderId) || selectedOrder.title;

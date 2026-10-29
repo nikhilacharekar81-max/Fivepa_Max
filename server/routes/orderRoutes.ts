@@ -443,6 +443,31 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
         }
       }
 
+      if (isInquiry && !req.body?.workspaceId && !req.body?.forceNew) {
+        const inqLockRes = await client.query(
+          `SELECT o.* FROM orders o
+           LEFT JOIN escrows e ON e.order_id = o.id
+           WHERE o.buyer_id = $1
+             AND o.seller_id = $2
+             AND COALESCE(o.gig_id, '') = $3
+             AND COALESCE(o.project_id, '') = $4
+             AND COALESCE(o.amount, 0) = 0
+             AND o.status IN ('in_progress', 'payment_pending')
+             AND (e.order_id IS NULL OR COALESCE(e.remaining, 0) = 0)
+           ORDER BY o.updated_at DESC NULLS LAST, o.created_at DESC, o.id DESC
+           LIMIT 1
+           FOR UPDATE OF o`,
+          [buyerId, sellerId, String(req.body?.gigId || ''), String(req.body?.projectId || '')]
+        );
+        if (inqLockRes.rows.length > 0) {
+          const matched = inqLockRes.rows[0];
+          const existing = await store.getOrderById(matched.id, client);
+          if (existing) {
+            return { replayed: true, result: enrichOrderWithServiceInfo(existing) };
+          }
+        }
+      }
+
       let workspaceId: string;
       if (isGig) {
         workspaceId = 'ws_' + randomUUID().slice(0, 12);
@@ -496,6 +521,13 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
         );
       } else {
         workspaceId = 'ws_' + randomUUID().slice(0, 12);
+        const resolvedOriginType: 'gig' | 'project' | 'profile' = isProject
+          ? 'project'
+          : (req.body?.originType === 'profile' || (!isGig && !isProject) ? 'profile' : 'gig');
+        const resolvedOriginId = isProject
+          ? (req.body?.projectId || id)
+          : (resolvedOriginType === 'profile' ? sellerId : (req.body?.gigId || id));
+
         await client.query(
           `INSERT INTO workspaces (workspace_id, buyer_id, seller_id, order_ids, title, created_at, updated_at, metadata)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -512,7 +544,7 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
                  GROUP BY elem
                ) deduped
              )`,
-          [workspaceId, buyerId, sellerId, JSON.stringify([id]), title, today, new Date().toISOString(), JSON.stringify({ originType: isProject ? 'project' : 'gig', originId: req.body?.projectId || id, status: 'active', activeOrderId: id, isInquiry })]
+          [workspaceId, buyerId, sellerId, JSON.stringify([id]), title, today, new Date().toISOString(), JSON.stringify({ originType: resolvedOriginType, originId: resolvedOriginId, status: 'active', activeOrderId: id, isInquiry })]
         );
       }
 

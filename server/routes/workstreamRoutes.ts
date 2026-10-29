@@ -54,6 +54,10 @@ import {
   WORKSTREAM_MAX_UPLOAD_BYTES,
   WORKSTREAM_INLINE_EXTENSIONS,
   WORKSTREAM_ALLOWED_EXTENSIONS,
+  WORKSTREAM_EXTENSION_MIME_MAP,
+  normalizeMimeType,
+  getCanonicalMimeForExtension,
+  resolveAndValidateWorkstreamUploadMime,
   OFFER_LABEL,
   OFFER_PREFIX,
   orderHasEscrow,
@@ -187,7 +191,32 @@ router.post(
   async (req: Request, res: Response) => {
     try {
       const caller = (req as any).authenticatedUser;
-      const rawName = (req.query.name as string) || (req.body?.name as string) || 'attachment';
+
+      let bodyObj: Record<string, any> | null = null;
+      let isJsonEnvelope = false;
+      const headerContentType = typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : undefined;
+
+      if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
+        if (typeof req.body.dataUrl === 'string' || typeof req.body.content === 'string') {
+          bodyObj = req.body;
+          isJsonEnvelope = true;
+        }
+      } else if (
+        (Buffer.isBuffer(req.body) || typeof req.body === 'string') &&
+        normalizeMimeType(headerContentType) === 'application/json'
+      ) {
+        try {
+          const parsed = JSON.parse(Buffer.isBuffer(req.body) ? req.body.toString('utf8') : req.body);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && (typeof parsed.dataUrl === 'string' || typeof parsed.content === 'string')) {
+            bodyObj = parsed;
+            isJsonEnvelope = true;
+          }
+        } catch {
+          // Raw body is not a JSON upload envelope; treat as raw file bytes
+        }
+      }
+
+      const rawName = (req.query.name as string) || (bodyObj?.name as string) || (req.body?.name as string) || 'attachment';
       let decodedName: string;
       try { decodedName = decodeURIComponent(rawName); } catch { decodedName = rawName; }
       const safeBase = path.basename(decodedName).replace(/[^a-zA-Z0-9._-]/g, '_') || 'file';
@@ -200,23 +229,42 @@ router.post(
       const storedFilename = `${Date.now()}_${randomUUID().slice(0, 8)}_${nameWithoutExt}${ext}`;
 
       let buffer: Buffer;
-      if (Buffer.isBuffer(req.body)) {
-        buffer = req.body;
-      } else if (typeof req.body === 'string') {
-        buffer = Buffer.from(req.body);
-      } else if (req.body && typeof req.body === 'object') {
-        const rawData = typeof req.body.dataUrl === 'string'
-          ? req.body.dataUrl
-          : (typeof req.body.content === 'string' ? req.body.content : '');
+      let dataUrlMime: string | undefined;
+
+      if (isJsonEnvelope && bodyObj) {
+        const rawData = typeof bodyObj.dataUrl === 'string'
+          ? bodyObj.dataUrl
+          : (typeof bodyObj.content === 'string' ? bodyObj.content : '');
+        if (typeof bodyObj.dataUrl === 'string' && rawData.startsWith('data:')) {
+          const dataHeaderMatch = rawData.match(/^data:([^;,]+)(?:;[^,]*)?,/i);
+          if (dataHeaderMatch && dataHeaderMatch[1]) {
+            dataUrlMime = dataHeaderMatch[1].trim().toLowerCase();
+          }
+        }
         const b64Idx = rawData.indexOf(';base64,');
         if (b64Idx !== -1) {
           buffer = Buffer.from(rawData.slice(b64Idx + 8), 'base64');
+        } else if (rawData.startsWith('data:') && rawData.includes(',')) {
+          const commaIdx = rawData.indexOf(',');
+          const rawPayload = rawData.slice(commaIdx + 1);
+          try {
+            buffer = Buffer.from(decodeURIComponent(rawPayload), 'utf8');
+          } catch {
+            buffer = Buffer.from(rawPayload, 'utf8');
+          }
         } else {
           buffer = Buffer.from(rawData);
         }
+      } else if (Buffer.isBuffer(req.body)) {
+        buffer = req.body;
+      } else if (typeof req.body === 'string') {
+        buffer = Buffer.from(req.body);
+      } else if (req.body && typeof req.body === 'object' && ext === '.json') {
+        buffer = Buffer.from(JSON.stringify(req.body, null, 2), 'utf8');
       } else {
         buffer = Buffer.alloc(0);
       }
+
       if (!buffer || buffer.length === 0) {
         return res.status(400).json({ error: 'No file data received' });
       }
@@ -224,35 +272,30 @@ router.post(
         return res.status(413).json({ error: 'File is too large (25 MB maximum).' });
       }
 
-      // Magic byte validation
-      if (ext === '.pdf') {
-        if (buffer.length < 4 || buffer.toString('utf8', 0, 4) !== '%PDF') {
-          return res.status(400).json({ error: 'Invalid file signature: PDF files must start with %PDF.' });
-        }
-      } else if (ext === '.png') {
-        if (buffer.length < 4 || buffer[0] !== 0x89 || buffer[1] !== 0x50 || buffer[2] !== 0x4e || buffer[3] !== 0x47) {
-          return res.status(400).json({ error: 'Invalid file signature: PNG files must start with \\x89PNG.' });
-        }
-      } else if (ext === '.jpg' || ext === '.jpeg') {
-        if (buffer.length < 3 || buffer[0] !== 0xff || buffer[1] !== 0xd8 || buffer[2] !== 0xff) {
-          return res.status(400).json({ error: 'Invalid file signature: JPEG files must start with \\xFF\\xD8\\xFF.' });
-        }
-      } else if (ext === '.gif') {
-        if (buffer.length < 4 || buffer.toString('utf8', 0, 4) !== 'GIF8') {
-          return res.status(400).json({ error: 'Invalid file signature: GIF files must start with GIF8.' });
-        }
-      } else if (ext === '.webp') {
-        if (buffer.length < 12 || buffer.toString('utf8', 0, 4) !== 'RIFF' || buffer.toString('utf8', 8, 12) !== 'WEBP') {
-          return res.status(400).json({ error: 'Invalid file signature: WebP files must start with RIFF...WEBP.' });
-        }
-      } else if (ext === '.zip') {
-        if (buffer.length < 4 || buffer[0] !== 0x50 || buffer[1] !== 0x4b || buffer[2] !== 0x03 || buffer[3] !== 0x04) {
-          return res.status(400).json({ error: 'Invalid file signature: ZIP files must start with PK\\x03\\x04.' });
-        }
-      }
+      const declaredMime =
+        (typeof bodyObj?.mimeType === 'string' ? bodyObj.mimeType : undefined) ||
+        (typeof bodyObj?.type === 'string' ? bodyObj.type : undefined) ||
+        (typeof bodyObj?.contentType === 'string' ? bodyObj.contentType : undefined) ||
+        (typeof req.query.mimeType === 'string' ? req.query.mimeType : undefined) ||
+        (typeof req.query.type === 'string' ? req.query.type : undefined) ||
+        (typeof req.headers['x-file-type'] === 'string' ? req.headers['x-file-type'] : undefined) ||
+        (typeof req.headers['x-mime-type'] === 'string' ? req.headers['x-mime-type'] : undefined);
 
-      const orderId = typeof req.query.orderId === 'string' ? req.query.orderId : (typeof req.body?.orderId === 'string' ? req.body.orderId : (req.headers['x-order-id'] as string || undefined));
-      const workspaceId = typeof req.query.workspaceId === 'string' ? req.query.workspaceId : (typeof req.body?.workspaceId === 'string' ? req.body.workspaceId : (req.headers['x-workspace-id'] as string || undefined));
+      const mimeValidation = resolveAndValidateWorkstreamUploadMime({
+        ext,
+        buffer,
+        isJsonEnvelope,
+        dataUrlMime,
+        declaredMime,
+        headerContentType
+      });
+      if (!mimeValidation.ok) {
+        return res.status(400).json({ error: (mimeValidation as { ok: false; error: string }).error });
+      }
+      const mimeType = mimeValidation.mimeType;
+
+      const orderId = typeof req.query.orderId === 'string' ? req.query.orderId : (typeof bodyObj?.orderId === 'string' ? bodyObj.orderId : (typeof req.body?.orderId === 'string' ? req.body.orderId : (req.headers['x-order-id'] as string || undefined)));
+      const workspaceId = typeof req.query.workspaceId === 'string' ? req.query.workspaceId : (typeof bodyObj?.workspaceId === 'string' ? bodyObj.workspaceId : (typeof req.body?.workspaceId === 'string' ? req.body.workspaceId : (req.headers['x-workspace-id'] as string || undefined)));
 
       if (!orderId && !workspaceId) {
         return res.status(400).json({ error: 'Context required: must provide orderId or workspaceId' });
@@ -316,7 +359,6 @@ router.post(
       }
 
       const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
-      const mimeType = (req.headers['content-type'] as string) || 'application/octet-stream';
       await uploadFileToCloudStorage(storedFilename, buffer, mimeType);
       const fileUrl = `${WORKSTREAM_FILE_URL_PREFIX}${storedFilename}`;
 
@@ -364,7 +406,7 @@ router.get(['/workstream/files/:filename', '/uploads/workstream/:filename'], req
   const filename = path.basename(req.params.filename);
   const filePath = path.join(WORKSTREAM_UPLOADS_DIR, filename);
   const localExists = fs.existsSync(filePath);
-  const dbRec = !localExists ? await store.getUploadRecord(filename) : null;
+  const dbRec = await store.getUploadRecord(filename);
   if (!localExists && !dbRec) {
     return res.status(404).json({ error: 'File not found' });
   }
@@ -379,10 +421,14 @@ router.get(['/workstream/files/:filename', '/uploads/workstream/:filename'], req
   const parts = filename.split('_');
   const originalName = parts.length > 2 ? parts.slice(2).join('_') : filename;
   const ext = path.extname(filename).toLowerCase();
+  const storedMime = normalizeMimeType(dbRec?.mime);
+  const extSpec = WORKSTREAM_EXTENSION_MIME_MAP[ext];
+  const resolvedMime = storedMime && extSpec?.allowed.includes(storedMime) ? extSpec.canonical : getCanonicalMimeForExtension(ext);
 
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Cache-Control', 'private, no-store');
   res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Content-Type', resolvedMime);
 
   const isPotentiallyActive = ['.html', '.htm', '.xhtml', '.svg', '.xml', '.js', '.mjs'].includes(ext);
   if (isPotentiallyActive) {
@@ -391,7 +437,7 @@ router.get(['/workstream/files/:filename', '/uploads/workstream/:filename'], req
 
   const forceDownload = req.query.download === '1' || !WORKSTREAM_INLINE_EXTENSIONS.has(ext) || ext === '.html' || ext === '.htm' || ext === '.svg';
   if (!localExists) {
-    if (forceDownload) res.attachment(originalName); else res.type(ext);
+    if (forceDownload) res.attachment(originalName);
     const stream = openCloudFileStream(filename);
     stream.on('error', () => { if (!res.headersSent) res.status(404).json({ error: 'File not found' }); else res.end(); });
     return void stream.pipe(res);
@@ -401,7 +447,7 @@ router.get(['/workstream/files/:filename', '/uploads/workstream/:filename'], req
     return res.download(filePath, originalName);
   }
 
-  res.sendFile(filePath);
+  res.sendFile(filePath, { headers: { 'Content-Type': resolvedMime } });
 });
 
 router.delete(
@@ -424,26 +470,37 @@ router.delete(
   }
 );
 
-router.get(['/messages/:orderId', '/workspaces/:orderId/messages'], requireAuth, async (req: Request, res: Response) => {
+router.get(['/messages/:id', '/workspaces/:id/messages', '/workstream/:id/messages'], requireAuth, async (req: Request, res: Response) => {
   try {
-    const paramId = req.params.orderId;
-    const order = await store.getOrder(paramId);
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (!canAccessOrderWorkstream((req as any).authenticatedUser, order)) {
+    const paramId = req.params.id;
+    const authUser = (req as any).authenticatedUser;
+    const isAdmin = isStaffUser(authUser);
+
+    let workspace = await workspaceService.getWorkspaceAsync(paramId);
+    let order: Order | null = null;
+    if (!workspace) {
+      order = (await store.getOrder(paramId)) || null;
+      if (order?.workspaceId) {
+        workspace = await workspaceService.getWorkspaceAsync(order.workspaceId);
+      }
+    }
+
+    if (!workspace && !order) return res.status(404).json({ error: 'Workspace or Order not found' });
+
+    const buyerId = workspace?.buyerId || order?.buyerId;
+    const sellerId = workspace?.sellerId || order?.sellerId;
+    if (!isAdmin && authUser.id !== buyerId && authUser.id !== sellerId) {
       return res.status(403).json({ error: 'Forbidden: You are not a participant of this Workstream.' });
     }
 
     const orderOnly = req.query.orderOnly === 'true' || req.query.scope === 'order';
-    let msgs: Message[];
-    if (!orderOnly && order.workspaceId) {
-      const wsMsgs = await store.listMessagesForWorkspace(order.workspaceId);
-      if (wsMsgs.length > 0) {
-        msgs = wsMsgs;
-      } else {
-        msgs = await store.listMessages(order.id);
-      }
-    } else {
+    let msgs: Message[] = [];
+    if (!orderOnly && workspace) {
+      msgs = await store.listMessagesForWorkspace(workspace.workspaceId);
+    } else if (order) {
       msgs = await store.listMessages(order.id);
+    } else if (workspace) {
+      msgs = await store.listMessagesForWorkspace(workspace.workspaceId);
     }
 
     const before = typeof req.query.before === 'string' ? req.query.before : undefined;
@@ -474,33 +531,39 @@ router.post('/messages', requireAuth, rateLimit(120, 60_000), async (req: Reques
     const authUserId = (req as any).authenticatedUserId;
     const caller = await store.getUser(authUserId);
     if (!caller) return res.status(401).json({ error: 'User not found' });
-    const orderId = req.body.orderId;
-    if (!orderId) return res.status(400).json({ error: 'Order ID is required' });
 
-    let order = await store.getOrder(orderId);
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-    
-    if (caller.status === 'suspended' && !orderId.startsWith('support_admin_')) {
+    const orderId = req.body.orderId;
+    const workspaceId = req.body.workspaceId;
+    if (!orderId && !workspaceId) return res.status(400).json({ error: 'Order ID or Workspace ID is required' });
+
+    let order = orderId ? await store.getOrder(orderId) : null;
+    let workspace = workspaceId ? await workspaceService.getWorkspaceAsync(workspaceId) : (order?.workspaceId ? await workspaceService.getWorkspaceAsync(order.workspaceId) : null);
+    if (!order && !workspace) return res.status(404).json({ error: 'Order or Workspace not found' });
+
+    const buyerId = order?.buyerId || workspace?.buyerId;
+    const sellerId = order?.sellerId || workspace?.sellerId;
+
+    if (caller.status === 'suspended' && !(orderId && orderId.startsWith('support_admin_'))) {
       return res.status(403).json({ error: 'Action forbidden: Your account is suspended. You can only message Support.' });
     }
 
-    if (!canAccessOrderWorkstream(caller, order)) {
+    if (!isStaffUser(caller) && caller.id !== buyerId && caller.id !== sellerId) {
       return res.status(403).json({ error: 'Forbidden: You are not a participant of this Workstream.' });
     }
 
-    if (order.isMuted && !isStaffUser(caller)) {
+    if (order && order.isMuted && !isStaffUser(caller)) {
       return res.status(403).json({ error: 'Chat is currently paused.' });
     }
 
-    const fileCheck = await validateMessageFileInfo(req.body.fileInfo, caller, order);
+    const fileCheck = await validateMessageFileInfo(req.body.fileInfo, caller, order || undefined);
     if (!fileCheck.ok) return res.status(400).json({ error: (fileCheck as any).error });
 
     const clientMessageId = typeof req.body.clientMessageId === 'string' ? req.body.clientMessageId : undefined;
-    if (clientMessageId) {
-      const pool = postgresStore.getPool();
-      const existingRes = await pool.query(
-        "SELECT * FROM messages WHERE order_id = $1 AND sender_id = $2 AND metadata->>'clientMessageId' = $3 LIMIT 1",
-        [order.id, caller.id, clientMessageId]
+    const queryTargetId = order?.id || workspace?.workspaceId;
+    if (clientMessageId && queryTargetId) {
+      const existingRes = await postgresStore.getPool().query(
+        "SELECT * FROM messages WHERE (order_id = $1 OR workspace_id = $1) AND sender_id = $2 AND metadata->>'clientMessageId' = $3 LIMIT 1",
+        [queryTargetId, caller.id, clientMessageId]
       );
       if (existingRes.rows.length > 0) {
         const r = existingRes.rows[0];
@@ -509,6 +572,7 @@ router.post('/messages', requireAuth, rateLimit(120, 60_000), async (req: Reques
           message: {
             id: r.id,
             orderId: r.order_id,
+            workspaceId: r.workspace_id,
             senderId: r.sender_id,
             senderName: r.sender_name,
             text: r.text,
@@ -522,21 +586,45 @@ router.post('/messages', requireAuth, rateLimit(120, 60_000), async (req: Reques
       }
     }
 
-    const newMsg = sanitizeAndCreateMessage(caller, order, req.body, fileCheck);
+    let newMsg: Message;
+    if (order) {
+      newMsg = sanitizeAndCreateMessage(caller, order, req.body, fileCheck);
+      if (workspace?.workspaceId) {
+        newMsg.workspaceId = workspace.workspaceId;
+      }
+    } else {
+      newMsg = {
+        id: 'msg_' + randomUUID().slice(0, 12),
+        workspaceId: workspace!.workspaceId,
+        senderId: caller.id,
+        senderName: caller.name,
+        text: escapeHtml(String(req.body.text || '')).slice(0, 10000),
+        timestamp: new Date().toISOString(),
+        type: (req.body.type as any) || 'message',
+        fileInfo: fileCheck.fileInfo || undefined,
+        metadata: {
+          ...(req.body.metadata || {}),
+          ...(clientMessageId ? { clientMessageId } : {}),
+          workspaceId: workspace!.workspaceId
+        }
+      };
+    }
+
     if (newMsg.fileInfo?.url) {
       const fn = workstreamFilenameFromUrl(newMsg.fileInfo.url);
       if (fn) {
         await postgresStore.getPool().query(
           "UPDATE uploads SET order_id = COALESCE(order_id, $1), workspace_id = COALESCE(workspace_id, $3) WHERE filename = $2",
-          [order.id, fn, order.workspaceId || null]
+          [order?.id || null, fn, workspace?.workspaceId || order?.workspaceId || null]
         );
       }
     }
+
     try {
       await recordMessage(newMsg);
     } catch (msgErr: any) {
-      if (clientMessageId) {
-        const existingMsg = await store.getMessageByClientMsgId(order.id, caller.id, clientMessageId);
+      if (clientMessageId && queryTargetId) {
+        const existingMsg = await store.getMessageByClientMsgId(queryTargetId, caller.id, clientMessageId);
         if (existingMsg) {
           return res.json({ success: true, message: existingMsg, deduplicated: true });
         }
@@ -544,16 +632,18 @@ router.post('/messages', requireAuth, rateLimit(120, 60_000), async (req: Reques
       throw msgErr;
     }
 
-    const otherUserId = order.buyerId === caller.id ? order.sellerId : order.buyerId;
-    createNotification({
-      userId: otherUserId,
-      type: 'message',
-      title: 'New Message',
-      message: `${caller.name} sent a message regarding order "${order.title}".`,
-      link: `/workstream/${order.id}`,
-      dedupKey: `msg_${newMsg.id}`,
-      actorId: caller.id
-    });
+    const otherUserId = buyerId === caller.id ? sellerId : buyerId;
+    if (otherUserId) {
+      createNotification({
+        userId: otherUserId,
+        type: 'message',
+        title: 'New Message',
+        message: `${caller.name} sent a message regarding "${order?.title || (workspace as any)?.title || 'WorkStream'}".`,
+        link: order ? `/workstream/${order.id}` : `/workspace/${workspace?.workspaceId}`,
+        dedupKey: `msg_${newMsg.id}`,
+        actorId: caller.id
+      });
+    }
 
     res.json(newMsg);
   } catch (err: any) {

@@ -738,7 +738,8 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
               buyerId: activeUser.id,
               sellerId: freelancerId,
               ...(gigId ? { gigId } : {}),
-              ...(projectId ? { projectId } : {})
+              ...(projectId ? { projectId } : {}),
+              ...(!gigId && !projectId ? { originType: 'profile' } : {})
             })
           });
 
@@ -1062,11 +1063,26 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
       const workspaceOrderIds = new Set(workspaceOrders.map(o => o.id));
       workspaceOrderIds.add(hydratedActiveOrder.id);
 
-      const workspaceMessages = workstream.messages.filter(
-        m =>
-          workspaceOrderIds.has(m.orderId) ||
-          (Boolean(hydratedActiveOrder.workspaceId) && m.metadata?.workspaceId === hydratedActiveOrder.workspaceId)
-      );
+      const workspaceMessages = workstream.messages
+        .filter(
+          m =>
+            (m.orderId && workspaceOrderIds.has(m.orderId)) ||
+            (Boolean(hydratedActiveOrder.workspaceId) &&
+              (m.workspaceId === hydratedActiveOrder.workspaceId ||
+               m.metadata?.workspaceId === hydratedActiveOrder.workspaceId ||
+               m.orderId === hydratedActiveOrder.workspaceId))
+        )
+        .sort((a, b) => {
+          const tA = a.timestamp ? new Date(a.timestamp).getTime() : NaN;
+          const tB = b.timestamp ? new Date(b.timestamp).getTime() : NaN;
+          const validA = !isNaN(tA);
+          const validB = !isNaN(tB);
+          if (!validA && !validB) return String(a.id || '').localeCompare(String(b.id || ''));
+          if (!validA) return 1;
+          if (!validB) return -1;
+          if (tA !== tB) return tA - tB;
+          return String(a.id || '').localeCompare(String(b.id || ''));
+        });
 
       mainContent = (
         <WorkstreamWorkspace
@@ -1231,8 +1247,11 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
         />
       </div>
     );
-  } else if (pathParts.length === 1 && !RESERVED_ROUTES.includes(pathParts[0].toLowerCase())) {
-    const usernameParam = pathParts[0].toLowerCase();
+  } else if (
+    (pathParts.length === 1 && !RESERVED_ROUTES.includes(pathParts[0].toLowerCase())) ||
+    (pathParts.length === 2 && ['profile', 'freelancer', 'user', 'freelancers'].includes(pathParts[0].toLowerCase()))
+  ) {
+    const usernameParam = (pathParts.length === 2 ? pathParts[1] : pathParts[0]).toLowerCase();
     const matchedUser = users.find(
       u =>
         (u.username && u.username.toLowerCase() === usernameParam) ||
@@ -1248,7 +1267,7 @@ export default function App({ initialPath = '/', initialData }: AppProps) {
             gigs={gigs}
             reviews={reviews}
             onNavigate={navigate}
-            onContact={() => handleContactSeller(matchedUser.id, matchedUser.name, `Consultation with ${matchedUser.name}`)}
+            onContact={(targetId) => handleContactSeller(targetId || matchedUser.id, matchedUser.name, `Consultation with ${matchedUser.name}`)}
           />
         </div>
       );

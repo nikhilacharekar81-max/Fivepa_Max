@@ -164,7 +164,7 @@ export interface Workspace {
   workspaceId: string;
   buyerId: string;
   sellerId: string;
-  originType: 'gig' | 'project';
+  originType: 'gig' | 'project' | 'profile';
   originId: string;
   createdAt: string;
   status: 'active' | 'archived';
@@ -460,7 +460,8 @@ export interface AuditLog {
 
 export interface Message {
   id: string;
-  orderId: string;
+  orderId?: string;
+  workspaceId?: string;
   senderId: string;
   senderName: string;
   text: string;
