@@ -955,4 +955,71 @@ CREATE INDEX IF NOT EXISTS idx_orders_buyer_seller ON orders (buyer_id, seller_i
 CREATE INDEX IF NOT EXISTS idx_workstream_offers_workspace ON workstream_offers (workspace_id);
 CREATE INDEX IF NOT EXISTS idx_uploads_workspace_id ON uploads (workspace_id);
 CREATE INDEX IF NOT EXISTS idx_uploads_order_id ON uploads (order_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_inquiry_unique ON workspaces (buyer_id, seller_id, (metadata->>'originType'), (metadata->>'originId')) WHERE (metadata->>'isInquiry') = 'true';
+DO $$
+DECLARE
+  _dup RECORD;
+  _conflict_count INT;
+  _unresolvable_diag TEXT := '';
+BEGIN
+  -- Inspect for conflicting existing records before enforcing uniqueness
+  SELECT COUNT(*) INTO _conflict_count
+  FROM (
+    SELECT buyer_id, seller_id, (metadata->>'originType') AS o_type, (metadata->>'originId') AS o_id
+    FROM workspaces
+    WHERE (metadata->>'isInquiry') = 'true'
+    GROUP BY buyer_id, seller_id, (metadata->>'originType'), (metadata->>'originId')
+    HAVING COUNT(*) > 1
+  ) dups;
+
+  IF _conflict_count > 0 THEN
+    FOR _dup IN (
+      SELECT buyer_id, seller_id, (metadata->>'originType') AS o_type, (metadata->>'originId') AS o_id,
+             array_agg(workspace_id ORDER BY updated_at DESC, created_at DESC) AS ws_ids,
+             COUNT(*) AS cnt
+      FROM workspaces
+      WHERE (metadata->>'isInquiry') = 'true'
+      GROUP BY buyer_id, seller_id, (metadata->>'originType'), (metadata->>'originId')
+      HAVING COUNT(*) > 1
+    ) LOOP
+      DECLARE
+        _primary_ws_id TEXT := _dup.ws_ids[1];
+        _other_ws_id TEXT;
+        _msg_count INT;
+        _ord_count INT;
+        _offer_count INT;
+        _upload_count INT;
+        _has_unresolvable BOOLEAN := FALSE;
+      BEGIN
+        FOR i IN 2..array_length(_dup.ws_ids, 1) LOOP
+          _other_ws_id := _dup.ws_ids[i];
+          SELECT COUNT(*) INTO _msg_count FROM messages WHERE workspace_id = _other_ws_id OR metadata->>'workspaceId' = _other_ws_id;
+          SELECT COUNT(*) INTO _ord_count FROM orders WHERE workspace_id = _other_ws_id;
+          SELECT COUNT(*) INTO _offer_count FROM workstream_offers WHERE workspace_id = _other_ws_id;
+          SELECT COUNT(*) INTO _upload_count FROM uploads WHERE workspace_id = _other_ws_id;
+
+          -- Non-destructive reconciliation only when duplicate is completely empty
+          IF _msg_count = 0 AND _ord_count = 0 AND _offer_count = 0 AND _upload_count = 0 THEN
+            UPDATE workspaces
+            SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{isInquiry}', '"false"'::jsonb, true)
+            WHERE workspace_id = _other_ws_id;
+          ELSE
+            _has_unresolvable := TRUE;
+          END IF;
+        END LOOP;
+
+        IF _has_unresolvable THEN
+          _unresolvable_diag := _unresolvable_diag || format(
+            ' [Buyer: %s, Seller: %s, OriginType: %s, OriginId: %s, Workspaces: %s]',
+            _dup.buyer_id, _dup.seller_id, _dup.o_type, _dup.o_id, array_to_string(_dup.ws_ids, ', ')
+          );
+        END IF;
+      END;
+    END LOOP;
+
+    IF _unresolvable_diag <> '' THEN
+      RAISE EXCEPTION 'Cannot safely enforce idx_workspaces_inquiry_unique: Duplicate active inquiry workspaces with distinct message/order history exist:%', _unresolvable_diag;
+    END IF;
+  END IF;
+
+  EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_inquiry_unique ON workspaces (buyer_id, seller_id, (metadata->>''originType''), (metadata->>''originId'')) WHERE (metadata->>''isInquiry'') = ''true''';
+END $$;

@@ -543,8 +543,9 @@ router.post('/messages', requireAuth, rateLimit(120, 60_000), async (req: Reques
     if (!order && !workspace) return res.status(404).json({ error: 'Order or Workspace not found' });
 
     if (order && workspace) {
-      const orderBelongsToWs = (order.workspaceId && order.workspaceId === workspace.workspaceId) ||
-        (Array.isArray(workspace.orderIds) && workspace.orderIds.includes(order.id));
+      const orderBelongsToWs = order.workspaceId
+        ? order.workspaceId === workspace.workspaceId
+        : (Array.isArray(workspace.orderIds) && workspace.orderIds.includes(order.id));
       const partiesMatch = order.buyerId === workspace.buyerId && order.sellerId === workspace.sellerId;
       if (!orderBelongsToWs || !partiesMatch) {
         return res.status(400).json({ error: 'Order does not belong to the specified Workspace' });
@@ -686,7 +687,14 @@ router.post('/orders/:id/message', requireAuth, rateLimit(120, 60_000), async (r
         return res.status(400).json({ error: 'Order does not belong to the specified Workspace' });
       }
       const ws = await workspaceService.getWorkspaceAsync(req.body.workspaceId);
-      if (!ws || (order.workspaceId && ws.workspaceId !== order.workspaceId) || (!ws.orderIds?.includes(order.id) && order.workspaceId !== ws.workspaceId) || ws.buyerId !== order.buyerId || ws.sellerId !== order.sellerId) {
+      if (!ws) {
+        return res.status(400).json({ error: 'Order does not belong to the specified Workspace' });
+      }
+      const orderBelongsToWs = order.workspaceId
+        ? order.workspaceId === ws.workspaceId
+        : (Array.isArray(ws.orderIds) && ws.orderIds.includes(order.id));
+      const partiesMatch = order.buyerId === ws.buyerId && order.sellerId === ws.sellerId;
+      if (!orderBelongsToWs || !partiesMatch) {
         return res.status(400).json({ error: 'Order does not belong to the specified Workspace' });
       }
     }

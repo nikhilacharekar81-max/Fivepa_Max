@@ -110,31 +110,74 @@ router.get('/orders', requireAuth, requireActiveStatus, async (req: Request, res
     const dbOrders = isAdmin ? await store.listOrders() : await store.listOrdersForUser(authUserId);
     const ordersList = [...dbOrders, ...inqOrders];
     const orderIds = ordersList.map(o => o.id);
+    const wsIds = Array.from(new Set(ordersList.map(o => o.workspaceId).filter(Boolean))) as string[];
     const userIds = Array.from(new Set(ordersList.flatMap(o => [o.buyerId, o.sellerId]).filter(Boolean)));
 
     if (ordersList.length === 0) {
       return res.json([]);
     }
 
-    const [usersList, latestMsgsRes] = await Promise.all([
+    const [usersList, msgsRes] = await Promise.all([
       userIds.length > 0
         ? Promise.all(userIds.map(id => store.getUser(id)))
         : Promise.resolve([]),
-      orderIds.length > 0
+      (orderIds.length > 0 || wsIds.length > 0)
         ? pool.query(`
-            SELECT DISTINCT ON (target_id) target_id AS order_id, text, timestamp
-            FROM (
-              SELECT COALESCE(order_id, workspace_id) AS target_id, text, timestamp
-              FROM messages
-              WHERE order_id = ANY($1) OR workspace_id = ANY($1)
-            ) sub
-            ORDER BY target_id, timestamp DESC
-          `, [orderIds])
+            SELECT id, order_id, workspace_id, metadata->>'workspaceId' AS meta_ws_id, text, timestamp
+            FROM messages
+            WHERE (order_id IS NOT NULL AND order_id = ANY($1::text[]))
+               OR (order_id IS NULL AND (workspace_id = ANY($2::text[]) OR (metadata->>'workspaceId') = ANY($2::text[])))
+            ORDER BY timestamp DESC
+          `, [
+            orderIds.length > 0 ? orderIds : ['__none__'],
+            wsIds.length > 0 ? wsIds : ['__none__']
+          ])
         : Promise.resolve({ rows: [] as any[] })
     ]);
 
+    const latestMsgMap = new Map<string, { text: string; timestamp: string }>();
+    const orderIdSet = new Set(orderIds);
+
+    const ordersByWs = new Map<string, Order[]>();
+    for (const ord of ordersList) {
+      if (ord.workspaceId) {
+        const list = ordersByWs.get(ord.workspaceId) || [];
+        list.push(ord);
+        ordersByWs.set(ord.workspaceId, list);
+      }
+    }
+
+    for (const msgRow of msgsRes.rows) {
+      const msgTime = new Date(msgRow.timestamp || 0).getTime();
+      if (msgRow.order_id && orderIdSet.has(msgRow.order_id)) {
+        const current = latestMsgMap.get(msgRow.order_id);
+        const currTime = current ? new Date(current.timestamp || 0).getTime() : -1;
+        if (!current || msgTime > currTime) {
+          latestMsgMap.set(msgRow.order_id, { text: msgRow.text, timestamp: msgRow.timestamp });
+        }
+      } else if (!msgRow.order_id) {
+        const targetWsId = msgRow.workspace_id || msgRow.meta_ws_id;
+        if (targetWsId) {
+          if (orderIdSet.has(targetWsId)) {
+            const current = latestMsgMap.get(targetWsId);
+            const currTime = current ? new Date(current.timestamp || 0).getTime() : -1;
+            if (!current || msgTime > currTime) {
+              latestMsgMap.set(targetWsId, { text: msgRow.text, timestamp: msgRow.timestamp });
+            }
+          }
+          const matchingOrders = ordersByWs.get(targetWsId) || [];
+          for (const ord of matchingOrders) {
+            const current = latestMsgMap.get(ord.id);
+            const currTime = current ? new Date(current.timestamp || 0).getTime() : -1;
+            if (!current || msgTime > currTime) {
+              latestMsgMap.set(ord.id, { text: msgRow.text, timestamp: msgRow.timestamp });
+            }
+          }
+        }
+      }
+    }
+
     const userMap = new Map((usersList.filter(Boolean) as User[]).map(u => [u.id, u]));
-    const latestMsgMap = new Map((latestMsgsRes.rows as any[]).map(m => [m.order_id, m]));
 
     const userOrders: Order[] = ordersList.map(order => {
       const buyerUser = userMap.get(order.buyerId);
@@ -461,8 +504,8 @@ router.post('/orders', requireAuth, requireActiveStatus, rateLimit(30, 60_000), 
     }
 
     if (!isInquiry) {
-      if (!Number.isFinite(rawAmount) || rawAmount < 1.00) {
-        return res.status(400).json({ error: 'Minimum order amount is $1.00.' });
+      if (!Number.isFinite(rawAmount) || rawAmount < 10.00) {
+        return res.status(400).json({ error: 'Minimum order amount is $10.00.' });
       }
     }
 

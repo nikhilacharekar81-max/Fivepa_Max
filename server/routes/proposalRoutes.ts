@@ -331,12 +331,23 @@ export async function processProposalAccept(req: any, res: any) {
         console.error('[processProposalAccept] Post-commit recordOrder warning:', recErr);
       }
 
-      if (Array.isArray((proj as any).proposalsList)) {
-        (proj as any).proposalsList = (proj as any).proposalsList.map((p: any) => p.id === proposal.id ? { ...p, status: 'accepted', workstreamOrderId: order.id, offerId: offer?.id } : p);
+      if (!isReplay) {
+        if (Array.isArray((proj as any).proposalsList)) {
+          (proj as any).proposalsList = (proj as any).proposalsList.map((p: any) => p.id === proposal.id ? { ...p, status: 'accepted', workstreamOrderId: order.id, offerId: offer?.id } : p);
+        }
+        try { await store.saveProject(proj); } catch (e) { console.warn('[processProposalAccept] Post-commit saveProject warning:', e); }
+      } else {
+        try {
+          const freshProj = await store.getProject(proposal.projectId);
+          if (freshProj) {
+            Object.assign(proj, freshProj);
+          }
+        } catch (e) {
+          console.warn('[processProposalAccept] Post-commit reload project warning:', e);
+        }
       }
 
       try { await store.saveOrder(order); } catch (e) { console.warn('[processProposalAccept] Post-commit saveOrder warning:', e); }
-      try { await store.saveProject(proj); } catch (e) { console.warn('[processProposalAccept] Post-commit saveProject warning:', e); }
       try { await syncUserBalances(); } catch (e) { console.warn('[processProposalAccept] Post-commit syncUserBalances warning:', e); }
 
       if (!isReplay) {

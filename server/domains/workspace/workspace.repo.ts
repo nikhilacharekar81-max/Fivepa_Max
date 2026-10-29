@@ -237,10 +237,8 @@ export class WorkspaceRepo {
     const verifiedOrderIds = await this.getVerifiedWorkspaceOrderIds(workspaceId, dbRunner);
     const res = await dbRunner.query(
       `SELECT * FROM messages
-       WHERE (order_id = ANY($1::text[]))
-          OR (order_id = $2)
-          OR (workspace_id = $2)
-          OR (metadata->>'workspaceId' = $2)
+       WHERE (order_id IS NOT NULL AND order_id = ANY($1::text[]))
+          OR (order_id IS NULL AND (workspace_id = $2 OR metadata->>'workspaceId' = $2))
        ORDER BY timestamp ASC, id ASC`,
       [verifiedOrderIds.length > 0 ? verifiedOrderIds : ['__nonexistent__'], workspaceId]
     );
