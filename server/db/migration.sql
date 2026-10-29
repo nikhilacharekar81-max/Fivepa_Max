@@ -810,6 +810,27 @@ SELECT
 FROM messages WHERE sender_id NOT IN (SELECT id FROM users)
 ON CONFLICT (id) DO NOTHING;
 
+INSERT INTO reconciliation_exceptions (id, type, entity_id, description, detected_at)
+SELECT 
+  'RE_GF_' || MD5(id), 'ORPHAN_RECORD', id, 
+  'Gig refers to non-existent freelancer_id: ' || freelancer_id, NOW()::text
+FROM gigs WHERE freelancer_id NOT IN (SELECT id FROM users)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO reconciliation_exceptions (id, type, entity_id, description, detected_at)
+SELECT 
+  'RE_PP_' || MD5(id), 'ORPHAN_RECORD', id, 
+  'Proposal refers to non-existent project_id: ' || project_id, NOW()::text
+FROM proposals WHERE project_id NOT IN (SELECT id FROM projects)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO reconciliation_exceptions (id, type, entity_id, description, detected_at)
+SELECT 
+  'RE_MO_' || MD5(id), 'ORPHAN_RECORD', id, 
+  'Message refers to non-existent order_id: ' || order_id, NOW()::text
+FROM messages WHERE order_id NOT IN (SELECT id FROM orders)
+ON CONFLICT (id) DO NOTHING;
+
 -- 6. Apply Foreign Key Constraints
 DO $$ 
 DECLARE
